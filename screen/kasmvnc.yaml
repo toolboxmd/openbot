@@ -10,7 +10,8 @@ network:
   use_ipv6: false
   ssl:
     require_ssl: false
-  # WebRTC UDP transit stays off. Same-origin iframe uses the websocket only.
   udp:
     public_ip: 127.0.0.1
     port: 0
+command_line:
+  prompt: false

@@ -10,11 +10,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
+      dbus \
       dbus-x11 \
       fonts-dejavu-core \
       procps \
       ssl-cert \
-      sudo \
       thunar \
       wget \
       x11-xserver-utils \
