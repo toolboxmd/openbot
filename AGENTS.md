@@ -3,8 +3,9 @@
 Read `CONTEXT.md` before changing names.
 Read `docs/agents/issue-tracker.md` before filing tickets.
 Read `docs/adr/` before reversing a locked decision.
+Read `CONTRIBUTING.md` before opening a PR.
 
-Plan on the wayfinder map. Do not implement v1 until the frontier research tickets have a chosen option.
+Layer 1 of the wayfinder map is picked (research, Eyes, CONTRIBUTING). Do not implement v1 until a spec and tracer-bullet tickets exist.
 
 ## Skills
 
