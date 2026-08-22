@@ -1,6 +1,11 @@
 import { FormEvent, useState } from "react";
+import { motion } from "framer-motion";
+import { ArrowRight } from "lucide-react";
+import { Mark } from "@/components/Mark";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { unlock } from "@/lib/session";
 
 type Props = {
@@ -26,38 +31,45 @@ export function PasswordGate({ onUnlocked }: Props) {
   }
 
   return (
-    <main className="flex min-h-full items-center justify-center px-6">
-      <form
+    <main className="flex min-h-full items-center justify-center bg-sidebar px-6">
+      <motion.form
         onSubmit={onSubmit}
-        className="w-full max-w-sm rounded-2xl border border-border bg-card p-8 shadow-lg"
+        initial={{ opacity: 0, scale: 0.98 }}
+        animate={{ opacity: 1, scale: 1 }}
+        transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
+        className="w-full max-w-sm"
       >
-        <p className="text-xs font-medium tracking-[0.2em] text-primary uppercase">OpenBot</p>
-        <h1 className="mt-3 text-2xl font-semibold tracking-tight">Unlock this Computer</h1>
-        <p className="mt-2 text-sm text-muted-foreground">
-          Enter the Password once. An HttpOnly cookie keeps this PWA signed in.
-        </p>
-        <label className="mt-6 block text-sm font-medium" htmlFor="password">
-          Password
-        </label>
-        <Input
-          id="password"
-          name="password"
-          type="password"
-          autoComplete="current-password"
-          autoFocus
-          value={password}
-          onChange={(event) => setPassword(event.target.value)}
-          className="mt-2"
-        />
-        {error ? (
-          <p className="mt-2 text-sm text-destructive" role="alert">
-            {error}
-          </p>
-        ) : null}
-        <Button type="submit" className="mt-6 w-full" disabled={pending || password.length === 0}>
-          {pending ? "Checking…" : "Enter"}
-        </Button>
-      </form>
+        <Card className="border-border/80 shadow-none">
+          <CardHeader>
+            <Mark />
+            <CardTitle className="mt-4">Unlock this Computer</CardTitle>
+            <CardDescription>Enter the Password once. You stay signed in here.</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-3">
+            <Label htmlFor="password">Password</Label>
+            <Input
+              id="password"
+              name="password"
+              type="password"
+              autoComplete="current-password"
+              autoFocus
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+            />
+            {error ? (
+              <p className="text-sm text-destructive" role="alert">
+                {error}
+              </p>
+            ) : null}
+          </CardContent>
+          <CardFooter>
+            <Button type="submit" className="w-full" disabled={pending || password.length === 0}>
+              {pending ? "Checking…" : "Enter"}
+              <ArrowRight />
+            </Button>
+          </CardFooter>
+        </Card>
+      </motion.form>
     </main>
   );
 }
