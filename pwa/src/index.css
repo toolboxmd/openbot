@@ -1,7 +1,5 @@
 @import "tailwindcss";
 
-@custom-variant dark (&:is(.dark *));
-
 @theme inline {
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
@@ -30,34 +28,34 @@
   --color-sidebar-accent: var(--sidebar-accent);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
   --color-sidebar-border: var(--sidebar-border);
-  --font-sans: ui-sans-serif, system-ui, sans-serif;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, sans-serif;
 }
 
 :root {
-  --radius: 0.75rem;
-  --background: oklch(0.16 0.012 55);
-  --foreground: oklch(0.95 0.01 80);
-  --card: oklch(0.2 0.012 55);
-  --card-foreground: oklch(0.95 0.01 80);
-  --popover: oklch(0.2 0.012 55);
-  --popover-foreground: oklch(0.95 0.01 80);
-  --primary: oklch(0.84 0.09 80);
-  --primary-foreground: oklch(0.18 0.02 55);
-  --secondary: oklch(0.26 0.012 55);
-  --secondary-foreground: oklch(0.95 0.01 80);
-  --muted: oklch(0.26 0.01 55);
-  --muted-foreground: oklch(0.72 0.02 70);
-  --accent: oklch(0.28 0.02 55);
-  --accent-foreground: oklch(0.95 0.01 80);
-  --destructive: oklch(0.63 0.2 25);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 14%);
-  --ring: oklch(0.84 0.09 80);
-  --sidebar: oklch(0.14 0.012 55);
-  --sidebar-foreground: oklch(0.9 0.01 80);
-  --sidebar-accent: oklch(0.22 0.014 55);
-  --sidebar-accent-foreground: oklch(0.95 0.01 80);
-  --sidebar-border: oklch(1 0 0 / 8%);
+  --radius: 1rem;
+  --background: #ffffff;
+  --foreground: #111111;
+  --card: #ffffff;
+  --card-foreground: #111111;
+  --popover: #ffffff;
+  --popover-foreground: #111111;
+  --primary: #111111;
+  --primary-foreground: #ffffff;
+  --secondary: #f4f4f5;
+  --secondary-foreground: #111111;
+  --muted: #f4f4f5;
+  --muted-foreground: #737373;
+  --accent: #f4f4f5;
+  --accent-foreground: #111111;
+  --destructive: #dc2626;
+  --border: #ececec;
+  --input: #ececec;
+  --ring: #111111;
+  --sidebar: #f7f7f8;
+  --sidebar-foreground: #111111;
+  --sidebar-accent: #ececec;
+  --sidebar-accent-foreground: #111111;
+  --sidebar-border: #ececec;
 }
 
 @layer base {

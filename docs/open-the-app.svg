@@ -1,21 +1,19 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800">
   <title>OpenBot empty chat after Password</title>
-  <rect width="1280" height="800" fill="#1c1916"/>
-  <rect width="256" height="800" fill="#171411"/>
-  <line x1="256" y1="0" x2="256" y2="800" stroke="#2a2622"/>
-  <text x="24" y="36" fill="#e8b86d" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" letter-spacing="3.2">OPENBOT</text>
-  <text x="24" y="58" fill="#a89f91" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">This Computer</text>
-  <line x1="0" y1="76" x2="256" y2="76" stroke="#2a2622"/>
-  <text x="24" y="108" fill="#8f877c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" letter-spacing="1.6">BOTS</text>
-  <rect x="16" y="124" width="224" height="88" rx="8" fill="none" stroke="#3a3530" stroke-dasharray="4 4"/>
-  <text x="128" y="174" text-anchor="middle" fill="#8f877c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">No Bots yet.</text>
-  <line x1="256" y1="64" x2="1280" y2="64" stroke="#2a2622"/>
-  <text x="280" y="30" fill="#f3ece3" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="600">Thread</text>
-  <text x="280" y="50" fill="#8f877c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Empty shell. Talk to a Bot comes later.</text>
-  <text x="768" y="380" text-anchor="middle" fill="#8f877c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">No messages. Create a Bot on this Computer when that slice lands.</text>
-  <line x1="256" y1="700" x2="1280" y2="700" stroke="#2a2622"/>
-  <rect x="320" y="716" width="880" height="56" rx="12" fill="#24201c" stroke="#3a3530"/>
-  <text x="340" y="750" fill="#8f877c" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Message a Bot…</text>
-  <rect x="1144" y="726" width="40" height="36" rx="8" fill="#e8b86d"/>
-  <path d="M1164 746 l8 -8 l8 8" fill="none" stroke="#1c1916" stroke-width="2"/>
+  <rect width="1280" height="800" fill="#ffffff"/>
+  <rect width="256" height="800" fill="#f7f7f8"/>
+  <line x1="256" y1="0" x2="256" y2="800" stroke="#ececec"/>
+  <text x="24" y="40" fill="#111111" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="600">OpenBot</text>
+  <text x="24" y="62" fill="#737373" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">This Computer</text>
+  <line x1="0" y1="80" x2="256" y2="80" stroke="#ececec"/>
+  <text x="24" y="112" fill="#737373" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">Bots</text>
+  <rect x="16" y="128" width="224" height="72" rx="12" fill="#ffffff" stroke="#ececec"/>
+  <text x="128" y="170" text-anchor="middle" fill="#737373" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">No Bots yet.</text>
+  <line x1="256" y1="64" x2="1280" y2="64" stroke="#ececec"/>
+  <text x="280" y="40" fill="#111111" font-family="ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="600">Thread</text>
+  <text x="768" y="380" text-anchor="middle" fill="#737373" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">No messages yet.</text>
+  <rect x="320" y="716" width="880" height="56" rx="28" fill="#f4f4f5"/>
+  <text x="348" y="750" fill="#737373" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Message a Bot…</text>
+  <circle cx="1164" cy="744" r="18" fill="#111111"/>
+  <path d="M1164 736 v12 M1158 742 l6 -6 l6 6" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
 </svg>
