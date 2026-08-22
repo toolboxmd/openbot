@@ -30,7 +30,7 @@ Headed Chrome driver on the Screen's DISPLAY. Default browser hands. Not Playwri
 User drives the Screen for password, 2FA, captcha, or payment. Never paste secrets in chat.
 
 ## Eyes
-Original code-drawn robot face. Color plus a body shape hashed at create (disc, squircle, stadium, shield, bean, diamond). Two light capsule dots, always on. Idle hops and peek-turns. Write (streaming a message) replaces the face with three dots in that Bot's color. Other states: think, needs-you, sleep.
+Original code-drawn robot face. Color plus a body shape hashed at create (disc, squircle, stadium, shield, bean, diamond). Two light capsule dots, always on. Idle hops and peek-turns. Write (streaming a message) replaces the face with three dots in that Bot's color. Other states: think, needs-you, sleep. While a turn is in flight, Eyes sit under the last chat message above the composer. When the turn is done, that presence is gone. The sidebar face stays.
 
 ## Tunnel
 User-provided Cloudflare tunnel so the PWA is reachable from a phone.
