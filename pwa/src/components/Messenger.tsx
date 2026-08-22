@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { ArrowUp, Bot, Monitor } from "lucide-react";
-import { Mark } from "@/components/Mark";
+import { ArrowUp, Monitor } from "lucide-react";
+import { Eyes } from "@/components/Eyes";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
@@ -34,7 +34,7 @@ export function Messenger() {
     <div data-testid="messenger" className="flex h-full min-h-0 bg-background">
       <aside className="flex w-64 shrink-0 flex-col bg-sidebar text-sidebar-foreground">
         <div className="flex items-center gap-3 px-4 py-4">
-          <Mark size="sm" />
+          <Eyes size={32} />
           <div className="min-w-0">
             <p className="truncate text-sm font-semibold">OpenBot</p>
             <p className="flex items-center gap-1 text-xs text-muted-foreground">
@@ -53,19 +53,14 @@ export function Messenger() {
                     type="button"
                     className="flex w-full items-center gap-2 rounded-2xl px-3 py-2 text-left text-sm hover:bg-sidebar-accent"
                   >
-                    <Bot className="size-4 text-muted-foreground" />
+                    <Eyes name={bot.name} size={28} />
                     {bot.name}
                   </button>
                 </li>
               ))}
             </ul>
           ) : (
-            <div className="flex h-full flex-col items-center justify-center gap-2 px-2 text-center">
-              <span className="flex size-10 items-center justify-center rounded-2xl bg-background">
-                <Bot className="size-4 text-muted-foreground" />
-              </span>
-              <p className="text-sm text-muted-foreground">No Bots yet.</p>
-            </div>
+            <p className="px-3 py-4 text-sm text-muted-foreground">No Bots yet.</p>
           )}
         </div>
       </aside>
@@ -80,11 +75,9 @@ export function Messenger() {
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
-            className="flex flex-col items-center gap-3 text-center"
+            className="flex flex-col items-center gap-4 text-center"
           >
-            <span className="flex size-14 items-center justify-center rounded-3xl bg-secondary">
-              <Bot className="size-6 text-muted-foreground" />
-            </span>
+            <Eyes size={88} />
             <p className="text-sm text-muted-foreground">No messages yet.</p>
           </motion.div>
         </div>

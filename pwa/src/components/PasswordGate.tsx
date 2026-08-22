@@ -1,7 +1,7 @@
 import { FormEvent, useState } from "react";
 import { motion } from "framer-motion";
 import { ArrowRight } from "lucide-react";
-import { Mark } from "@/components/Mark";
+import { Eyes } from "@/components/Eyes";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -41,8 +41,8 @@ export function PasswordGate({ onUnlocked }: Props) {
       >
         <Card className="border-border/80 shadow-none">
           <CardHeader>
-            <Mark />
-            <CardTitle className="mt-4">Unlock this Computer</CardTitle>
+            <Eyes size={56} />
+            <CardTitle className="mt-3">Unlock this Computer</CardTitle>
             <CardDescription>Enter the Password once. You stay signed in here.</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-3">
