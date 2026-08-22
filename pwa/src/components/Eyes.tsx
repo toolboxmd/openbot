@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef } from "react";
-import { bodyPath, EYE, pickColor, pickShape, type FaceMode, type FaceShape } from "@/lib/face";
+import { useEffect, useRef } from "react";
+import { EYE, pickColor, pickShape, type FaceMode, type FaceShape } from "@/lib/face";
 import { cn } from "@/lib/utils";
 
 type Props = {
@@ -21,128 +21,143 @@ function rand(a: number, b: number): number {
   return a + Math.random() * (b - a);
 }
 
-type Pose = {
-  eyeW: number;
-  eyeH: number;
-  lid: number;
-  squash: number;
-  tilt: number;
-  fillOp: number;
-  gazeBias: { x: number; y: number };
-};
+type Vec = { x: number; y: number; z: number };
 
-function poseFor(mode: FaceMode): Pose {
-  switch (mode) {
-    case "think":
-      return { eyeW: 0.92, eyeH: 0.78, lid: 0.12, squash: 1.02, tilt: 5, fillOp: 1, gazeBias: { x: 0.35, y: -0.45 } };
-    case "work":
-      return { eyeW: 0.88, eyeH: 0.72, lid: 0.16, squash: 1, tilt: 0, fillOp: 1, gazeBias: { x: 0, y: 0.18 } };
-    case "needs-you":
-      return { eyeW: 1.18, eyeH: 1.28, lid: 0, squash: 1.04, tilt: 0, fillOp: 1, gazeBias: { x: 0, y: 0 } };
-    case "sleep":
-      return { eyeW: 1.12, eyeH: 0.18, lid: 0.88, squash: 0.92, tilt: -7, fillOp: 0.9, gazeBias: { x: 0, y: 0 } };
-    default:
-      return { eyeW: 1, eyeH: 1, lid: 0.02, squash: 1, tilt: 0, fillOp: 1, gazeBias: { x: 0, y: 0 } };
-  }
+function rotY(p: Vec, a: number): Vec {
+  const c = Math.cos(a);
+  const s = Math.sin(a);
+  return { x: p.x * c + p.z * s, y: p.y, z: -p.x * s + p.z * c };
+}
+function rotX(p: Vec, a: number): Vec {
+  const c = Math.cos(a);
+  const s = Math.sin(a);
+  return { x: p.x, y: p.y * c - p.z * s, z: p.y * s + p.z * c };
+}
+function norm(p: Vec): Vec {
+  const l = Math.hypot(p.x, p.y, p.z) || 1;
+  return { x: p.x / l, y: p.y / l, z: p.z / l };
 }
 
-type Sim = {
-  blinkT: number;
-  blink: number;
-  double: boolean;
-  gaze: { x: number; y: number };
-  target: { x: number; y: number };
-  saccadeIn: number;
-  nextSaccade: number;
-  breath: number;
-  squash: number;
-  tilt: number;
-  lid: number;
-  eyeW: number;
-  eyeH: number;
-  fillOp: number;
-  hop: number;
-  hopT: number;
-  flip: number;
-  flipT: number;
-  flipping: number;
-};
+function hexToRgb(hex: string): [number, number, number] {
+  const h = hex.replace("#", "");
+  return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+}
 
-function freshSim(pose: Pose): Sim {
-  return {
-    blinkT: rand(1.4, 3.8),
-    blink: 0,
-    double: false,
-    gaze: { x: 0, y: 0 },
-    target: { x: 0, y: 0 },
-    saccadeIn: 0,
-    nextSaccade: rand(0.6, 1.6),
-    breath: Math.random() * Math.PI * 2,
-    squash: pose.squash,
-    tilt: pose.tilt,
-    lid: pose.lid,
-    eyeW: pose.eyeW,
-    eyeH: pose.eyeH,
-    fillOp: pose.fillOp,
-    hop: 0,
-    hopT: rand(1.8, 3.6),
-    flip: 1,
-    flipT: rand(4.5, 8),
-    flipping: 0,
-  };
+function mix([ar, ag, ab]: [number, number, number], [br, bg, bb]: [number, number, number], t: number): string {
+  const k = clamp(t, 0, 1);
+  return `rgb(${Math.round(ar + (br - ar) * k)},${Math.round(ag + (bg - ag) * k)},${Math.round(ab + (bb - ab) * k)})`;
+}
+
+/** Stretch a unit sphere into the hashed 3D body. */
+function deform(p: Vec, shape: FaceShape): Vec {
+  if (shape === "capsule") return norm({ x: p.x * 0.72, y: p.y * 1.18, z: p.z * 0.72 });
+  if (shape === "rounded-cube") {
+    const n = 3.2;
+    const s = (Math.abs(p.x) ** n + Math.abs(p.y) ** n + Math.abs(p.z) ** n) ** (1 / n) || 1;
+    return { x: p.x / s, y: p.y / s, z: p.z / s };
+  }
+  if (shape === "diamond") return norm({ x: p.x * 1.15, y: p.y * 1.28, z: p.z * 1.15 });
+  if (shape === "bean") return norm({ x: p.x * 1.08 + 0.12, y: p.y * 0.92, z: p.z * 0.95 });
+  if (shape === "shield") return norm({ x: p.x * 0.92, y: p.y * 1.22 + 0.08, z: p.z * 0.88 });
+  return p;
+}
+
+function pose(mode: FaceMode) {
+  switch (mode) {
+    case "think":
+      return { lid: 0.12, eye: 0.92, look: { x: 0.28, y: -0.35 } };
+    case "work":
+      return { lid: 0.18, eye: 0.88, look: { x: 0, y: 0.12 } };
+    case "needs-you":
+      return { lid: 0, eye: 1.18, look: { x: 0, y: 0 } };
+    case "sleep":
+      return { lid: 0.88, eye: 1.05, look: { x: 0, y: 0 } };
+    default:
+      return { lid: 0.04, eye: 1, look: { x: 0, y: 0 } };
+  }
 }
 
 export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle", className }: Props) {
   const resolvedShape = shape ?? pickShape(name);
   const resolvedColor = color ?? pickColor(name);
-  const body = useMemo(() => bodyPath(resolvedShape), [resolvedShape]);
-  const svgRef = useRef<SVGSVGElement>(null);
-  const gRef = useRef<SVGGElement>(null);
-  const leftRef = useRef<SVGEllipseElement>(null);
-  const rightRef = useRef<SVGEllipseElement>(null);
-  const pointer = useRef({ x: 0, y: 0 });
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const el = canvas;
+    const g = ctx;
+
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const pose0 = poseFor(mode);
-    const sim = freshSim(pose0);
-    let last = performance.now();
-    let raf = 0;
+    const pointer = { x: 0, y: 0 };
+    const base = hexToRgb(resolvedColor);
+    const p0 = pose(mode);
+
+    const sim = {
+      yaw: 0,
+      pitch: 0,
+      targetYaw: 0,
+      targetPitch: 0,
+      blink: 0,
+      blinkT: rand(1.6, 3.4),
+      double: false,
+      lid: p0.lid,
+      hop: 0,
+      hopT: rand(2.2, 4.2),
+      wrap: 0,
+      wrapT: rand(6, 11),
+      wrapping: 0,
+      breath: Math.random() * Math.PI * 2,
+    };
 
     function onMove(event: PointerEvent) {
-      const el = svgRef.current;
-      if (!el) return;
       const box = el.getBoundingClientRect();
-      const nx = (event.clientX - (box.left + box.width / 2)) / Math.max(24, box.width / 2);
-      const ny = (event.clientY - (box.top + box.height / 2)) / Math.max(24, box.height / 2);
-      pointer.current = { x: clamp(nx, -1, 1), y: clamp(ny, -1, 1) };
+      pointer.x = clamp((event.clientX - (box.left + box.width / 2)) / (box.width / 2), -1, 1);
+      pointer.y = clamp((event.clientY - (box.top + box.height / 2)) / (box.height / 2), -1, 1);
     }
     window.addEventListener("pointermove", onMove);
 
-    function tick(dt: number) {
-      const p = poseFor(mode);
-      const k = dt === 0 ? 1 : 1 - Math.pow(0.001, dt);
-      sim.eyeW = lerp(sim.eyeW, p.eyeW, k);
-      sim.eyeH = lerp(sim.eyeH, p.eyeH, k);
-      sim.lid = lerp(sim.lid, p.lid, k);
-      sim.squash = lerp(sim.squash, p.squash, k);
-      sim.tilt = lerp(sim.tilt, p.tilt, k);
-      sim.fillOp = lerp(sim.fillOp, p.fillOp, k);
+    let raf = 0;
+    let last = performance.now();
 
-      const lively = !reduced && (mode === "idle" || mode === "needs-you" || mode === "think");
+    function drawEye(ctx2: CanvasRenderingContext2D, p: Vec, radius: number, lid: number, scale: number) {
+      if (p.z < 0.08) return;
+      const cx = radius + p.x * radius * 0.86;
+      const cy = radius - p.y * radius * 0.86;
+      const foreshort = 0.35 + 0.65 * clamp(p.z, 0, 1);
+      const rx = 5.4 * scale * foreshort;
+      const ry = Math.max(0.7, 7.8 * scale * foreshort * (1 - lid * 0.94));
+      ctx2.save();
+      ctx2.translate(cx, cy);
+      ctx2.rotate(-p.x * 0.35);
+      ctx2.beginPath();
+      ctx2.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
+      ctx2.fillStyle = EYE;
+      ctx2.globalAlpha = clamp((p.z - 0.08) / 0.4, 0, 1);
+      ctx2.fill();
+      ctx2.restore();
+    }
+
+    function paint(dt: number) {
+      const p = pose(mode);
+      sim.lid = lerp(sim.lid, p.lid, 1 - Math.pow(0.001, dt));
+      sim.breath += dt * Math.PI * 2 * 0.32;
+
       if (!reduced && mode !== "sleep") {
         sim.blinkT -= dt;
         if (sim.blinkT <= 0 && sim.blink <= 0) {
           sim.blink = 0.001;
-          sim.double = Math.random() < 0.18;
-          sim.blinkT = rand(2.2, 6.5) * (mode === "work" || mode === "think" ? 1.6 : 1);
+          sim.double = Math.random() < 0.16;
+          sim.blinkT = rand(2.1, 5.8);
         }
       }
       let blinkLid = 0;
       if (sim.blink > 0) {
-        const close = 0.08;
-        const hold = 0.02;
-        const open = 0.14;
+        const close = 0.07;
+        const hold = 0.03;
+        const open = 0.12;
         const t = sim.blink;
         if (t < close) blinkLid = t / close;
         else if (t < close + hold) blinkLid = 1;
@@ -154,146 +169,136 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
         if (sim.blink > 0) sim.blink += dt;
       }
 
-      sim.nextSaccade -= dt;
-      const aim = {
-        x: clamp(pointer.current.x * 0.55 + p.gazeBias.x, -0.7, 0.7),
-        y: clamp(pointer.current.y * 0.45 + p.gazeBias.y, -0.55, 0.55),
-      };
-      if (mode === "needs-you" || mode === "sleep") {
-        sim.target.x = 0;
-        sim.target.y = 0;
-      } else if (sim.saccadeIn > 0) {
-        sim.saccadeIn -= dt;
-      } else if (sim.nextSaccade <= 0 && !reduced) {
-        sim.target.x = clamp(aim.x + rand(-0.2, 0.2), -0.75, 0.75);
-        sim.target.y = clamp(aim.y + rand(-0.18, 0.18), -0.55, 0.55);
-        sim.saccadeIn = rand(0.06, 0.09);
-        sim.nextSaccade = mode === "think" ? rand(0.5, 1.2) : rand(1.1, 2.8);
-      } else {
-        sim.target.x = lerp(sim.target.x, aim.x, 0.08);
-        sim.target.y = lerp(sim.target.y, aim.y, 0.08);
+      if (mode === "idle" && !reduced) {
+        sim.wrapT -= dt;
+        if (sim.wrapT <= 0 && sim.wrapping <= 0) {
+          sim.wrapping = 0.001;
+          sim.wrapT = rand(7, 13);
+        }
       }
-      const st = sim.saccadeIn > 0 ? 0.55 : 0.18;
-      sim.gaze.x = lerp(sim.gaze.x, sim.target.x, st);
-      sim.gaze.y = lerp(sim.gaze.y, sim.target.y, st);
+      if (sim.wrapping > 0) {
+        const u = Math.min(1, sim.wrapping / 1.15);
+        sim.wrap = Math.sin(u * Math.PI) * Math.PI;
+        if (u >= 1) {
+          sim.wrapping = 0;
+          sim.wrap = 0;
+        } else sim.wrapping += dt;
+      } else {
+        sim.wrap = lerp(sim.wrap, 0, 0.12);
+      }
 
-      if (lively && mode !== "think") {
+      if (!reduced && (mode === "idle" || mode === "needs-you")) {
         sim.hopT -= dt;
         if (sim.hopT <= 0 && sim.hop <= 0) {
           sim.hop = 0.001;
-          sim.hopT = rand(2.8, 6.2);
+          sim.hopT = rand(2.6, 5.5);
         }
       }
       let hopY = 0;
-      let hopSquash = 1;
       if (sim.hop > 0) {
         const up = 0.12;
-        const hang = 0.04;
-        const down = 0.14;
+        const down = 0.16;
         const t = sim.hop;
-        if (t < up) {
-          const u = t / up;
-          hopY = -10 * u * (2 - u);
-          hopSquash = 1 - 0.08 * u;
-        } else if (t < up + hang) {
-          hopY = -10;
-          hopSquash = 0.92;
-        } else if (t < up + hang + down) {
-          const u = (t - up - hang) / down;
-          hopY = -10 * (1 - u * u);
-          hopSquash = 0.92 + 0.16 * u;
-        } else {
-          sim.hop = 0;
-          hopSquash = 1.08;
-        }
+        if (t < up) hopY = -8 * (t / up);
+        else if (t < up + down) hopY = -8 * (1 - (t - up) / down);
+        else sim.hop = 0;
         if (sim.hop > 0) sim.hop += dt;
       }
 
-      if (mode === "idle" && !reduced) {
-        sim.flipT -= dt;
-        if (sim.flipT <= 0 && sim.flipping <= 0) {
-          sim.flipping = 0.001;
-          sim.flipT = rand(5.5, 11);
-        }
-      }
-      if (sim.flipping > 0) {
-        const dur = 0.7;
-        const u = Math.min(1, sim.flipping / dur);
-        const ang = u < 0.5 ? u * 2 : 1 - (u - 0.5) * 2;
-        sim.flip = Math.cos(ang * Math.PI);
-        if (u >= 1) {
-          sim.flipping = 0;
-          sim.flip = 1;
-        } else sim.flipping += dt;
-      } else {
-        sim.flip = lerp(sim.flip, 1, 0.2);
-      }
-      if (mode !== "idle") sim.flip = lerp(sim.flip, 1, k);
+      const aimYaw = reduced ? 0 : pointer.x * 0.55 + p.look.x + (mode === "idle" ? Math.sin(sim.breath * 0.35) * 0.18 : 0);
+      const aimPitch = reduced ? 0 : -pointer.y * 0.4 + p.look.y;
+      sim.targetYaw = clamp(aimYaw, -0.7, 0.7);
+      sim.targetPitch = clamp(aimPitch, -0.45, 0.4);
+      sim.yaw = lerp(sim.yaw, sim.targetYaw + sim.wrap, reduced ? 1 : 0.12);
+      sim.pitch = lerp(sim.pitch, sim.targetPitch, reduced ? 1 : 0.12);
 
-      sim.breath += dt * Math.PI * 2 * (mode === "sleep" ? 0.22 : 0.35);
-      const breath = reduced || mode === "work" ? 0 : Math.sin(sim.breath) * 0.012;
-      const lid = clamp(sim.lid + blinkLid * (1 - sim.lid), 0, 1);
-      const eyeH = Math.max(0.1, sim.eyeH * (1 - lid * 0.92));
-      const eyeW = 8.6 * sim.eyeW;
-      const eyeY = 44 + sim.gaze.y * 10;
-      const gap = 12.5;
-      const eyeOp = Math.max(0, Math.abs(sim.flip) - 0.18) / 0.82;
-      const left = leftRef.current;
-      const right = rightRef.current;
-      if (left && right) {
-        left.setAttribute("cx", String(50 - gap + sim.gaze.x * 9));
-        right.setAttribute("cx", String(50 + gap + sim.gaze.x * 9));
-        left.setAttribute("cy", String(eyeY));
-        right.setAttribute("cy", String(eyeY));
-        left.setAttribute("rx", String(eyeW));
-        right.setAttribute("rx", String(eyeW));
-        left.setAttribute("ry", String(10.4 * eyeH));
-        right.setAttribute("ry", String(10.4 * eyeH));
-        left.setAttribute("opacity", String(eyeOp));
-        right.setAttribute("opacity", String(eyeOp));
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const px = size * dpr;
+      if (el.width !== px) {
+        el.width = px;
+        el.height = px;
       }
-      const sy = sim.squash * hopSquash * (1 + breath);
-      const sx = (1 / Math.sqrt(Math.max(0.4, sy))) * sim.flip;
-      gRef.current?.setAttribute(
-        "transform",
-        `translate(50 ${50 + hopY}) rotate(${sim.tilt}) scale(${sx} ${sy}) translate(-50 -50)`,
+      g.setTransform(dpr, 0, 0, dpr, 0, hopY * (size / 100));
+      g.clearRect(0, -20, size, size + 40);
+
+      const radius = size / 2;
+      const breath = reduced || mode === "work" ? 0 : Math.sin(sim.breath) * 0.012;
+      const r = radius * (0.92 + breath);
+
+      const light: Vec = norm({ x: -0.42, y: 0.62, z: 0.66 });
+      const grad = g.createRadialGradient(
+        radius + light.x * r * 0.35,
+        radius - light.y * r * 0.35,
+        r * 0.08,
+        radius,
+        radius,
+        r,
       );
+      const highlight = mix(base, [255, 255, 255], resolvedColor === "#141414" ? 0.28 : 0.22);
+      const shade = mix(base, [0, 0, 0], 0.55);
+      grad.addColorStop(0, highlight);
+      grad.addColorStop(0.42, resolvedColor);
+      grad.addColorStop(1, shade);
+
+      g.beginPath();
+      if (resolvedShape === "capsule") {
+        g.ellipse(radius, radius, r * 0.78, r, 0, 0, Math.PI * 2);
+      } else if (resolvedShape === "rounded-cube") {
+        const x = radius - r * 0.86;
+        const s = r * 1.72;
+        g.roundRect(x, x, s, s, r * 0.42);
+      } else if (resolvedShape === "diamond") {
+        g.moveTo(radius, radius - r);
+        g.lineTo(radius + r * 0.78, radius);
+        g.lineTo(radius, radius + r);
+        g.lineTo(radius - r * 0.78, radius);
+        g.closePath();
+      } else {
+        g.arc(radius, radius, r, 0, Math.PI * 2);
+      }
+      g.fillStyle = grad;
+      g.fill();
+
+      g.beginPath();
+      g.arc(radius, radius, r, 0, Math.PI * 2);
+      g.strokeStyle = mix(base, [0, 0, 0], 0.35);
+      g.lineWidth = Math.max(1, size * 0.02);
+      g.globalAlpha = resolvedShape === "sphere" || resolvedShape === "bean" || resolvedShape === "shield" ? 0.35 : 0;
+      g.stroke();
+      g.globalAlpha = 1;
+
+      const lid = clamp(sim.lid + blinkLid * (1 - sim.lid), 0, 1);
+      const eyeScale = p.eye * (size / 88);
+      const left0 = deform(norm({ x: -0.32, y: 0.1, z: 0.94 }), resolvedShape);
+      const right0 = deform(norm({ x: 0.32, y: 0.1, z: 0.94 }), resolvedShape);
+      const left = rotX(rotY(left0, sim.yaw), sim.pitch);
+      const right = rotX(rotY(right0, sim.yaw), sim.pitch);
+      drawEye(g, left, radius, lid, eyeScale);
+      drawEye(g, right, radius, lid, eyeScale);
     }
 
     function loop(now: number) {
       const dt = Math.min(0.05, (now - last) / 1000);
       last = now;
-      tick(dt);
+      paint(dt);
       raf = requestAnimationFrame(loop);
     }
-    tick(0);
+    paint(0);
     raf = requestAnimationFrame(loop);
     return () => {
       cancelAnimationFrame(raf);
       window.removeEventListener("pointermove", onMove);
     };
-  }, [mode]);
+  }, [mode, resolvedColor, resolvedShape, size]);
 
   return (
-    <svg
-      ref={svgRef}
-      viewBox="0 0 100 100"
+    <canvas
+      ref={canvasRef}
       width={size}
       height={size}
       aria-hidden
-      className={cn("overflow-visible", className)}
-    >
-      <g ref={gRef}>
-        {body.type === "ellipse" ? (
-          <ellipse cx={body.cx} cy={body.cy} rx={body.rx} ry={body.ry} fill={resolvedColor} />
-        ) : null}
-        {body.type === "rect" ? (
-          <rect x={body.x} y={body.y} width={body.w} height={body.h} rx={body.rx} fill={resolvedColor} />
-        ) : null}
-        {body.type === "path" ? <path d={body.d} fill={resolvedColor} /> : null}
-        <ellipse ref={leftRef} cx="37.5" cy="44" rx="8.6" ry="10.4" fill={EYE} />
-        <ellipse ref={rightRef} cx="62.5" cy="44" rx="8.6" ry="10.4" fill={EYE} />
-      </g>
-    </svg>
+      className={cn("block", className)}
+      style={{ width: size, height: size }}
+    />
   );
 }
