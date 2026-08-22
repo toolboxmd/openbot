@@ -77,7 +77,7 @@ export function Messenger() {
             transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
             className="flex flex-col items-center gap-4 text-center"
           >
-            <Eyes size={88} />
+            <Eyes size={140} />
             <p className="text-sm text-muted-foreground">No messages yet.</p>
           </motion.div>
         </div>
