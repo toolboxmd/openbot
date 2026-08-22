@@ -172,3 +172,30 @@ describe("Computer Screen without an upstream", () => {
     assert.equal(screen.status, 503);
   });
 });
+
+describe("Computer Screen with an unreachable upstream", () => {
+  let box: RunningBox;
+
+  before(async () => {
+    box = await startBox({
+      password: PASSWORD,
+      pwaDir: await emptyPwa(),
+      host: "127.0.0.1",
+      port: 0,
+      screenUpstream: "http://127.0.0.1:1",
+    });
+  });
+
+  after(async () => {
+    await box.close();
+  });
+
+  test("Computer is not ready when Screen does not answer", async () => {
+    const cookie = await login(box.url);
+    const api = await fetch(`${box.url}/api/computer`, { headers: { cookie } });
+    assert.ok(api.ok);
+    const body = (await api.json()) as { path?: string; ready?: boolean };
+    assert.equal(body.path, "/screen/");
+    assert.equal(body.ready, false);
+  });
+});
