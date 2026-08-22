@@ -1,15 +1,15 @@
 FROM node:22-alpine AS pwa
 WORKDIR /src
-COPY package.json package-lock.json ./
-RUN npm ci
+COPY package.json package-lock.json* ./
+RUN npm install
 COPY pwa ./pwa
 COPY daemon ./daemon
 RUN npm run build:pwa
 
 FROM node:22-alpine
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci
+COPY package.json package-lock.json* ./
+RUN npm install
 COPY daemon ./daemon
 COPY --from=pwa /src/pwa/dist ./pwa
 ENV NODE_ENV=production
