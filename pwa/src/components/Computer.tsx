@@ -5,6 +5,8 @@ function screenSrc(path: string): string {
   const url = new URL(path, "http://openbot.local");
   url.searchParams.set("autoconnect", "1");
   url.searchParams.set("resize", "remote");
+  // Kasm defaults to ws://origin/websockify. Keep the socket on /screen/.
+  url.searchParams.set("path", "screen/websockify");
   return `${url.pathname}${url.search}`;
 }
 
