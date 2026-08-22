@@ -25,3 +25,13 @@ export async function listBots(): Promise<BotList> {
   }
   return (await res.json()) as BotList;
 }
+
+export type Computer = { path: string; ready: boolean };
+
+export async function getComputer(): Promise<Computer> {
+  const res = await fetch("/api/computer", { credentials: "same-origin" });
+  if (!res.ok) {
+    throw new Error("session expired");
+  }
+  return (await res.json()) as Computer;
+}

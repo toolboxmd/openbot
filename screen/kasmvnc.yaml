@@ -1,0 +1,16 @@
+desktop:
+  resolution:
+    width: 1280
+    height: 800
+network:
+  protocol: http
+  interface: 0.0.0.0
+  websocket_port: 6901
+  use_ipv4: true
+  use_ipv6: false
+  ssl:
+    require_ssl: false
+  # WebRTC UDP transit stays off. Same-origin iframe uses the websocket only.
+  udp:
+    public_ip: 127.0.0.1
+    port: 0
