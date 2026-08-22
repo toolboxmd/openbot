@@ -274,6 +274,16 @@ async function servePwa(
   }
 }
 
+async function screenIsReachable(upstream: string | undefined): Promise<boolean> {
+  if (!upstream) return false;
+  try {
+    await fetch(upstream, { signal: AbortSignal.timeout(750), redirect: "manual" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function startBox(options: BoxOptions): Promise<RunningBox> {
   const host = options.host ?? "0.0.0.0";
   const salt = crypto.randomBytes(16);
@@ -340,7 +350,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         }
         sendJson(res, 200, {
           path: `${SCREEN_PREFIX}/`,
-          ready: Boolean(options.screenUpstream),
+          ready: await screenIsReachable(options.screenUpstream),
         });
         return;
       }
