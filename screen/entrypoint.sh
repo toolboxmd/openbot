@@ -21,7 +21,9 @@ if [ ! -e /run/dbus/pid ]; then
   dbus-daemon --system --fork || true
 fi
 
+rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
 mkdir -p "$HOME/.vnc"
+rm -f "$HOME/.vnc/"*.pid "$HOME/.vnc/"*.log
 cp /etc/openbot/xstartup "$HOME/.vnc/xstartup"
 chmod +x "$HOME/.vnc/xstartup"
 # Kasm's first-run DE picker needs a TTY. Mark it done and keep our xstartup.
