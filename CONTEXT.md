@@ -6,7 +6,7 @@ Glossary only. No implementation.
 Self-hosted Grok Bot. Named Bots on one Computer. MIT. Repo `toolboxmd/openbot`.
 
 ## Computer
-One Linux VM per instance. Shared files, CLI credentials, and browser cookie jar. Not a security boundary per Bot.
+One Linux desktop per instance (Docker Screen). Shared files and browser cookie jar. Not a security boundary per Bot. Harness CLI logins live on the host OS, not inside Screen.
 
 ## Bot
 A named teammate with a profile (name, title, description, Eyes, Harness) and its own Screen. Persistent.
@@ -18,16 +18,16 @@ Private XFCE desktop for one Bot. Other Bots cannot see its windows. Watch via K
 A Bot whose Screen is currently running. RAM and CPU count per Active Bot, not per sidebar row.
 
 ## Sleep
-Stop an idle Screen so it stops costing RAM. Cold start when opened again.
+Stop an idle Screen so it stops costing RAM. Cold start when opened again. Also kills that Bot's Harness child.
 
 ## Harness
-The coding agent CLI on a Bot: Codex, Claude Code, Grok Build, or Kimi Code, over ACP. User picks one, then OAuth on that Screen.
+The coding agent CLI already on the host OS (Codex, Claude Code, Grok Build, or Kimi Code) over ACP. The picker shows what is on PATH. The process runs beside Screen, not inside XFCE. The user does not watch its terminal. Files are a host folder also mounted on Screen. Vendor login is that host CLI home. Takeover is for site 2FA.
 
 ## PinchTab
 Headed Chrome driver on the Screen's DISPLAY. Default browser hands. Not Playwright.
 
 ## Takeover
-User drives the Screen for password, 2FA, captcha, or payment. Never paste secrets in chat.
+User drives the Screen for password, 2FA, captcha, or payment. Never paste secrets in chat. Not used for Harness CLI login.
 
 ## Eyes
 Code-drawn robot face (color + shape). States: idle, thinking, working, needs-you, asleep.
