@@ -46,6 +46,7 @@ export class AcpClient {
   private nextId = 1;
   private pending = new Map<RpcId, Pending>();
   private closed = false;
+  private paused = false;
   private sessionId: string | null = null;
   private turnText = "";
   private idleResolvers: Array<() => void> = [];
@@ -67,7 +68,10 @@ export class AcpClient {
     const out = readline.createInterface({ input: this.child.stdout });
     out.on("line", (line) => this.onLine(line));
     const err = readline.createInterface({ input: this.child.stderr });
-    err.on("line", (line) => this.handlers.onStderr?.(line));
+    err.on("line", (line) => {
+      console.error(`[acp] ${line}`);
+      this.handlers.onStderr?.(line);
+    });
     this.child.on("exit", () => {
       this.failAll(new Error("ACP child exited"));
     });
@@ -75,6 +79,10 @@ export class AcpClient {
 
   get pid(): number | undefined {
     return this.child.pid;
+  }
+
+  get hasSession(): boolean {
+    return this.sessionId !== null;
   }
 
   private send(obj: unknown): void {
@@ -203,6 +211,10 @@ export class AcpClient {
     return id;
   }
 
+  async authenticate(methodId: string): Promise<void> {
+    await this.request("authenticate", { methodId });
+  }
+
   async prompt(text: string): Promise<string> {
     if (!this.sessionId) throw new Error("no ACP session");
     this.turnText = "";
@@ -226,10 +238,45 @@ export class AcpClient {
     });
   }
 
+  pause(): void {
+    if (this.closed || this.paused) return;
+    const pid = this.child.pid;
+    if (!pid) return;
+    try {
+      process.kill(pid, "SIGSTOP");
+      this.paused = true;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  resume(): void {
+    if (this.closed || !this.paused) return;
+    const pid = this.child.pid;
+    if (!pid) return;
+    try {
+      process.kill(pid, "SIGCONT");
+      this.paused = false;
+    } catch {
+      /* ignore */
+    }
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
     this.failAll(new Error("ACP client closed"));
+    if (this.paused) {
+      this.paused = false;
+      const pid = this.child.pid;
+      if (pid) {
+        try {
+          process.kill(pid, "SIGCONT");
+        } catch {
+          /* ignore */
+        }
+      }
+    }
     try {
       this.child.kill("SIGTERM");
     } catch {

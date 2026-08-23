@@ -32,7 +32,7 @@ One origin. The host daemon is Talk, the reverse proxy, and the PWA.
 - daemon: Password, session cookie, static PWA, Computer API, per-Bot Screen proxy, Bots, Codex ACP, Sleep
 - one Screen container per Active Bot: Debian bookworm, XFCE, KasmVNC, Chrome
 - Kasm basic auth is injected by the proxy. WebRTC is off.
-- Talk: host Codex ACP. Picker detects other CLIs. This slice only spawns Codex. No PinchTab server (headed Chromium with a unique profile + shared cookie-jar mount). No Takeover yet.
+- Talk: host Codex ACP. Picker detects other CLIs. This slice only spawns Codex. No PinchTab server (headed Chromium with a unique profile + shared cookie-jar mount). Takeover pauses that Bot ACP child and grants Kasm write (/api/update_user); release returns view-only. Agent-requested needs-you does not auto-grant write.
 
 ## Tests
 

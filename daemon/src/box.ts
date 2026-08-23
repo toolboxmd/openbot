@@ -3,7 +3,8 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
 import path from "node:path";
-import { BotStore, defaultWorkspaceDir, type BotStoreDeps } from "./bots.ts";
+import { BotStore, defaultWorkspaceDir, type BotStoreDeps, type NeedsYouReason } from "./bots.ts";
+import { kasmUpdateWrite } from "./kasm.ts";
 import { NoopScreenRuntime, type ScreenRuntime } from "./screens.ts";
 
 export type BoxOptions = {
@@ -386,6 +387,19 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
     return undefined;
   }
 
+  async function applyKasmWrite(botId: string, write: boolean): Promise<void> {
+    if (!options.kasmUser || options.kasmPassword === undefined) return;
+    const upstream = upstreamFor(botId);
+    if (!upstream) return;
+    await kasmUpdateWrite({
+      upstream,
+      user: options.kasmUser,
+      password: options.kasmPassword,
+      name: options.kasmUser,
+      write,
+    });
+  }
+
   const server = http.createServer((req, res) => {
     void handle(req, res);
   });
@@ -585,6 +599,74 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         return;
       }
 
+      const takeoverMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/takeover$/);
+      if (takeoverMatch && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        const botId = decodeURIComponent(takeoverMatch[1]);
+        try {
+          const bot = store.takeover(botId);
+          try {
+            await applyKasmWrite(botId, true);
+          } catch (err) {
+            store.release(botId);
+            throw err;
+          }
+          sendJson(res, 200, bot);
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
+      const releaseMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/release$/);
+      if (releaseMatch && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        const botId = decodeURIComponent(releaseMatch[1]);
+        try {
+          try {
+            await applyKasmWrite(botId, false);
+          } catch {
+            // still release Talk state so the user is not stuck holding write
+          }
+          const bot = store.release(botId);
+          sendJson(res, 200, bot);
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
+      const needsYouMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/needs-you$/);
+      if (needsYouMatch && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        let body: Record<string, unknown> = {};
+        try {
+          const raw = await readBody(req);
+          body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        try {
+          const reasonRaw = typeof body.reason === "string" ? body.reason : "2fa";
+          const reason: NeedsYouReason = reasonRaw === "login" ? "login" : "2fa";
+          const bot = store.requestNeedsYou(decodeURIComponent(needsYouMatch[1]), reason);
+          sendJson(res, 200, bot);
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
       const botMatch = url.pathname.match(/^\/api\/bots\/([^/]+)$/);
       if (botMatch) {
         if (!hasSession(req, key)) {
@@ -634,6 +716,9 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
             ready: false,
             botId: null,
             cookieJar: screens.cookieJar(),
+            write: false,
+            viewOnly: true,
+            takeover: false,
           });
           return;
         }
@@ -643,12 +728,16 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
           return;
         }
         const upstream = upstreamFor(botId);
+        const taken = store.isTakeover(botId);
         sendJson(res, 200, {
           path: `${SCREEN_PREFIX}/${botId}/`,
           ready: Boolean(upstream) && (bot?.screen === "active") && (await screenIsReachable(upstream, auth)),
           botId,
           screen: bot?.screen ?? "asleep",
           cookieJar: screens.cookieJar(),
+          write: taken,
+          viewOnly: !taken,
+          takeover: taken,
         });
         return;
       }

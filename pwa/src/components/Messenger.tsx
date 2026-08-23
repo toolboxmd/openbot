@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { ArrowUp, Maximize2, MessageSquare, Monitor, Moon, Plus, Sun } from "lucide-react";
+import { ArrowUp, Maximize2, Monitor, Moon, Plus, Sun } from "lucide-react";
 import { ComputerScreen } from "@/components/Computer";
 import { Eyes } from "@/components/Eyes";
 import { Button } from "@/components/ui/button";
@@ -88,14 +88,6 @@ export function Messenger() {
     return () => window.clearInterval(tick);
   }, [activeId]);
 
-  useEffect(() => {
-    if (!computerOpen) return;
-    function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") setComputerOpen(false);
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [computerOpen]);
 
   async function onCreate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -442,19 +434,13 @@ export function Messenger() {
                 computerOpen ? "fixed inset-0 z-50" : "group relative aspect-video rounded-2xl",
               )}
             >
-              <ComputerScreen botId={live?.id ?? activeId} screen={live?.screen ?? active?.screen} />
-              {computerOpen ? (
-                <Button
-                  type="button"
-                  size="lg"
-                  aria-label="Back to chat"
-                  onClick={() => setComputerOpen(false)}
-                  className="absolute top-4 right-4 z-10 h-12 rounded-full px-6 text-base shadow-lg [&_svg]:size-5"
-                >
-                  <MessageSquare />
-                  Chat
-                </Button>
-              ) : (
+              <ComputerScreen
+                botId={live?.id ?? activeId}
+                screen={live?.screen ?? active?.screen}
+                expanded={computerOpen}
+                onClose={() => setComputerOpen(false)}
+              />
+              {computerOpen ? null : (
                 <button
                   type="button"
                   onClick={() => setComputerOpen(true)}

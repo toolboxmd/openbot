@@ -25,12 +25,13 @@ export type Bot = {
   screen: "asleep" | "waking" | "active";
   eyes: { color: string; shape: string; mode: EyesMode };
   write: boolean;
+  takeover: boolean;
   permission: {
     title: string;
     description?: string;
     options: Array<{ optionId: string; name: string; kind?: string }>;
   } | null;
-  needsYou: { reason: "login"; hint: string } | null;
+  needsYou: { reason: "login" | "2fa"; hint: string } | null;
   messages?: Array<{ id: string; role: "user" | "assistant"; text: string }>;
 };
 
@@ -122,6 +123,9 @@ export type Computer = {
   botId?: string | null;
   screen?: "asleep" | "waking" | "active";
   cookieJar?: string;
+  write?: boolean;
+  viewOnly?: boolean;
+  takeover?: boolean;
 };
 
 export async function getComputer(botId?: string | null): Promise<Computer> {
@@ -153,6 +157,30 @@ export async function wakeBot(id: string): Promise<Bot> {
   if (!res.ok) {
     const body = (await res.json().catch(() => ({}))) as { error?: string };
     throw new Error(body.error ?? "Could not Wake.");
+  }
+  return (await res.json()) as Bot;
+}
+
+export async function takeoverBot(id: string): Promise<Bot> {
+  const res = await fetch(`/api/bots/${encodeURIComponent(id)}/takeover`, {
+    method: "POST",
+    credentials: "same-origin",
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Could not Takeover.");
+  }
+  return (await res.json()) as Bot;
+}
+
+export async function releaseTakeover(id: string): Promise<Bot> {
+  const res = await fetch(`/api/bots/${encodeURIComponent(id)}/release`, {
+    method: "POST",
+    credentials: "same-origin",
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Could not hand back.");
   }
   return (await res.json()) as Bot;
 }

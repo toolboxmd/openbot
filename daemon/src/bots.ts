@@ -28,6 +28,8 @@ export type PublicPermission = {
 
 export type ScreenState = "asleep" | "waking" | "active";
 
+export type NeedsYouReason = "login" | "2fa";
+
 export type PublicBot = {
   id: string;
   name: string;
@@ -35,13 +37,16 @@ export type PublicBot = {
   screen: ScreenState;
   eyes: { color: string; shape: FaceShape; mode: EyesMode };
   write: boolean;
+  takeover: boolean;
   permission: PublicPermission | null;
-  needsYou: { reason: "login"; hint: string } | null;
+  needsYou: { reason: NeedsYouReason; hint: string } | null;
   messages?: PublicMessage[];
 };
 
 export type AcpSession = {
   close(): void;
+  pause?(): void;
+  resume?(): void;
   initialize(): Promise<unknown>;
   newSession(cwd: string): Promise<unknown>;
   prompt(text: string): Promise<string>;
@@ -56,8 +61,9 @@ type Bot = {
   harness: HarnessId | null;
   screen: ScreenState;
   write: boolean;
+  takeover: boolean;
   eyesMode: EyesMode;
-  needsYou: { reason: "login"; hint: string } | null;
+  needsYou: { reason: NeedsYouReason; hint: string } | null;
   permission: (PermissionPrompt & PublicPermission) | null;
   messages: PublicMessage[];
   client: AcpSession | null;
@@ -132,6 +138,7 @@ export class BotStore {
   private screens: ScreenRuntime;
   private spawnAcpFn: (spec: SpawnSpec, cwd: string, handlers?: AcpHandlers) => AcpSession;
   private listHarnessesFn: () => HarnessInfo[];
+  private takenOverId: string | null = null;
 
   constructor(workspaceDir: string, deps: BotStoreDeps = {}) {
     this.workspaceDir = workspaceDir;
@@ -203,6 +210,7 @@ export class BotStore {
       harness: null,
       screen: "asleep",
       write: false,
+      takeover: false,
       eyesMode: "sleep",
       needsYou: null,
       permission: null,
@@ -214,10 +222,68 @@ export class BotStore {
     return this.toPublic(bot, true);
   }
 
+  takeoverHeld(): string | null {
+    return this.takenOverId;
+  }
+
+  isTakeover(id: string): boolean {
+    return this.takenOverId === id;
+  }
+
+  takeover(id: string): PublicBot {
+    const bot = this.require(id);
+    if (bot.screen !== "active") {
+      throw Object.assign(new Error("Wake this Bot first"), { status: 409 });
+    }
+    if (this.takenOverId && this.takenOverId !== id) {
+      throw Object.assign(new Error("One Takeover per Screen"), { status: 409 });
+    }
+    if (this.takenOverId === id) {
+      return this.toPublic(bot, true);
+    }
+    bot.client?.pause?.();
+    bot.takeover = true;
+    bot.eyesMode = "needs-you";
+    this.takenOverId = id;
+    return this.toPublic(bot, true);
+  }
+
+  release(id: string): PublicBot {
+    const bot = this.require(id);
+    if (this.takenOverId !== id) {
+      bot.takeover = false;
+      return this.toPublic(bot, true);
+    }
+    bot.client?.resume?.();
+    bot.takeover = false;
+    this.takenOverId = null;
+    if (bot.screen === "asleep") bot.eyesMode = "sleep";
+    else if (bot.needsYou || bot.permission) bot.eyesMode = "needs-you";
+    else if (bot.write) bot.eyesMode = "write";
+    else bot.eyesMode = "idle";
+    return this.toPublic(bot, true);
+  }
+
+  requestNeedsYou(id: string, reason: NeedsYouReason = "2fa"): PublicBot {
+    const bot = this.require(id);
+    const hint =
+      reason === "login"
+        ? loginHint(bot.harness ?? "codex")
+        : "This Bot needs you on the Screen (2FA or a login page). Takeover when you are ready. Secrets stay on the Screen, not in chat.";
+    bot.needsYou = { reason, hint };
+    if (bot.screen !== "asleep") bot.eyesMode = "needs-you";
+    this.persist();
+    return this.toPublic(bot, true);
+  }
+
   async sleep(id: string): Promise<PublicBot> {
     const bot = this.require(id);
+    if (bot.takeover || this.takenOverId === id) {
+      this.release(id);
+    }
     this.killChild(bot);
     bot.write = false;
+    bot.takeover = false;
     bot.permission = null;
     bot.screen = "asleep";
     bot.eyesMode = "sleep";
@@ -280,6 +346,9 @@ export class BotStore {
     }
     if (bot.screen === "asleep") {
       throw Object.assign(new Error("Wake this Bot first"), { status: 409 });
+    }
+    if (bot.takeover || this.takenOverId === id) {
+      throw Object.assign(new Error("Screen is in Takeover"), { status: 409 });
     }
     if (bot.write) throw Object.assign(new Error("turn already in flight"), { status: 409 });
     if (bot.needsYou?.reason === "login" || !bot.client) {
@@ -417,6 +486,7 @@ export class BotStore {
         harness: record.harness,
         screen: running ? "active" : "asleep",
         write: false,
+        takeover: false,
         eyesMode: running ? "idle" : "sleep",
         needsYou: null,
         permission: null,
@@ -465,6 +535,7 @@ export class BotStore {
   private toPublic(bot: Bot, withMessages: boolean): PublicBot {
     let mode: EyesMode = bot.eyesMode;
     if (bot.screen === "asleep") mode = "sleep";
+    else if (bot.takeover) mode = "needs-you";
     else if (bot.screen === "waking") mode = "waking";
     else if (bot.write) mode = "write";
     const out: PublicBot = {
@@ -474,6 +545,7 @@ export class BotStore {
       screen: bot.screen,
       eyes: { color: bot.color, shape: bot.shape, mode },
       write: bot.write,
+      takeover: bot.takeover,
       permission: publicPermission(bot.permission),
       needsYou: bot.needsYou,
     };

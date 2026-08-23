@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800">
+  <rect width="1280" height="800" fill="#111"/>
+  <rect x="40" y="40" width="1200" height="720" rx="12" fill="#1a1a1c"/>
+  <rect x="56" y="56" width="1168" height="40" rx="6" fill="#2a2a2e"/>
+  <text x="72" y="82" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13" fill="#a3a3a3">XFCE Desktop</text>
+  <rect x="80" y="140" width="320" height="220" rx="8" fill="#fff"/>
+  <text x="96" y="172" font-family="ui-sans-serif,system-ui,sans-serif" font-size="14" font-weight="600" fill="#111">Sign in</text>
+  <text x="96" y="198" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" fill="#737373">Authenticator code</text>
+  <rect x="96" y="210" width="180" height="32" rx="6" fill="#f4f4f5" stroke="#d4d4d8"/>
+  <text x="108" y="230" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13" fill="#111">482 913</text>
+  <rect x="96" y="256" width="88" height="28" rx="6" fill="#111"/>
+  <text x="140" y="274" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" fill="#fff" text-anchor="middle">Continue</text>
+  <g transform="translate(400, 28)">
+    <rect x="0" y="0" width="480" height="44" rx="22" fill="#141414"/>
+    <text x="156" y="28" font-family="ui-sans-serif,system-ui,sans-serif" font-size="14" font-weight="600" fill="#f4f2ef">You have the Screen</text>
+    <rect x="330" y="8" width="134" height="28" rx="14" fill="#f4f2ef"/>
+    <text x="397" y="27" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" font-weight="600" fill="#141414" text-anchor="middle">Hand back</text>
+  </g>
+  <ellipse cx="64" cy="760" rx="14" ry="14" fill="#ff3b5c"/>
+  <ellipse cx="59" cy="758" rx="3" ry="5" fill="#f4f2ef"/>
+  <ellipse cx="69" cy="758" rx="3" ry="5" fill="#f4f2ef"/>
+  <text x="86" y="764" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" fill="#a3a3a3">Ada · needs-you</text>
+</svg>

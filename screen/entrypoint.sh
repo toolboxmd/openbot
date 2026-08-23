@@ -67,7 +67,8 @@ chmod +x "$HOME/.vnc/xstartup"
 touch "$HOME/.vnc/.de-was-selected"
 chown -R "$USER_NAME:$USER_NAME" "$HOME"
 
-printf '%s\n%s\n' "$PASSWORD" "$PASSWORD" | su -s /bin/bash "$USER_NAME" -c "kasmvncpasswd -u ${USER_NAME} -w"
+# Owner + read, no write: view-only until Talk Takeover calls /api/update_user?write=true.
+printf '%s\n%s\n' "$PASSWORD" "$PASSWORD" | su -s /bin/bash "$USER_NAME" -c "kasmvncpasswd -u ${USER_NAME} -o -r"
 
 sync_cookies_in
 
