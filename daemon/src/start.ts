@@ -46,10 +46,15 @@ function wrap(child: ChildProcess): SupervisedChild {
 }
 
 function spawnDaemon(env: NodeJS.ProcessEnv): SupervisedChild {
-  const child = spawn("tsx", ["daemon/src/index.ts"], {
+  const binDir = path.join(repoRoot, "node_modules", ".bin");
+  const tsx = path.join(binDir, "tsx");
+  const child = spawn(tsx, ["daemon/src/index.ts"], {
     cwd: repoRoot,
     stdio: "inherit",
-    env,
+    env: {
+      ...env,
+      PATH: `${binDir}${path.delimiter}${env.PATH ?? ""}`,
+    },
   });
   child.on("error", (err) => {
     console.error(err);
