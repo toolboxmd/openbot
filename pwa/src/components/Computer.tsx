@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 function screenSrc(path: string): string {
   const url = new URL(path, "http://openbot.local");
   url.searchParams.set("autoconnect", "1");
-  url.searchParams.set("resize", "remote");
+  url.searchParams.set("resize", "scale");
   // Kasm defaults to ws://origin/websockify. Keep the socket on /screen/.
   url.searchParams.set("path", "screen/websockify");
   return `${url.pathname}${url.search}`;
@@ -44,7 +44,7 @@ export function ComputerScreen() {
     <iframe
       title="Computer"
       src={screenSrc(computer.path)}
-      className="h-full w-full border-0 bg-black"
+      className="absolute inset-0 h-full w-full border-0 bg-black"
       allow="clipboard-read; clipboard-write; fullscreen"
     />
   );
