@@ -259,6 +259,7 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
       g.fillStyle = grad;
       g.fill();
 
+      // rim so the sphere reads as a volume, not a disc
       g.beginPath();
       g.arc(radius, radius, r, 0, Math.PI * 2);
       g.strokeStyle = mix(base, [0, 0, 0], 0.35);
@@ -290,6 +291,33 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
       window.removeEventListener("pointermove", onMove);
     };
   }, [mode, resolvedColor, resolvedShape, size]);
+
+  if (mode === "write") {
+    const dot = Math.max(5, Math.round(size * 0.18));
+    return (
+      <span
+        data-testid="eyes-write"
+        aria-label="writing"
+        className={cn("inline-flex items-center justify-center gap-1", className)}
+        style={{ width: size, height: size }}
+      >
+        {[0, 1, 2].map((i) => (
+          <span
+            key={i}
+            className="inline-block rounded-full"
+            style={{
+              width: dot,
+              height: dot,
+              background: resolvedColor,
+              opacity: 0.35 + i * 0.25,
+              animation: "openbot-write 0.9s ease-in-out infinite",
+              animationDelay: `${i * 160}ms`,
+            }}
+          />
+        ))}
+      </span>
+    );
+  }
 
   return (
     <canvas
