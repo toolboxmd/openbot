@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800">
+  <title>Talk to one Bot — Codex ACP</title>
+  <rect width="1280" height="800" fill="#ffffff"/>
+  <rect width="256" height="800" fill="#f7f7f8"/>
+  <circle cx="40" cy="36" r="16" fill="#141414"/>
+  <rect x="33" y="30" width="5" height="11" rx="2.5" fill="#f4f2ef"/>
+  <rect x="42" y="30" width="5" height="11" rx="2.5" fill="#f4f2ef"/>
+  <text x="62" y="32" fill="#111111" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="600">OpenBot</text>
+  <text x="62" y="48" fill="#737373" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11">This Computer</text>
+  <line x1="0" y1="64" x2="256" y2="64" stroke="#ececec"/>
+  <text x="28" y="92" fill="#111111" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">+ New Bot</text>
+  <circle cx="36" cy="128" r="14" fill="#2f8cff"/>
+  <rect x="30" y="123" width="4" height="9" rx="2" fill="#f4f2ef"/>
+  <rect x="38" y="123" width="4" height="9" rx="2" fill="#f4f2ef"/>
+  <text x="58" y="133" fill="#111111" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Ada</text>
+  <rect x="16" y="108" width="224" height="40" rx="16" fill="#ececee"/>
+  <line x1="256" y1="0" x2="256" y2="800" stroke="#ececec"/>
+  <text x="276" y="36" fill="#111111" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="500">Ada</text>
+  <rect x="780" y="18" width="180" height="28" rx="14" fill="#ffffff" stroke="#e8e8ea"/>
+  <text x="796" y="37" fill="#111111" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Harness: Codex</text>
+  <line x1="256" y1="56" x2="1008" y2="56" stroke="#ececec"/>
+  <rect x="620" y="88" width="220" height="36" rx="16" fill="#111111"/>
+  <text x="640" y="111" fill="#ffffff" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">say hi in one short sentence</text>
+  <rect x="276" y="140" width="360" height="36" rx="16" fill="#f4f4f5"/>
+  <text x="292" y="163" fill="#111111" font-family="ui-sans-serif, system-ui, sans-serif" font-size="13">Hi. I am here.</text>
+  <circle cx="292" cy="200" r="4" fill="#2f8cff" opacity="0.4"/>
+  <circle cx="304" cy="200" r="4" fill="#2f8cff" opacity="0.7"/>
+  <circle cx="316" cy="200" r="4" fill="#2f8cff"/>
+  <rect x="276" y="724" width="700" height="52" rx="26" fill="#f4f4f5"/>
+  <text x="304" y="755" fill="#737373" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14">Message a Bot…</text>
+  <circle cx="948" cy="750" r="18" fill="#111111"/>
+  <path d="M948 742 v12 M942 748 l6 -6 l6 6" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
+  <rect x="1008" y="0" width="272" height="800" fill="#f7f7f8"/>
+  <line x1="1008" y1="0" x2="1008" y2="800" stroke="#ececec"/>
+  <text x="1028" y="36" fill="#111111" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" font-weight="500">This Computer</text>
+  <line x1="1008" y1="56" x2="1280" y2="56" stroke="#ececec"/>
+  <rect x="1024" y="76" width="240" height="135" rx="16" fill="#111111"/>
+  <text x="1144" y="148" text-anchor="middle" fill="#a3a3a3" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">Screen</text>
+</svg>
