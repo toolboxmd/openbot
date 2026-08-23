@@ -41,6 +41,8 @@ RUN arch="${TARGETARCH:-amd64}"; \
 
 COPY kasmvnc.yaml /etc/kasmvnc/kasmvnc.yaml
 COPY xstartup /etc/openbot/xstartup
+COPY xfce/xfwm4.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
+COPY xfce/panel-default.xml /etc/xdg/xfce4/panel/default.xml
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh /etc/openbot/xstartup
 

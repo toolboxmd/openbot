@@ -22,9 +22,12 @@ if [ ! -e /run/dbus/pid ]; then
 fi
 
 rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
-mkdir -p "$HOME/.vnc"
+mkdir -p "$HOME/.vnc" "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml"
 rm -f "$HOME/.vnc/"*.pid "$HOME/.vnc/"*.log
 cp /etc/openbot/xstartup "$HOME/.vnc/xstartup"
+# One workspace, no pager. Seed before XFCE writes the Debian 2x2 default.
+cp /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml"
+cp /etc/xdg/xfce4/panel/default.xml "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
 chmod +x "$HOME/.vnc/xstartup"
 # Kasm's first-run DE picker needs a TTY. Mark it done and keep our xstartup.
 touch "$HOME/.vnc/.de-was-selected"
