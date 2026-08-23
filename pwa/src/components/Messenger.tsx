@@ -101,11 +101,11 @@ export function Messenger() {
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
               placeholder="Message a Bot…"
-              className="min-h-10"
+              className="min-h-10 resize-none"
             />
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button type="submit" size="icon" disabled={draft.trim().length === 0} aria-label="Send">
+                <Button type="submit" size="icon" disabled={draft.trim().length === 0} aria-label="Send" className="shrink-0">
                   <ArrowUp />
                 </Button>
               </TooltipTrigger>
@@ -138,7 +138,7 @@ export function Messenger() {
                   size="lg"
                   aria-label="Back to chat"
                   onClick={() => setComputerOpen(false)}
-                  className="absolute top-4 left-4 z-10 h-12 rounded-full px-6 text-base shadow-lg [&_svg]:size-5"
+                  className="absolute top-4 right-4 z-10 h-12 rounded-full px-6 text-base shadow-lg [&_svg]:size-5"
                 >
                   <MessageSquare />
                   Chat
