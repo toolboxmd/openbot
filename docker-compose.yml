@@ -7,4 +7,17 @@ services:
       OPENBOT_PASSWORD: ${OPENBOT_PASSWORD:-openbot}
       PORT: "8080"
       PWA_DIR: /app/pwa
+      SCREEN_UPSTREAM: http://screen:6901
+      KASM_USER: openbot
+      KASM_PASSWORD: ${OPENBOT_PASSWORD:-openbot}
+    depends_on:
+      - screen
+    restart: unless-stopped
+
+  screen:
+    build: ./screen
+    environment:
+      VNC_USER: openbot
+      VNC_PASSWORD: ${OPENBOT_PASSWORD:-openbot}
+    shm_size: "1gb"
     restart: unless-stopped

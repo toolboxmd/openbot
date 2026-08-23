@@ -2,7 +2,7 @@
 
 Self-hosted Grok Bot. Named Bots on one Computer. MIT.
 
-This slice opens the PWA: Password once, empty chat shell, HttpOnly cookie.
+This slice opens the PWA and one XFCE Screen on the Computer.
 
 ## Run
 
@@ -22,13 +22,17 @@ OPENBOT_PASSWORD='your-secret' docker compose up --build
 
 Enter the Password once. Refresh stays signed in.
 
+Open **Computer** in the sidebar. The Screen is an iframe on the same origin (`/screen/`). Kasm is not published on the host.
+
 ## What this Computer runs
 
 One origin. The box process is the daemon, the reverse proxy, and the PWA.
 
 - PWA: React + Vite + Tailwind v4 + shadcn, chat-first
-- daemon: Password, session cookie, static PWA
-- no Screen container, no Harness, no PinchTab in this slice
+- daemon: Password, session cookie, static PWA, Computer API, Screen proxy
+- one Screen container: Debian bookworm, XFCE, KasmVNC, Chrome
+- Kasm basic auth is injected by the proxy. WebRTC is off.
+- no Harness, no PinchTab cookie jar yet
 
 ## Tests
 
@@ -38,4 +42,4 @@ npm test
 npm run typecheck
 ```
 
-Public seam is HTTP. Tests hit `/api/session`, `/api/bots`, and `GET /`.
+Tests talk HTTP. They hit `/api/session`, `/api/bots`, `/api/computer`, `/screen/`, and `GET /`. A fake Kasm server stands in for the container.
