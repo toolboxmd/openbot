@@ -3,3 +3,4 @@ dist
 pwa/dist
 *.log
 .DS_Store
+workspace

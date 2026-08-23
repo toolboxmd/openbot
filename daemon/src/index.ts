@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startBox } from "./box.ts";
@@ -15,6 +16,8 @@ const host = process.env.HOST ?? "0.0.0.0";
 const screenUpstream = process.env.SCREEN_UPSTREAM;
 const kasmUser = process.env.KASM_USER ?? "openbot";
 const kasmPassword = process.env.KASM_PASSWORD ?? password;
+const workspaceDir = process.env.OPENBOT_WORKSPACE ?? path.resolve(process.cwd(), "workspace");
+fs.mkdirSync(workspaceDir, { recursive: true });
 
 const box = await startBox({
   password,
@@ -24,5 +27,6 @@ const box = await startBox({
   screenUpstream,
   kasmUser,
   kasmPassword,
+  workspaceDir,
 });
 console.log(`OpenBot box listening on ${box.url}`);
