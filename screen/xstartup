@@ -6,6 +6,7 @@ export GDK_BACKEND=x11
 export QT_QPA_PLATFORM=xcb
 startxfce4 &
 sleep 2
+xfconf-query -c displays -p /Notify -n -t bool -s false >/dev/null 2>&1 || true
 if command -v chromium >/dev/null 2>&1; then
   chromium --no-first-run --disable-gpu --no-sandbox --test-type --disable-dev-shm-usage about:blank &
 elif command -v chromium-browser >/dev/null 2>&1; then

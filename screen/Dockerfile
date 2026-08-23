@@ -43,8 +43,14 @@ COPY kasmvnc.yaml /etc/kasmvnc/kasmvnc.yaml
 COPY xstartup /etc/openbot/xstartup
 COPY xfce/xfwm4.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
 COPY xfce/panel-default.xml /etc/xdg/xfce4/panel/default.xml
+COPY xfce/displays.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/displays.xml
+COPY www/openbot.css /usr/share/kasmvnc/www/openbot.css
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh /etc/openbot/xstartup
+RUN chmod +x /entrypoint.sh /etc/openbot/xstartup \
+    && sed -i 's|</head>|<link rel="stylesheet" href="openbot.css"></head>|' \
+         /usr/share/kasmvnc/www/index.html \
+         /usr/share/kasmvnc/www/vnc.html \
+         /usr/share/kasmvnc/www/screen.html
 
 EXPOSE 6901
 CMD ["/entrypoint.sh"]

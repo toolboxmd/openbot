@@ -1,0 +1,5 @@
+/* Kasm's identify overlay is a 100px dark tile with the virtual display index. */
+#noVNC_notification_overlay,
+#noVNC_notification_overlay.show {
+  display: none !important;
+}

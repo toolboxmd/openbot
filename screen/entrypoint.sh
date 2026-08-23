@@ -28,6 +28,7 @@ cp /etc/openbot/xstartup "$HOME/.vnc/xstartup"
 # One workspace, no pager. Seed before XFCE writes the Debian 2x2 default.
 cp /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml"
 cp /etc/xdg/xfce4/panel/default.xml "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+cp /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/displays.xml "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/displays.xml"
 chmod +x "$HOME/.vnc/xstartup"
 # Kasm's first-run DE picker needs a TTY. Mark it done and keep our xstartup.
 touch "$HOME/.vnc/.de-was-selected"
