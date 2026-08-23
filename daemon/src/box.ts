@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
 import path from "node:path";
+import { BotStore, defaultWorkspaceDir } from "./bots.ts";
 
 export type BoxOptions = {
   password: string;
@@ -12,6 +13,7 @@ export type BoxOptions = {
   screenUpstream?: string;
   kasmUser?: string;
   kasmPassword?: string;
+  workspaceDir?: string;
 };
 
 export type RunningBox = {
@@ -291,11 +293,18 @@ async function screenIsReachable(
   }
 }
 
+function sendStoreError(res: http.ServerResponse, err: unknown): void {
+  const status = typeof (err as { status?: unknown })?.status === "number" ? (err as { status: number }).status : 500;
+  const message = err instanceof Error ? err.message : "box error";
+  sendJson(res, status, { error: message });
+}
+
 export async function startBox(options: BoxOptions): Promise<RunningBox> {
   const host = options.host ?? "0.0.0.0";
   const salt = crypto.randomBytes(16);
   const key = crypto.scryptSync(options.password, salt, 32);
   const auth = kasmAuthorization(options);
+  const store = new BotStore(options.workspaceDir ?? defaultWorkspaceDir());
 
   const server = http.createServer((req, res) => {
     void handle(req, res);
@@ -341,13 +350,165 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         return;
       }
 
+      if (url.pathname === "/api/harnesses" && method === "GET") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        sendJson(res, 200, { harnesses: store.listHarnesses() });
+        return;
+      }
+
       if (url.pathname === "/api/bots" && method === "GET") {
         if (!hasSession(req, key)) {
           sendJson(res, 401, { error: "unauthenticated" });
           return;
         }
-        sendJson(res, 200, { bots: [] });
+        sendJson(res, 200, { bots: store.list() });
         return;
+      }
+
+      if (url.pathname === "/api/bots" && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        let body: Record<string, unknown> = {};
+        try {
+          const raw = await readBody(req);
+          body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        try {
+          const name = typeof body.name === "string" ? body.name : "";
+          const bot = store.create(name);
+          sendJson(res, 201, bot);
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
+      const messagesMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/messages$/);
+      if (messagesMatch) {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        const botId = decodeURIComponent(messagesMatch[1]);
+        if (method === "GET") {
+          const thread = store.messages(botId);
+          if (!thread) {
+            sendJson(res, 404, { error: "Bot not found" });
+            return;
+          }
+          sendJson(res, 200, thread);
+          return;
+        }
+        if (method === "POST") {
+          let body: Record<string, unknown> = {};
+          try {
+            const raw = await readBody(req);
+            body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+          } catch {
+            sendJson(res, 400, { error: "invalid json" });
+            return;
+          }
+          try {
+            const text = typeof body.text === "string" ? body.text : "";
+            const bot = await store.send(botId, text);
+            sendJson(res, 200, bot);
+          } catch (err) {
+            sendStoreError(res, err);
+          }
+          return;
+        }
+      }
+
+      const permMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/permissions$/);
+      if (permMatch && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        let body: Record<string, unknown> = {};
+        try {
+          const raw = await readBody(req);
+          body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        try {
+          const optionId = typeof body.optionId === "string" ? body.optionId : "";
+          const bot = store.answerPermission(decodeURIComponent(permMatch[1]), optionId);
+          sendJson(res, 200, bot);
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
+      const harnessMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/harness$/);
+      if (harnessMatch && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        let body: Record<string, unknown> = {};
+        try {
+          const raw = await readBody(req);
+          body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        try {
+          const harness = typeof body.harness === "string" ? body.harness : "";
+          const bot = await store.pickHarness(decodeURIComponent(harnessMatch[1]), harness);
+          sendJson(res, 200, bot);
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
+      const botMatch = url.pathname.match(/^\/api\/bots\/([^/]+)$/);
+      if (botMatch) {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        const botId = decodeURIComponent(botMatch[1]);
+        if (method === "GET") {
+          const bot = store.get(botId);
+          if (!bot) {
+            sendJson(res, 404, { error: "Bot not found" });
+            return;
+          }
+          sendJson(res, 200, bot);
+          return;
+        }
+        if (method === "PATCH") {
+          let body: Record<string, unknown> = {};
+          try {
+            const raw = await readBody(req);
+            body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+          } catch {
+            sendJson(res, 400, { error: "invalid json" });
+            return;
+          }
+          try {
+            const harness = typeof body.harness === "string" ? body.harness : "";
+            const bot = await store.pickHarness(botId, harness);
+            sendJson(res, 200, bot);
+          } catch (err) {
+            sendStoreError(res, err);
+          }
+          return;
+        }
       }
 
       if (url.pathname === "/api/computer" && method === "GET") {
@@ -431,6 +592,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
     port: addr.port,
     close: () =>
       new Promise((resolve, reject) => {
+        store.close();
         server.close((err) => (err ? reject(err) : resolve()));
       }),
   };
