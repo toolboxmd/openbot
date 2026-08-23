@@ -15,3 +15,7 @@ network:
     port: 0
 command_line:
   prompt: false
+security:
+  brute_force_protection:
+    blacklist_threshold: 10000
+    blacklist_timeout: 1
