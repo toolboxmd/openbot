@@ -80,3 +80,16 @@
     cursor: pointer;
   }
 }
+
+@keyframes openbot-write {
+  0%,
+  80%,
+  100% {
+    opacity: 0.28;
+    transform: none;
+  }
+  40% {
+    opacity: 1;
+    transform: none;
+  }
+}
