@@ -1,21 +1,9 @@
+# Screen only. Talk is the host start script (ADR 0005). Ctrl-C leaves Screen up.
 services:
-  box:
-    build: .
-    ports:
-      - "8080:8080"
-    environment:
-      OPENBOT_PASSWORD: ${OPENBOT_PASSWORD:-openbot}
-      PORT: "8080"
-      PWA_DIR: /app/pwa
-      SCREEN_UPSTREAM: http://screen:6901
-      KASM_USER: openbot
-      KASM_PASSWORD: ${OPENBOT_PASSWORD:-openbot}
-    depends_on:
-      - screen
-    restart: unless-stopped
-
   screen:
     build: ./screen
+    ports:
+      - "127.0.0.1:6901:6901"
     environment:
       VNC_USER: openbot
       VNC_PASSWORD: ${OPENBOT_PASSWORD:-openbot}

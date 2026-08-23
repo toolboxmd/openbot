@@ -6,29 +6,27 @@ This slice talks to one Bot over Codex ACP on the host OS, and still watches one
 
 ## Run
 
-You need Docker for Screen. From the repo root:
+You need Docker for Screen, and Codex on PATH to Talk. From the repo root:
 
-```bash
-docker compose up --build
-```
+Run package.json scripts.start with OPENBOT_PASSWORD set.
 
-Then open [http://127.0.0.1:8080](http://127.0.0.1:8080).
+That one command brings Screen up (Compose, **screen only**, detached) and runs Talk in the foreground on the host. Chat listens on [http://127.0.0.1:8080](http://127.0.0.1:8080). If Talk crashes while the command is still running, it is started again. Ctrl-C / SIGTERM stops Talk and **leaves Screen up**.
 
 The Password is `openbot` unless you set `OPENBOT_PASSWORD`:
 
-```bash
-OPENBOT_PASSWORD='your-secret' docker compose up --build
-```
+Example: OPENBOT_PASSWORD='your-secret' then the package start script.
 
 Enter the Password once. Refresh stays signed in.
 
-Open **Computer** in the sidebar. The Screen is an iframe on the same origin (`/screen/`). Kasm is not published on the host.
+Open **Computer** in the sidebar. The Screen is an iframe on the same origin (`/screen/`). Kasm is published on loopback only (`127.0.0.1:6901`); the host daemon proxies it. Default `SCREEN_UPSTREAM` is `http://127.0.0.1:6901`.
 
-Talk is not compose. See [ADR 0005](docs/adr/0005-harness-on-host-os.md): the ACP child is a host OS process. Run the daemon on the host with the start script so it can spawn Codex. Codex must be on PATH (HOME/.local/bin is fine). The stdio adapter is codex-acp if installed, otherwise npx of @agentclientprotocol/codex-acp. CODEX_PATH points at the host codex. DISPLAY is not passed. NO_BROWSER=1. Missing login is a device-code hint in chat, not Takeover.
+See [ADR 0005](docs/adr/0005-harness-on-host-os.md): the ACP child is a host OS process. Compose cannot exec Mac Codex (Docker Desktop is a Linux VM). Do not start a Compose box service -- there is none. Codex must be on PATH (HOME/.local/bin is fine). The stdio adapter is codex-acp if installed, otherwise npx of @agentclientprotocol/codex-acp. CODEX_PATH points at the host codex. DISPLAY is not passed. NO_BROWSER=1. Missing login is a device-code hint in chat, not Takeover.
+
+Keep-alive while the start script runs is not keep-alive after logout, sleep, or reboot.
 
 ## What this Computer runs
 
-One origin. The box process is the daemon, the reverse proxy, and the PWA.
+One origin. The host daemon is Talk, the reverse proxy, and the PWA.
 
 - PWA: React + Vite + Tailwind v4 + shadcn, chat-first
 - daemon: Password, session cookie, static PWA, Computer API, Screen proxy, Bots, Codex ACP
@@ -44,4 +42,4 @@ npm test
 npm run typecheck
 ```
 
-Tests talk HTTP. They hit `/api/session`, `/api/bots`, `/api/computer`, `/screen/`, and `GET /`. A fake Kasm server stands in for the container. Talk is not covered by those tests.
+Tests talk HTTP. They hit `/api/session`, `/api/bots`, `/api/computer`, `/screen/`, and `GET /`. A fake Kasm server stands in for the container. Supervisor tests inject a compose runner, daemon spawner, clock, and signals; they do not start Docker or Codex.
