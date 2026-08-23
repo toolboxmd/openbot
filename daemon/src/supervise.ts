@@ -49,7 +49,7 @@ export async function superviseTalk(
   const unsubscribe = deps.onSignal((signal) => {
     if (stopping) return;
     stopping = true;
-    log(`OpenBot start: ${signal}, stopping Talk. Screen stays up.`);
+    log(`OpenBot start: ${signal}, stopping Talk. Screens that are up stay up.`);
     resumeStop();
   });
 

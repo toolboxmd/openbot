@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { startBox, type RunningBox } from "../src/box.ts";
+import { MemoryScreenRuntime } from "../src/screens.ts";
 
 const PASSWORD = "correct-horse";
 const KASM_USER = "kasm";
@@ -38,6 +39,8 @@ describe("Computer Screen HTTP", () => {
   let stub: http.Server;
   let lastAuth: string | undefined;
   let lastPath: string | undefined;
+  let screens: MemoryScreenRuntime;
+  let botId: string;
 
   before(async () => {
     stub = http.createServer((req, res) => {
@@ -58,15 +61,31 @@ describe("Computer Screen HTTP", () => {
     });
     const addr = stub.address();
     if (!addr || typeof addr === "string") throw new Error("stub failed to bind");
+    const workspaceDir = await mkdtemp(join(tmpdir(), "openbot-screen-ws-"));
+    screens = new MemoryScreenRuntime({
+      cookiesDir: join(workspaceDir, "cookies"),
+      upstreamFor: () => `http://127.0.0.1:${addr.port}`,
+    });
     box = await startBox({
       password: PASSWORD,
       pwaDir: await emptyPwa(),
       host: "127.0.0.1",
       port: 0,
-      screenUpstream: `http://127.0.0.1:${addr.port}`,
+      workspaceDir,
+      screens,
       kasmUser: KASM_USER,
       kasmPassword: KASM_PASSWORD,
     });
+    const cookie = await login(box.url);
+    const created = await fetch(`${box.url}/api/bots`, {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({ name: "Ada" }),
+    });
+    const bot = (await created.json()) as { id: string };
+    botId = bot.id;
+    const woke = await fetch(`${box.url}/api/bots/${botId}/wake`, { method: "POST", headers: { cookie } });
+    assert.ok(woke.ok, `wake failed: ${woke.status}`);
   });
 
   after(async () => {
@@ -77,21 +96,22 @@ describe("Computer Screen HTTP", () => {
   test("Computer API and Screen path need a session", async () => {
     const api = await fetch(`${box.url}/api/computer`);
     assert.ok(api.status >= 400, `unauthenticated /api/computer should fail, got ${api.status}`);
-    const screen = await fetch(`${box.url}/screen/`);
-    assert.ok(screen.status >= 400, `unauthenticated /screen/ should fail, got ${screen.status}`);
+    const screen = await fetch(`${box.url}/screen/${botId}/`);
+    assert.ok(screen.status >= 400, `unauthenticated /screen/${botId}/ should fail, got ${screen.status}`);
   });
 
-  test("session can read Computer and open Screen under the same origin", async () => {
+  test("session can read Computer and open that Bot's Screen under the same origin", async () => {
     const cookie = await login(box.url);
-    const api = await fetch(`${box.url}/api/computer`, { headers: { cookie } });
+    const api = await fetch(`${box.url}/api/computer?botId=${encodeURIComponent(botId)}`, { headers: { cookie } });
     assert.ok(api.ok, `GET /api/computer failed: ${api.status}`);
-    const body = (await api.json()) as { path?: string; ready?: boolean };
-    assert.equal(body.path, "/screen/");
+    const body = (await api.json()) as { path?: string; ready?: boolean; botId?: string };
+    assert.equal(body.botId, botId);
+    assert.equal(body.path, `/screen/${botId}/`);
     assert.equal(body.ready, true);
 
     lastAuth = undefined;
-    const screen = await fetch(`${box.url}/screen/`, { headers: { cookie } });
-    assert.ok(screen.ok, `GET /screen/ failed: ${screen.status}`);
+    const screen = await fetch(`${box.url}/screen/${botId}/`, { headers: { cookie } });
+    assert.ok(screen.ok, `GET /screen/${botId}/ failed: ${screen.status}`);
     const html = await screen.text();
     assert.match(html, /desktop-stub/);
     assert.doesNotMatch(html, /kasm-secret/);
@@ -112,7 +132,7 @@ describe("Computer Screen HTTP", () => {
         {
           hostname: dest.hostname,
           port: dest.port,
-          path: "/screen/websockify",
+          path: `/screen/${botId}/websockify`,
           method: "GET",
           headers: {
             cookie,
@@ -154,6 +174,7 @@ describe("Computer Screen without an upstream", () => {
       pwaDir: await emptyPwa(),
       host: "127.0.0.1",
       port: 0,
+      workspaceDir: await mkdtemp(join(tmpdir(), "openbot-noup-")),
     });
   });
 
@@ -165,25 +186,47 @@ describe("Computer Screen without an upstream", () => {
     const cookie = await login(box.url);
     const api = await fetch(`${box.url}/api/computer`, { headers: { cookie } });
     assert.ok(api.ok);
-    const body = (await api.json()) as { path?: string; ready?: boolean };
-    assert.equal(body.path, "/screen/");
+    const body = (await api.json()) as { path?: string | null; ready?: boolean };
     assert.equal(body.ready, false);
-    const screen = await fetch(`${box.url}/screen/`, { headers: { cookie } });
+    assert.equal(body.path, null);
+    const created = await fetch(`${box.url}/api/bots`, {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({ name: "Ada" }),
+    });
+    const bot = (await created.json()) as { id: string };
+    const screen = await fetch(`${box.url}/screen/${bot.id}/`, { headers: { cookie } });
     assert.equal(screen.status, 503);
   });
 });
 
 describe("Computer Screen with an unreachable upstream", () => {
   let box: RunningBox;
+  let botId: string;
 
   before(async () => {
+    const workspaceDir = await mkdtemp(join(tmpdir(), "openbot-unreach-"));
+    const screens = new MemoryScreenRuntime({
+      cookiesDir: join(workspaceDir, "cookies"),
+      upstreamFor: () => "http://127.0.0.1:1",
+    });
     box = await startBox({
       password: PASSWORD,
       pwaDir: await emptyPwa(),
       host: "127.0.0.1",
       port: 0,
-      screenUpstream: "http://127.0.0.1:1",
+      workspaceDir,
+      screens,
     });
+    const cookie = await login(box.url);
+    const created = await fetch(`${box.url}/api/bots`, {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({ name: "Ada" }),
+    });
+    const bot = (await created.json()) as { id: string };
+    botId = bot.id;
+    await fetch(`${box.url}/api/bots/${botId}/wake`, { method: "POST", headers: { cookie } });
   });
 
   after(async () => {
@@ -192,10 +235,10 @@ describe("Computer Screen with an unreachable upstream", () => {
 
   test("Computer is not ready when Screen does not answer", async () => {
     const cookie = await login(box.url);
-    const api = await fetch(`${box.url}/api/computer`, { headers: { cookie } });
+    const api = await fetch(`${box.url}/api/computer?botId=${encodeURIComponent(botId)}`, { headers: { cookie } });
     assert.ok(api.ok);
-    const body = (await api.json()) as { path?: string; ready?: boolean };
-    assert.equal(body.path, "/screen/");
+    const body = (await api.json()) as { path?: string; ready?: boolean; botId?: string };
+    assert.equal(body.path, `/screen/${botId}/`);
     assert.equal(body.ready, false);
   });
 });

@@ -3,7 +3,8 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
 import path from "node:path";
-import { BotStore, defaultWorkspaceDir } from "./bots.ts";
+import { BotStore, defaultWorkspaceDir, type BotStoreDeps } from "./bots.ts";
+import { NoopScreenRuntime, type ScreenRuntime } from "./screens.ts";
 
 export type BoxOptions = {
   password: string;
@@ -14,7 +15,8 @@ export type BoxOptions = {
   kasmUser?: string;
   kasmPassword?: string;
   workspaceDir?: string;
-};
+  screens?: ScreenRuntime;
+} & Pick<BotStoreDeps, "spawnAcp" | "listHarnesses">;
 
 export type RunningBox = {
   url: string;
@@ -113,13 +115,15 @@ function isScreenPath(pathname: string): boolean {
   return pathname === SCREEN_PREFIX || pathname.startsWith(`${SCREEN_PREFIX}/`);
 }
 
-function stripScreenPrefix(pathname: string): string {
-  if (pathname === SCREEN_PREFIX) return "/";
-  if (pathname.startsWith(`${SCREEN_PREFIX}/`)) {
-    const rest = pathname.slice(SCREEN_PREFIX.length);
-    return rest.length === 0 ? "/" : rest;
-  }
-  return pathname;
+function parseScreenPath(pathname: string): { botId: string; rest: string } | null {
+  if (!pathname.startsWith(`${SCREEN_PREFIX}/`)) return null;
+  const rest = pathname.slice(SCREEN_PREFIX.length + 1);
+  if (!rest) return null;
+  const cut = rest.indexOf("/");
+  const botId = decodeURIComponent(cut === -1 ? rest : rest.slice(0, cut));
+  if (!botId) return null;
+  const tail = cut === -1 || cut === rest.length - 1 ? "/" : rest.slice(cut);
+  return { botId, rest: tail || "/" };
 }
 
 function kasmAuthorization(options: BoxOptions): string | undefined {
@@ -276,21 +280,85 @@ async function servePwa(
   }
 }
 
-async function screenIsReachable(
+function screenIsReachable(
   upstream: string | undefined,
   auth: string | undefined,
 ): Promise<boolean> {
-  if (!upstream) return false;
+  if (!upstream) return Promise.resolve(false);
+
+  let dest: URL;
   try {
-    await fetch(upstream, {
-      signal: AbortSignal.timeout(750),
-      redirect: "manual",
-      headers: auth ? { Authorization: auth } : undefined,
-    });
-    return true;
+    dest = new URL(upstream);
   } catch {
-    return false;
+    return Promise.resolve(false);
   }
+  if (dest.protocol !== "http:" && dest.protocol !== "https:") {
+    return Promise.resolve(false);
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+    };
+
+    const headers: http.OutgoingHttpHeaders = {
+      host: dest.host,
+      connection: "close",
+    };
+    if (auth) headers.authorization = auth;
+
+    let req: http.ClientRequest;
+    try {
+      req = requestFor(dest)(dest, {
+        method: "GET",
+        headers,
+        timeout: 750,
+      });
+    } catch {
+      done(false);
+      return;
+    }
+
+    const kill = () => {
+      try {
+        req.destroy();
+      } catch {
+        // ignore
+      }
+    };
+
+    req.setTimeout(750, () => {
+      kill();
+      done(false);
+    });
+    req.on("response", (res) => {
+      res.resume();
+      kill();
+      done(true);
+    });
+    req.on("timeout", () => {
+      kill();
+      done(false);
+    });
+    req.on("error", () => {
+      done(false);
+    });
+    req.on("socket", (socket) => {
+      socket.setTimeout(750, () => {
+        kill();
+        done(false);
+      });
+    });
+    try {
+      req.end();
+    } catch {
+      kill();
+      done(false);
+    }
+  });
 }
 
 function sendStoreError(res: http.ServerResponse, err: unknown): void {
@@ -304,7 +372,19 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
   const salt = crypto.randomBytes(16);
   const key = crypto.scryptSync(options.password, salt, 32);
   const auth = kasmAuthorization(options);
-  const store = new BotStore(options.workspaceDir ?? defaultWorkspaceDir());
+  const screens: ScreenRuntime = options.screens ?? new NoopScreenRuntime();
+  await screens.hydrate?.();
+  const store = new BotStore(options.workspaceDir ?? defaultWorkspaceDir(), {
+    screens,
+    spawnAcp: options.spawnAcp,
+    listHarnesses: options.listHarnesses,
+  });
+
+  function upstreamFor(botId: string | null): string | undefined {
+    if (botId && screens.upstream(botId)) return screens.upstream(botId);
+    if (botId && screens.running(botId) && options.screenUpstream) return options.screenUpstream;
+    return undefined;
+  }
 
   const server = http.createServer((req, res) => {
     void handle(req, res);
@@ -475,6 +555,36 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         return;
       }
 
+      const sleepMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/sleep$/);
+      if (sleepMatch && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        try {
+          const bot = await store.sleep(decodeURIComponent(sleepMatch[1]));
+          sendJson(res, 200, bot);
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
+      const wakeMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/wake$/);
+      if (wakeMatch && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        try {
+          const bot = await store.wake(decodeURIComponent(wakeMatch[1]));
+          sendJson(res, 200, bot);
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
       const botMatch = url.pathname.match(/^\/api\/bots\/([^/]+)$/);
       if (botMatch) {
         if (!hasSession(req, key)) {
@@ -516,9 +626,29 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
           sendJson(res, 401, { error: "unauthenticated" });
           return;
         }
+        const requested = url.searchParams.get("botId");
+        const botId = requested || store.activeId();
+        if (!botId) {
+          sendJson(res, 200, {
+            path: null,
+            ready: false,
+            botId: null,
+            cookieJar: screens.cookieJar(),
+          });
+          return;
+        }
+        const bot = store.get(botId);
+        if (requested && !bot) {
+          sendJson(res, 404, { error: "Bot not found" });
+          return;
+        }
+        const upstream = upstreamFor(botId);
         sendJson(res, 200, {
-          path: `${SCREEN_PREFIX}/`,
-          ready: await screenIsReachable(options.screenUpstream, auth),
+          path: `${SCREEN_PREFIX}/${botId}/`,
+          ready: Boolean(upstream) && (bot?.screen === "active") && (await screenIsReachable(upstream, auth)),
+          botId,
+          screen: bot?.screen ?? "asleep",
+          cookieJar: screens.cookieJar(),
         });
         return;
       }
@@ -533,14 +663,15 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
           sendJson(res, 401, { error: "unauthenticated" });
           return;
         }
-        if (!options.screenUpstream) {
+        const parsed = parseScreenPath(url.pathname);
+        const botId = parsed?.botId ?? store.activeId();
+        const rest = parsed?.rest ?? "/";
+        const destBase = upstreamFor(botId);
+        if (!botId || !destBase) {
           sendJson(res, 503, { error: "Screen is not up" });
           return;
         }
-        const dest = new URL(
-          `${stripScreenPrefix(url.pathname)}${url.search}`,
-          options.screenUpstream,
-        );
+        const dest = new URL(`${rest}${url.search}`, destBase);
         proxyHttp(req, res, dest, auth);
         return;
       }
@@ -567,12 +698,16 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       socket.destroy();
       return;
     }
-    if (!options.screenUpstream) {
+    const parsed = parseScreenPath(url.pathname);
+    const botId = parsed?.botId ?? store.activeId();
+    const rest = parsed?.rest ?? "/";
+    const destBase = upstreamFor(botId);
+    if (!botId || !destBase) {
       socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
     }
-    const dest = new URL(`${stripScreenPrefix(url.pathname)}${url.search}`, options.screenUpstream);
+    const dest = new URL(`${rest}${url.search}`, destBase);
     proxyUpgrade(req, socket, head, dest, auth);
   });
 

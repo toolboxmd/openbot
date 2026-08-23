@@ -4,12 +4,24 @@ unset DBUS_SESSION_BUS_ADDRESS
 export XDG_SESSION_TYPE=x11
 export GDK_BACKEND=x11
 export QT_QPA_PLATFORM=xcb
+PROFILE="${CHROME_USER_DATA_DIR:-$HOME/.config/chromium}"
+mkdir -p "$PROFILE"
 startxfce4 &
 sleep 2
 xfconf-query -c displays -p /Notify -n -t bool -s false >/dev/null 2>&1 || true
+# Unique headed profile per Screen. Shared cookies are copied in/out of
+# /computer/cookies by entrypoint. No CDP, no shared Chrome process, no PinchTab.
 if command -v chromium >/dev/null 2>&1; then
-  chromium --no-first-run --disable-gpu --no-sandbox --test-type --disable-dev-shm-usage about:blank &
+  chromium \
+    --user-data-dir="$PROFILE" \
+    --no-first-run --disable-gpu --no-sandbox --test-type --disable-dev-shm-usage \
+    --disable-session-crashed-bubble --hide-crash-restore-bubble \
+    about:blank &
 elif command -v chromium-browser >/dev/null 2>&1; then
-  chromium-browser --no-first-run --disable-gpu --no-sandbox --test-type --disable-dev-shm-usage about:blank &
+  chromium-browser \
+    --user-data-dir="$PROFILE" \
+    --no-first-run --disable-gpu --no-sandbox --test-type --disable-dev-shm-usage \
+    --disable-session-crashed-bubble --hide-crash-restore-bubble \
+    about:blank &
 fi
 wait

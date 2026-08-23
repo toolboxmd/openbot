@@ -72,6 +72,8 @@ function pose(mode: FaceMode) {
       return { lid: 0, eye: 1.18, look: { x: 0, y: 0 } };
     case "sleep":
       return { lid: 0.88, eye: 1.05, look: { x: 0, y: 0 } };
+    case "waking":
+      return { lid: 0.42, eye: 1.12, look: { x: 0, y: 0.22 } };
     default:
       return { lid: 0.04, eye: 1, look: { x: 0, y: 0 } };
   }

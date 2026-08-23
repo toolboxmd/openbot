@@ -16,7 +16,7 @@ export const COLORS = [
 export const OPENBOT_COLOR = "#141414";
 export const EYE = "#f4f2ef";
 
-export type FaceMode = "idle" | "think" | "work" | "write" | "needs-you" | "sleep";
+export type FaceMode = "idle" | "think" | "work" | "write" | "needs-you" | "sleep" | "waking";
 
 export function hash32(s: string): number {
   let h = 2166136261;

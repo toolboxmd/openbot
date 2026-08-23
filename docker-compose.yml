@@ -1,11 +1,11 @@
-# Screen only. Talk is the host start script (ADR 0005). Ctrl-C leaves Screen up.
+# Screen image only. Talk docker-runs one container per Active Bot
+# (unique loopback port, unique home volume, shared cookie jar + workspace).
+# Do not publish 6901 here; the agent desktop often already owns it.
 services:
   screen:
     build: ./screen
-    ports:
-      - "127.0.0.1:6901:6901"
+    image: openbot-screen
+    shm_size: "1gb"
     environment:
       VNC_USER: openbot
       VNC_PASSWORD: ${OPENBOT_PASSWORD:-openbot}
-    shm_size: "1gb"
-    restart: unless-stopped

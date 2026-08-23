@@ -13,7 +13,7 @@ if (!process.env.OPENBOT_PASSWORD) {
 
 function composeUp(service: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn("docker", ["compose", "up", "--detach", "--build", service], {
+    const child = spawn("docker", ["compose", "build", service], {
       cwd: repoRoot,
       stdio: "inherit",
       env: process.env,
@@ -25,7 +25,7 @@ function composeUp(service: string): Promise<void> {
         return;
       }
       reject(
-        new Error(`docker compose up --detach --build ${service} exited ${code ?? signal}`),
+        new Error(`docker compose build ${service} exited ${code ?? signal}`),
       );
     });
   });

@@ -16,12 +16,13 @@ export async function unlock(password: string): Promise<{ ok: true } | { ok: fal
   return { ok: true };
 }
 
-export type EyesMode = "idle" | "think" | "work" | "write" | "needs-you" | "sleep";
+export type EyesMode = "idle" | "think" | "work" | "write" | "needs-you" | "sleep" | "waking";
 
 export type Bot = {
   id: string;
   name: string;
   harness: string | null;
+  screen: "asleep" | "waking" | "active";
   eyes: { color: string; shape: string; mode: EyesMode };
   write: boolean;
   permission: {
@@ -115,12 +116,43 @@ export async function answerPermission(botId: string, optionId: string): Promise
   return (await res.json()) as Bot;
 }
 
-export type Computer = { path: string; ready: boolean };
+export type Computer = {
+  path: string | null;
+  ready: boolean;
+  botId?: string | null;
+  screen?: "asleep" | "waking" | "active";
+  cookieJar?: string;
+};
 
-export async function getComputer(): Promise<Computer> {
-  const res = await fetch("/api/computer", { credentials: "same-origin" });
+export async function getComputer(botId?: string | null): Promise<Computer> {
+  const qs = botId ? `?botId=${encodeURIComponent(botId)}` : "";
+  const res = await fetch(`/api/computer${qs}`, { credentials: "same-origin" });
   if (!res.ok) {
     throw new Error("session expired");
   }
   return (await res.json()) as Computer;
+}
+
+export async function sleepBot(id: string): Promise<Bot> {
+  const res = await fetch(`/api/bots/${encodeURIComponent(id)}/sleep`, {
+    method: "POST",
+    credentials: "same-origin",
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Could not Sleep.");
+  }
+  return (await res.json()) as Bot;
+}
+
+export async function wakeBot(id: string): Promise<Bot> {
+  const res = await fetch(`/api/bots/${encodeURIComponent(id)}/wake`, {
+    method: "POST",
+    credentials: "same-origin",
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Could not Wake.");
+  }
+  return (await res.json()) as Bot;
 }
