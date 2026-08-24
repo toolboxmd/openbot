@@ -1,5 +1,20 @@
 import { useEffect, useRef } from "react";
-import { EYE, pickColor, pickShape, type FaceMode, type FaceShape } from "@/lib/face";
+import {
+  EYE,
+  pickColor,
+  pickShape,
+  deform,
+  norm,
+  rotX,
+  rotY,
+  shapeFit,
+  shapeOutline,
+  shapeZExtent,
+  projectPoint,
+  type FaceMode,
+  type FaceShape,
+  type Vec3,
+} from "@/lib/face";
 import { cn } from "@/lib/utils";
 
 type Props = {
@@ -21,23 +36,6 @@ function rand(a: number, b: number): number {
   return a + Math.random() * (b - a);
 }
 
-type Vec = { x: number; y: number; z: number };
-
-function rotY(p: Vec, a: number): Vec {
-  const c = Math.cos(a);
-  const s = Math.sin(a);
-  return { x: p.x * c + p.z * s, y: p.y, z: -p.x * s + p.z * c };
-}
-function rotX(p: Vec, a: number): Vec {
-  const c = Math.cos(a);
-  const s = Math.sin(a);
-  return { x: p.x, y: p.y * c - p.z * s, z: p.y * s + p.z * c };
-}
-function norm(p: Vec): Vec {
-  const l = Math.hypot(p.x, p.y, p.z) || 1;
-  return { x: p.x / l, y: p.y / l, z: p.z / l };
-}
-
 function hexToRgb(hex: string): [number, number, number] {
   const h = hex.replace("#", "");
   return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
@@ -46,20 +44,6 @@ function hexToRgb(hex: string): [number, number, number] {
 function mix([ar, ag, ab]: [number, number, number], [br, bg, bb]: [number, number, number], t: number): string {
   const k = clamp(t, 0, 1);
   return `rgb(${Math.round(ar + (br - ar) * k)},${Math.round(ag + (bg - ag) * k)},${Math.round(ab + (bb - ab) * k)})`;
-}
-
-/** Stretch a unit sphere into the hashed 3D body. */
-function deform(p: Vec, shape: FaceShape): Vec {
-  if (shape === "capsule") return norm({ x: p.x * 0.72, y: p.y * 1.18, z: p.z * 0.72 });
-  if (shape === "rounded-cube") {
-    const n = 3.2;
-    const s = (Math.abs(p.x) ** n + Math.abs(p.y) ** n + Math.abs(p.z) ** n) ** (1 / n) || 1;
-    return { x: p.x / s, y: p.y / s, z: p.z / s };
-  }
-  if (shape === "diamond") return norm({ x: p.x * 1.15, y: p.y * 1.28, z: p.z * 1.15 });
-  if (shape === "bean") return norm({ x: p.x * 1.08 + 0.12, y: p.y * 0.92, z: p.z * 0.95 });
-  if (shape === "shield") return norm({ x: p.x * 0.92, y: p.y * 1.22 + 0.08, z: p.z * 0.88 });
-  return p;
 }
 
 function pose(mode: FaceMode) {
@@ -75,6 +59,13 @@ function pose(mode: FaceMode) {
     default:
       return { lid: 0.04, eye: 1, look: { x: 0, y: 0 } };
   }
+}
+
+function trace(ctx: CanvasRenderingContext2D, outline: { x: number; y: number }[]) {
+  if (!outline.length) return;
+  ctx.moveTo(outline[0].x, outline[0].y);
+  for (let i = 1; i < outline.length; i++) ctx.lineTo(outline[i].x, outline[i].y);
+  ctx.closePath();
 }
 
 export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle", className }: Props) {
@@ -94,6 +85,8 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
     const pointer = { x: 0, y: 0 };
     const base = hexToRgb(resolvedColor);
     const p0 = pose(mode);
+    const restFit = shapeFit(resolvedShape, size);
+    const zMax = shapeZExtent(resolvedShape);
 
     const sim = {
       yaw: 0,
@@ -122,20 +115,19 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
     let raf = 0;
     let last = performance.now();
 
-    function drawEye(ctx2: CanvasRenderingContext2D, p: Vec, radius: number, lid: number, scale: number) {
-      if (p.z < 0.08) return;
-      const cx = radius + p.x * radius * 0.86;
-      const cy = radius - p.y * radius * 0.86;
-      const foreshort = 0.35 + 0.65 * clamp(p.z, 0, 1);
+    function drawEye(ctx2: CanvasRenderingContext2D, p: Vec3, lid: number, scale: number, fit: typeof restFit) {
+      if (p.z < zMax * 0.08) return;
+      const q = projectPoint(p, fit, size);
+      const foreshort = 0.35 + 0.65 * clamp(p.z / zMax, 0, 1);
       const rx = 5.4 * scale * foreshort;
       const ry = Math.max(0.7, 7.8 * scale * foreshort * (1 - lid * 0.94));
       ctx2.save();
-      ctx2.translate(cx, cy);
+      ctx2.translate(q.x, q.y);
       ctx2.rotate(-p.x * 0.35);
       ctx2.beginPath();
       ctx2.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
       ctx2.fillStyle = EYE;
-      ctx2.globalAlpha = clamp((p.z - 0.08) / 0.4, 0, 1);
+      ctx2.globalAlpha = clamp((p.z / zMax - 0.08) / 0.4, 0, 1);
       ctx2.fill();
       ctx2.restore();
     }
@@ -221,19 +213,21 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
       g.setTransform(dpr, 0, 0, dpr, 0, hopY * (size / 100));
       g.clearRect(0, -20, size, size + 40);
 
-      const radius = size / 2;
       const breath = reduced || mode === "work" ? 0 : Math.sin(sim.breath) * 0.012;
-      const r = radius * (0.92 + breath);
+      const live = {
+        ...restFit,
+        scale: restFit.scale * (1 + breath),
+        width: restFit.width * (1 + breath),
+        height: restFit.height * (1 + breath),
+        maxDim: restFit.maxDim * (1 + breath),
+      };
+      const radius = size / 2;
+      const r = live.maxDim / 2;
 
-      const light: Vec = norm({ x: -0.42, y: 0.62, z: 0.66 });
-      const grad = g.createRadialGradient(
-        radius + light.x * r * 0.35,
-        radius - light.y * r * 0.35,
-        r * 0.08,
-        radius,
-        radius,
-        r,
-      );
+      const light: Vec3 = norm({ x: -0.42, y: 0.62, z: 0.66 });
+      const gx = radius + light.x * live.width * 0.22;
+      const gy = radius - light.y * live.height * 0.22;
+      const grad = g.createRadialGradient(gx, gy, r * 0.08, radius, radius, r);
       const highlight = mix(base, [255, 255, 255], resolvedColor === "#141414" ? 0.28 : 0.22);
       const shade = mix(base, [0, 0, 0], 0.55);
       grad.addColorStop(0, highlight);
@@ -241,41 +235,29 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
       grad.addColorStop(1, shade);
 
       g.beginPath();
-      if (resolvedShape === "capsule") {
-        g.ellipse(radius, radius, r * 0.78, r, 0, 0, Math.PI * 2);
-      } else if (resolvedShape === "rounded-cube") {
-        const x = radius - r * 0.86;
-        const s = r * 1.72;
-        g.roundRect(x, x, s, s, r * 0.42);
-      } else if (resolvedShape === "diamond") {
-        g.moveTo(radius, radius - r);
-        g.lineTo(radius + r * 0.78, radius);
-        g.lineTo(radius, radius + r);
-        g.lineTo(radius - r * 0.78, radius);
-        g.closePath();
-      } else {
+      if (resolvedShape === "sphere") {
         g.arc(radius, radius, r, 0, Math.PI * 2);
+      } else {
+        trace(g, shapeOutline(resolvedShape, sim.yaw, live, size));
       }
       g.fillStyle = grad;
       g.fill();
 
-      // rim so the sphere reads as a volume, not a disc
-      g.beginPath();
-      g.arc(radius, radius, r, 0, Math.PI * 2);
       g.strokeStyle = mix(base, [0, 0, 0], 0.35);
       g.lineWidth = Math.max(1, size * 0.02);
-      g.globalAlpha = resolvedShape === "sphere" || resolvedShape === "bean" || resolvedShape === "shield" ? 0.35 : 0;
+      g.lineJoin = "round";
+      g.globalAlpha = 0.35;
       g.stroke();
       g.globalAlpha = 1;
 
       const lid = clamp(sim.lid + blinkLid * (1 - sim.lid), 0, 1);
-      const eyeScale = p.eye * (size / 88);
+      const eyeScale = p.eye * Math.max(size / 88, 0.42);
       const left0 = deform(norm({ x: -0.32, y: 0.1, z: 0.94 }), resolvedShape);
       const right0 = deform(norm({ x: 0.32, y: 0.1, z: 0.94 }), resolvedShape);
       const left = rotX(rotY(left0, sim.yaw), sim.pitch);
       const right = rotX(rotY(right0, sim.yaw), sim.pitch);
-      drawEye(g, left, radius, lid, eyeScale);
-      drawEye(g, right, radius, lid, eyeScale);
+      drawEye(g, left, lid, eyeScale, live);
+      drawEye(g, right, lid, eyeScale, live);
     }
 
     function loop(now: number) {
@@ -298,7 +280,7 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
       <span
         data-testid="eyes-write"
         aria-label="writing"
-        className={cn("inline-flex items-center justify-center gap-1", className)}
+        className={cn("inline-flex shrink-0 items-center justify-center gap-1", className)}
         style={{ width: size, height: size }}
       >
         {[0, 1, 2].map((i) => (
@@ -325,7 +307,9 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
       width={size}
       height={size}
       aria-hidden
-      className={cn("block", className)}
+      data-face-name={name}
+      data-face-shape={resolvedShape}
+      className={cn("block aspect-square shrink-0", className)}
       style={{ width: size, height: size }}
     />
   );
