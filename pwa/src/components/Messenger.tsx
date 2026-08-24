@@ -161,7 +161,7 @@ export function Messenger() {
     <div data-testid="messenger" className="flex h-full min-h-0 bg-background">
       <aside className="flex w-64 shrink-0 flex-col bg-sidebar text-sidebar-foreground">
         <div className="flex items-center gap-3 px-4 py-4">
-          <Eyes size={32} />
+          <Eyes size={32} className="aspect-square shrink-0" />
           <div className="min-w-0">
             <p className="truncate text-sm font-semibold">OpenBot</p>
             <p className="flex items-center gap-1 text-xs text-muted-foreground">
@@ -223,7 +223,7 @@ export function Messenger() {
                       shape={bot.eyes.shape as FaceShape}
                       mode={sidebarMode(bot)}
                       size={28}
-                      className="shrink-0"
+                      className="aspect-square shrink-0"
                     />
                     {bot.name}
                   </button>
