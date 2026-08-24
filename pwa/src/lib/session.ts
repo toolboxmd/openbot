@@ -24,6 +24,8 @@ export type Bot = {
   harness: string | null;
   eyes: { color: string; shape: string; mode: EyesMode };
   write: boolean;
+  zoom?: boolean;
+  display?: number | null;
   permission: {
     title: string;
     description?: string;
@@ -115,12 +117,36 @@ export async function answerPermission(botId: string, optionId: string): Promise
   return (await res.json()) as Bot;
 }
 
-export type Computer = { path: string; ready: boolean };
+export type Computer = {
+  path: string;
+  ready: boolean;
+  botId?: string | null;
+  write?: boolean;
+  viewOnly?: boolean;
+  zoom?: boolean;
+  display?: number | null;
+  container?: string;
+};
 
-export async function getComputer(): Promise<Computer> {
-  const res = await fetch("/api/computer", { credentials: "same-origin" });
+export async function getComputer(botId?: string | null): Promise<Computer> {
+  const qs = botId ? `?botId=${encodeURIComponent(botId)}` : "";
+  const res = await fetch(`/api/computer${qs}`, { credentials: "same-origin" });
   if (!res.ok) {
     throw new Error("session expired");
+  }
+  return (await res.json()) as Computer;
+}
+
+export async function setComputerZoom(botId: string | null, zoom: boolean): Promise<Computer> {
+  const res = await fetch("/api/computer/zoom", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ botId, zoom }),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Could not zoom Computer.");
   }
   return (await res.json()) as Computer;
 }
