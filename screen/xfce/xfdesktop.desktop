@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Xfdesktop
+Exec=xfdesktop
+Hidden=true
+X-XFCE-Autostart-Override=true
