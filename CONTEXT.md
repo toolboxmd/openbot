@@ -27,7 +27,22 @@ The coding agent CLI already on the host OS (Codex, Claude Code, Grok Build, or 
 Headed Chrome driver on the Screen's DISPLAY. Default browser hands. Not Playwright.
 
 ## Takeover
-There is no Takeover button. Zooming or opening the Computer preview is already write. User drives the Screen for password, 2FA, captcha, or payment. Never paste secrets in chat. Not used for Harness CLI login.
+There is no Takeover button on the Computer pane. Zooming or opening the Computer preview is already write. In chat, a needs-you Computer card says it needs you; its action is **Open computer** (same as zoom). Not a second mode. User drives the Screen for password, 2FA, captcha, or payment. Never paste secrets in chat. Not used for Harness CLI login.
+
+## Open computer
+The primary action on a needs-you Computer card. Opens that Bot's Computer (already write). Same as clicking the preview.
+
+## Waiting for you
+Sidebar state when a Bot needs the user (orange). Pairs with an in-thread Computer card: **Action needed**, thumbnail of the blocker, **Open computer** / **I'm done** / **Skip**. I'm done = resume the Bot. Skip = stop waiting. Both stay on the card until clicked. Done and Skip remain in history (green Done / skipped), with Open computer still available.
+
+## Working
+While a Bot is writing: Eyes animate in the thread (three-dot / moving). Hover on that Eyes shows `{name} is working`. Not a chat bubble and not a strip that stays on screen. Idle: no working copy, animation gone.
+
+## Card
+A transcript item that is not a text bubble: screenshot, file chip, widget, Computer needs-you / Done. Human-facing. Never a dump of tool JSON or ACP logs.
+
+## Turn
+One user send. The Bot may reply with several short bubbles (each ACP message is one bubble). The PWA does not split a long string. Tone is a few sentences, like a person. Markdown essays and tool transcripts are capped out of chat. Screenshots and files attach when they help, not as a default dump.
 
 ## Eyes
 Code-drawn robot face (color + shape). States: idle, thinking, working, needs-you, asleep.
