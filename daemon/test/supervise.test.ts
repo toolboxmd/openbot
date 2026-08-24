@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   DEFAULT_SCREEN_UPSTREAM,
+  FORBIDDEN_SCREEN_PORT,
   SCREEN_SERVICE,
   superviseTalk,
   type SupervisedChild,
@@ -89,7 +90,8 @@ describe("start supervisor", () => {
     const env = await spawned.promise;
     assert.deepEqual(order, [`compose:${SCREEN_SERVICE}`, "spawn"]);
     assert.equal(env.SCREEN_UPSTREAM, DEFAULT_SCREEN_UPSTREAM);
-    assert.equal(DEFAULT_SCREEN_UPSTREAM, "http://127.0.0.1:6901");
+    assert.equal(DEFAULT_SCREEN_UPSTREAM, "http://127.0.0.1:16901");
+    assert.equal(FORBIDDEN_SCREEN_PORT, 6901);
     assert.ok(fire, "supervisor should listen for signals");
     fire!("SIGINT");
     await run;
@@ -119,6 +121,40 @@ describe("start supervisor", () => {
     const env = await spawned.promise;
     assert.equal(env.SCREEN_UPSTREAM, "http://127.0.0.1:16901");
     fire!("SIGTERM");
+    await run;
+  });
+
+  test("pickPorts publishes a loopback range and never 6901", async () => {
+    const spawned = deferred<NodeJS.ProcessEnv>();
+    let composeEnv: NodeJS.ProcessEnv | undefined;
+    let fire: ((signal: NodeJS.Signals) => void) | undefined;
+    const run = superviseTalk(
+      {
+        composeUp: async (_service, env) => {
+          composeEnv = env;
+        },
+        spawnDaemon: (env) => {
+          spawned.resolve(env);
+          return new FakeChild();
+        },
+        sleep: async () => {},
+        now: () => 0,
+        onSignal: (handler) => {
+          fire = handler;
+          return () => {};
+        },
+        pickPorts: async () => [16931, 16932],
+      },
+      {},
+    );
+    const env = await spawned.promise;
+    assert.equal(env.SCREEN_UPSTREAM, "http://127.0.0.1:16931");
+    assert.equal(env.SCREEN_PORTS, "16931,16932");
+    assert.equal(env.SCREEN_PORT_1, "16931");
+    assert.equal(env.SCREEN_PORT_2, "16932");
+    assert.equal(composeEnv?.SCREEN_PORT_1, "16931");
+    assert.ok(!String(env.SCREEN_PORTS).split(",").includes("6901"));
+    fire!("SIGINT");
     await run;
   });
 
