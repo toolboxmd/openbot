@@ -47,7 +47,12 @@ describe("Computer Screen HTTP", () => {
     stub = http.createServer((req, res) => {
       lastAuth = req.headers.authorization;
       lastPath = req.url;
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "www-authenticate": "Basic realm=kasm" });
+      res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "www-authenticate": "Basic realm=kasm",
+        "cross-origin-embedder-policy": "require-corp",
+        "cross-origin-opener-policy": "same-origin",
+      });
       res.end("<html><title>KasmVNC</title><body>desktop-stub</body></html>");
     });
     stub.on("upgrade", (req, socket) => {
@@ -126,6 +131,20 @@ describe("Computer Screen HTTP", () => {
     assert.equal(lastAuth, expected);
     const www = screen.headers.get("www-authenticate");
     assert.equal(www, null, "Kasm basic-auth challenge must not reach the browser");
+    assert.equal(screen.headers.get("cross-origin-embedder-policy"), null);
+    assert.equal(screen.headers.get("cross-origin-opener-policy"), null);
+  });
+
+  test("Talk does not disable clipboard via Permissions-Policy", async () => {
+    const cookie = await login(box.url);
+    const pwa = await fetch(`${box.url}/`, { headers: { cookie } });
+    assert.ok(pwa.ok, `GET / failed: ${pwa.status}`);
+    const screen = await fetch(`${box.url}/screen/`, { headers: { cookie } });
+    assert.ok(screen.ok, `GET /screen/ failed: ${screen.status}`);
+    for (const res of [pwa, screen]) {
+      const policy = `${res.headers.get("permissions-policy") ?? ""} ${res.headers.get("feature-policy") ?? ""}`;
+      assert.doesNotMatch(policy, /clipboard-(?:read|write)\s*=\s*\(\)/);
+    }
   });
 
   test("session WebSocket upgrade is proxied with basic auth", async () => {
@@ -168,6 +187,26 @@ describe("Computer Screen HTTP", () => {
       req.on("error", reject);
       req.end();
     });
+  });
+
+  test("Kasm UI assets under /screen/ are not treated as Bot ids", async () => {
+    const cookie = await login(box.url);
+    lastPath = undefined;
+    const asset = await fetch(`${box.url}/screen/assets/ui-BOjwDkC7.js`, { headers: { cookie } });
+    assert.ok(asset.ok, `GET /screen/assets/ui.js failed: ${asset.status}`);
+    assert.equal(lastPath, "/assets/ui-BOjwDkC7.js");
+    lastPath = undefined;
+    const css = await fetch(`${box.url}/screen/openbot.css`, { headers: { cookie } });
+    assert.ok(css.ok, `GET /screen/openbot.css failed: ${css.status}`);
+    assert.equal(lastPath, "/openbot.css");
+  });
+
+  test("Bot Screen assets stay on that Bot's Kasm path", async () => {
+    const cookie = await login(box.url);
+    lastPath = undefined;
+    const asset = await fetch(`${box.url}/screen/${adaId}/assets/ui.js`, { headers: { cookie } });
+    assert.ok(asset.ok, `GET /screen/{bot}/assets/ui.js failed: ${asset.status}`);
+    assert.equal(lastPath, "/assets/ui.js");
   });
 
   test("two Bots proxy to their own display paths on one Computer", async () => {
