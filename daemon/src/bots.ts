@@ -10,14 +10,18 @@ import {
   type HarnessId,
   type HarnessInfo,
 } from "./harness.ts";
-import { AcpClient, isAuthError, spawnAcp, type AcpHandlers, type PermissionPrompt } from "./acp.ts";
+import { AcpClient, isAuthError, spawnAcp, type AcpHandlers, type AssistantDelta, type PermissionPrompt } from "./acp.ts";
 import type { SpawnSpec } from "./harness.ts";
 import { NoopComputerRuntime, type ComputerRuntime, type DisplayHandle } from "./computer.ts";
+
+export type MessageReceipt = "sent" | "delivered" | "read";
 
 export type PublicMessage = {
   id: string;
   role: "user" | "assistant";
   text: string;
+  createdAt: string;
+  receipt?: MessageReceipt;
 };
 
 export type PublicPermission = {
@@ -62,6 +66,7 @@ type Bot = {
   needsYou: { reason: "login"; hint: string } | null;
   permission: (PermissionPrompt & PublicPermission) | null;
   messages: PublicMessage[];
+  openAssistantId: string | null;
   client: AcpSession | null;
 };
 
@@ -163,6 +168,7 @@ export class BotStore {
       needsYou: null,
       permission: null,
       messages: [],
+      openAssistantId: null,
       client: null,
     };
     this.bots.set(id, bot);
@@ -236,11 +242,14 @@ export class BotStore {
           bot.permission = prompt;
           bot.eyesMode = "needs-you";
         },
-        onAssistant: (text) => {
-          const last = bot.messages[bot.messages.length - 1];
-          if (last && last.role === "assistant" && bot.write) {
-            last.text = text;
-          }
+        onAssistant: (text, delta) => {
+          this.applyAssistant(bot, text, delta);
+        },
+        onPromptWritten: () => {
+          this.setUserReceipt(bot, "delivered");
+        },
+        onPromptFlushed: () => {
+          this.setUserReceipt(bot, "read");
         },
       });
     } catch (err) {
@@ -289,17 +298,27 @@ export class BotStore {
       throw Object.assign(new Error(bot.needsYou?.hint ?? loginHint("codex")), { status: 409 });
     }
 
-    bot.messages.push({ id: crypto.randomUUID(), role: "user", text: trimmed });
-    bot.messages.push({ id: crypto.randomUUID(), role: "assistant", text: "" });
+    bot.messages.push({
+      id: crypto.randomUUID(),
+      role: "user",
+      text: trimmed,
+      createdAt: nowIso(),
+      receipt: "sent",
+    });
+    bot.openAssistantId = null;
     bot.write = true;
     bot.eyesMode = "write";
     bot.permission = null;
 
     const client = bot.client;
+    const turnAt = bot.messages.length;
     void (async () => {
       try {
         const reply = await client.prompt(trimmed);
-        this.fillAssistant(bot, reply || ".");
+        const assistants = bot.messages.slice(turnAt).filter((m) => m.role === "assistant" && m.text);
+        if (assistants.length === 0) {
+          this.pushAssistant(bot, reply || ".");
+        }
       } catch (err) {
         if (isAuthError(err) || isLikelyLogin(err)) {
           bot.eyesMode = "needs-you";
@@ -309,6 +328,7 @@ export class BotStore {
           this.fillAssistant(bot, err instanceof Error ? err.message : "Harness error");
         }
       } finally {
+        bot.openAssistantId = null;
         bot.write = false;
         if (bot.eyesMode === "write") bot.eyesMode = bot.needsYou ? "needs-you" : "idle";
         bot.permission = null;
@@ -338,14 +358,41 @@ export class BotStore {
   }
 
   private pushAssistant(bot: Bot, text: string): void {
-    bot.messages.push({ id: crypto.randomUUID(), role: "assistant", text });
+    bot.openAssistantId = null;
+    bot.messages.push({ id: crypto.randomUUID(), role: "assistant", text, createdAt: nowIso() });
+  }
+
+  private applyAssistant(bot: Bot, text: string, delta?: AssistantDelta): void {
+    const startNew = Boolean(delta?.start) || !bot.openAssistantId;
+    if (startNew) {
+      const id = crypto.randomUUID();
+      bot.messages.push({ id, role: "assistant", text, createdAt: nowIso() });
+      bot.openAssistantId = id;
+    } else {
+      const msg = bot.messages.find((item) => item.id === bot.openAssistantId);
+      if (msg) msg.text = text;
+    }
+    if (delta?.done) bot.openAssistantId = null;
+  }
+
+  private setUserReceipt(bot: Bot, next: MessageReceipt): void {
+    for (let i = bot.messages.length - 1; i >= 0; i--) {
+      const msg = bot.messages[i];
+      if (msg.role === "user") {
+        msg.receipt = advanceReceipt(msg.receipt, next);
+        return;
+      }
+    }
   }
 
   private fillAssistant(bot: Bot, text: string): void {
-    const last = bot.messages[bot.messages.length - 1];
-    if (last && last.role === "assistant") {
-      last.text = text;
-      return;
+    if (bot.openAssistantId) {
+      const msg = bot.messages.find((item) => item.id === bot.openAssistantId);
+      if (msg) {
+        msg.text = text;
+        bot.openAssistantId = null;
+        return;
+      }
     }
     this.pushAssistant(bot, text);
   }
@@ -370,6 +417,18 @@ export class BotStore {
 
 function isLikelyLogin(err: unknown): boolean {
   return isAuthError(err) || /login|auth|not signed/i.test(String((err as Error)?.message ?? err));
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+const RECEIPT_ORDER: MessageReceipt[] = ["sent", "delivered", "read"];
+
+function advanceReceipt(current: MessageReceipt | undefined, next: MessageReceipt): MessageReceipt {
+  const have = RECEIPT_ORDER.indexOf(current ?? "sent");
+  const want = RECEIPT_ORDER.indexOf(next);
+  return want > have ? next : (current ?? "sent");
 }
 
 export function defaultWorkspaceDir(): string {

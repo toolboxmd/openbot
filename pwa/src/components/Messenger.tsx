@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, Fragment, useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { ArrowUp, Maximize2, Monitor, Plus } from "lucide-react";
 import { ComputerScreen } from "@/components/Computer";
@@ -21,6 +21,50 @@ import {
   type Bot,
   type Harness,
 } from "@/lib/session";
+
+
+type ChatMessage = NonNullable<Bot["messages"]>[number];
+
+function autolink(text: string) {
+  return text.split(/(https?:\/\/[^\s<]+)/g).map((part, index) => {
+    if (!/^https?:\/\//.test(part)) return <span key={index}>{part}</span>;
+    const href = part.replace(/[.,;:!?)]+$/, "");
+    const trailing = part.slice(href.length);
+    return (
+      <span key={index}>
+        <a href={href} target="_blank" rel="noreferrer noopener" className="underline underline-offset-2">
+          {href}
+        </a>
+        {trailing}
+      </span>
+    );
+  });
+}
+
+function dayLabel(iso: string | undefined, now = new Date()): string | null {
+  if (!iso) return null;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  const startOfDay = (value: Date) => new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
+  const diff = Math.round((startOfDay(now) - startOfDay(date)) / 86_400_000);
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Yesterday";
+  return date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+}
+
+function timeLabel(iso: string | undefined): string | null {
+  if (!iso) return null;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+
+function receiptLabel(receipt: ChatMessage["receipt"]): string | null {
+  if (receipt === "sent") return "Sent";
+  if (receipt === "delivered") return "Delivered";
+  if (receipt === "read") return "Read";
+  return null;
+}
 
 export function Messenger() {
   const [draft, setDraft] = useState("");
@@ -263,19 +307,48 @@ export function Messenger() {
         {active && messages.length > 0 ? (
           <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-6 py-4">
             <ul className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-3">
-              {messages.filter((message) => message.text.length > 0).map((message) => (
-                <li
-                  key={message.id}
-                  className={cn(
-                    "max-w-[85%] rounded-2xl px-4 py-2 text-sm",
-                    message.role === "user"
-                      ? "self-end bg-primary text-primary-foreground"
-                      : "self-start bg-secondary text-secondary-foreground",
-                  )}
-                >
-                  {message.text}
-                </li>
-              ))}
+              {messages
+                .filter((message) => message.text.length > 0)
+                .map((message, index, visible) => {
+                  const day = dayLabel(message.createdAt);
+                  const prevDay = index > 0 ? dayLabel(visible[index - 1]?.createdAt) : null;
+                  const showDay = Boolean(day && day !== prevDay);
+                  const user = message.role === "user";
+                  const time = timeLabel(message.createdAt);
+                  const receipt = user ? receiptLabel(message.receipt) : null;
+                  return (
+                    <Fragment key={message.id}>
+                      {showDay ? (
+                        <li className="self-center py-2 text-[11px] font-medium text-muted-foreground">{day}</li>
+                      ) : null}
+                      <li
+                        className={cn(
+                          "flex max-w-[85%] flex-col gap-1",
+                          user ? "self-end items-end" : "self-start items-start",
+                        )}
+                      >
+                        {time ? (
+                          <time className="px-1 text-[11px] text-muted-foreground" dateTime={message.createdAt}>
+                            {time}
+                          </time>
+                        ) : null}
+                        <div
+                          className={cn(
+                            "rounded-2xl px-4 py-2 text-sm whitespace-pre-wrap break-words",
+                            user
+                              ? "bg-primary text-primary-foreground"
+                              : "bg-secondary text-secondary-foreground",
+                          )}
+                        >
+                          {autolink(message.text)}
+                        </div>
+                        {receipt ? (
+                          <span className="px-1 text-[11px] text-muted-foreground">{receipt}</span>
+                        ) : null}
+                      </li>
+                    </Fragment>
+                  );
+                })}
             </ul>
             {writing ? (
               <div className="mx-auto mt-3 w-full max-w-2xl">
