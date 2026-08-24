@@ -8,8 +8,11 @@ import {
   loginHint,
   spawnSpec,
   type HarnessId,
+  type HarnessInfo,
 } from "./harness.ts";
-import { AcpClient, isAuthError, spawnAcp, type PermissionPrompt } from "./acp.ts";
+import { AcpClient, isAuthError, spawnAcp, type AcpHandlers, type PermissionPrompt } from "./acp.ts";
+import type { SpawnSpec } from "./harness.ts";
+import { NoopComputerRuntime, type ComputerRuntime, type DisplayHandle } from "./computer.ts";
 
 export type PublicMessage = {
   id: string;
@@ -29,9 +32,21 @@ export type PublicBot = {
   harness: HarnessId | null;
   eyes: { color: string; shape: FaceShape; mode: EyesMode };
   write: boolean;
+  zoom: boolean;
+  display: number | null;
   permission: PublicPermission | null;
   needsYou: { reason: "login"; hint: string } | null;
   messages?: PublicMessage[];
+};
+
+export type AcpSession = {
+  close(): void;
+  pause?(): void;
+  resume?(): void;
+  initialize(): Promise<unknown>;
+  newSession(cwd: string): Promise<unknown>;
+  prompt(text: string): Promise<string>;
+  respondPermission(rpcId: PermissionPrompt["rpcId"], optionId: string): void;
 };
 
 type Bot = {
@@ -41,11 +56,19 @@ type Bot = {
   shape: FaceShape;
   harness: HarnessId | null;
   write: boolean;
+  zoom: boolean;
+  display: DisplayHandle | null;
   eyesMode: EyesMode;
   needsYou: { reason: "login"; hint: string } | null;
   permission: (PermissionPrompt & PublicPermission) | null;
   messages: PublicMessage[];
-  client: AcpClient | null;
+  client: AcpSession | null;
+};
+
+export type BotStoreDeps = {
+  computer?: ComputerRuntime;
+  spawnAcp?: (spec: SpawnSpec, cwd: string, handlers?: AcpHandlers) => AcpSession;
+  listHarnesses?: () => HarnessInfo[];
 };
 
 function publicPermission(p: PermissionPrompt | null): PublicPermission | null {
@@ -56,9 +79,16 @@ function publicPermission(p: PermissionPrompt | null): PublicPermission | null {
 export class BotStore {
   private bots = new Map<string, Bot>();
   private workspaceDir: string;
+  private computer: ComputerRuntime;
+  private spawnAcpFn: (spec: SpawnSpec, cwd: string, handlers?: AcpHandlers) => AcpSession;
+  private listHarnessesFn: () => HarnessInfo[];
+  private zoomedId: string | null = null;
 
-  constructor(workspaceDir: string) {
+  constructor(workspaceDir: string, deps: BotStoreDeps = {}) {
     this.workspaceDir = workspaceDir;
+    this.computer = deps.computer ?? new NoopComputerRuntime();
+    this.spawnAcpFn = deps.spawnAcp ?? spawnAcp;
+    this.listHarnessesFn = deps.listHarnesses ?? listHarnessesOnPath;
     fs.mkdirSync(this.workspaceDir, { recursive: true });
   }
 
@@ -70,7 +100,23 @@ export class BotStore {
   }
 
   listHarnesses() {
-    return listHarnessesOnPath();
+    return this.listHarnessesFn();
+  }
+
+  hasAcpChild(id: string): boolean {
+    return this.require(id).client != null;
+  }
+
+  computerRuntime(): ComputerRuntime {
+    return this.computer;
+  }
+
+  zoomedBotId(): string | null {
+    return this.zoomedId;
+  }
+
+  isZoomed(id: string): boolean {
+    return this.zoomedId === id;
   }
 
   list(): PublicBot[] {
@@ -82,7 +128,12 @@ export class BotStore {
     return bot ? this.toPublic(bot, true) : null;
   }
 
-  messages(id: string): { messages: PublicMessage[]; write: boolean; permission: PublicPermission | null; needsYou: PublicBot["needsYou"] } | null {
+  messages(id: string): {
+    messages: PublicMessage[];
+    write: boolean;
+    permission: PublicPermission | null;
+    needsYou: PublicBot["needsYou"];
+  } | null {
     const bot = this.bots.get(id);
     if (!bot) return null;
     return {
@@ -93,11 +144,12 @@ export class BotStore {
     };
   }
 
-  create(name: string): PublicBot {
+  async create(name: string): Promise<PublicBot> {
     const trimmed = name.trim();
     if (!trimmed) throw Object.assign(new Error("name is required"), { status: 400 });
     const taken = [...this.bots.values()].map((b) => b.shape);
     const id = crypto.randomUUID();
+    const display = await this.computer.allocate(id);
     const bot: Bot = {
       id,
       name: trimmed,
@@ -105,6 +157,8 @@ export class BotStore {
       shape: pickShape(trimmed, taken),
       harness: null,
       write: false,
+      zoom: false,
+      display,
       eyesMode: "idle",
       needsYou: null,
       permission: null,
@@ -112,6 +166,33 @@ export class BotStore {
       client: null,
     };
     this.bots.set(id, bot);
+    return this.toPublic(bot, true);
+  }
+
+  zoom(id: string): PublicBot {
+    const bot = this.require(id);
+    if (this.zoomedId && this.zoomedId !== id) {
+      this.unzoom(this.zoomedId);
+    }
+    if (this.zoomedId === id) return this.toPublic(bot, true);
+    bot.client?.pause?.();
+    bot.zoom = true;
+    this.zoomedId = id;
+    return this.toPublic(bot, true);
+  }
+
+  unzoom(id: string): PublicBot {
+    const bot = this.require(id);
+    if (this.zoomedId !== id) {
+      bot.zoom = false;
+      return this.toPublic(bot, true);
+    }
+    bot.client?.resume?.();
+    bot.zoom = false;
+    this.zoomedId = null;
+    if (bot.needsYou || bot.permission) bot.eyesMode = "needs-you";
+    else if (bot.write) bot.eyesMode = "write";
+    else bot.eyesMode = "idle";
     return this.toPublic(bot, true);
   }
 
@@ -135,9 +216,22 @@ export class BotStore {
     bot.eyesMode = "idle";
 
     const cwd = this.workspaceDir;
-    let client: AcpClient;
+    let spec: SpawnSpec;
     try {
-      client = spawnAcp(spawnSpec(harness), cwd, {
+      spec = spawnSpec(harness);
+    } catch (err) {
+      if (this.spawnAcpFn === spawnAcp) {
+        bot.eyesMode = "needs-you";
+        bot.needsYou = { reason: "login", hint: loginHint(harness) };
+        this.pushAssistant(bot, err instanceof Error ? err.message : loginHint(harness));
+        return this.toPublic(bot, true);
+      }
+      spec = { command: "injected-acp", args: [], env: { ...process.env } };
+    }
+
+    let client: AcpSession;
+    try {
+      client = this.spawnAcpFn(spec, cwd, {
         onPermission: (prompt) => {
           bot.permission = prompt;
           bot.eyesMode = "needs-you";
@@ -165,7 +259,14 @@ export class BotStore {
     } catch (err) {
       bot.eyesMode = "needs-you";
       bot.needsYou = { reason: "login", hint: loginHint(harness) };
-      this.pushAssistant(bot, isAuthError(err) || isLikelyLogin(err) ? loginHint(harness) : err instanceof Error ? err.message : loginHint(harness));
+      this.pushAssistant(
+        bot,
+        isAuthError(err) || isLikelyLogin(err)
+          ? loginHint(harness)
+          : err instanceof Error
+            ? err.message
+            : loginHint(harness),
+      );
       client.close();
       bot.client = null;
     }
@@ -179,6 +280,9 @@ export class BotStore {
     if (!bot.harness) throw Object.assign(new Error("pick a Harness first"), { status: 400 });
     if (bot.harness !== "codex") {
       throw Object.assign(new Error("Talk spawn is Codex-only in this slice"), { status: 400 });
+    }
+    if (bot.zoom || this.zoomedId === id) {
+      throw Object.assign(new Error("Computer is zoomed"), { status: 409 });
     }
     if (bot.write) throw Object.assign(new Error("turn already in flight"), { status: 409 });
     if (bot.needsYou?.reason === "login" || !bot.client) {
@@ -254,6 +358,8 @@ export class BotStore {
       harness: bot.harness,
       eyes: { color: bot.color, shape: bot.shape, mode },
       write: bot.write,
+      zoom: bot.zoom,
+      display: bot.display?.display ?? null,
       permission: publicPermission(bot.permission),
       needsYou: bot.needsYou,
     };
