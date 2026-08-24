@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { ArrowUp, Maximize2, MessageSquare, Monitor, Plus } from "lucide-react";
+import { ArrowUp, Maximize2, Monitor, Plus } from "lucide-react";
 import { ComputerScreen } from "@/components/Computer";
 import { Eyes } from "@/components/Eyes";
 import { Button } from "@/components/ui/button";
@@ -86,15 +86,6 @@ export function Messenger() {
     return () => window.clearInterval(tick);
   }, [activeId]);
 
-  useEffect(() => {
-    if (!computerOpen) return;
-    function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") setComputerOpen(false);
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [computerOpen]);
-
   async function onCreate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const name = nameDraft.trim();
@@ -159,14 +150,18 @@ export function Messenger() {
   }
 
   const messages = active?.messages ?? [];
-  const writing = Boolean(active?.write);
+  const writing = active?.eyes.mode === "write";
   const sidebarMode = (bot: Bot): FaceMode => (bot.eyes.mode === "write" ? "idle" : (bot.eyes.mode as FaceMode));
+
+  function openComputer() {
+    setComputerOpen(true);
+  }
 
   return (
     <div data-testid="messenger" className="flex h-full min-h-0 bg-background">
       <aside className="flex w-64 shrink-0 flex-col bg-sidebar text-sidebar-foreground">
         <div className="flex items-center gap-3 px-4 py-4">
-          <Eyes size={32} />
+          <Eyes size={32} className="aspect-square shrink-0" />
           <div className="min-w-0">
             <p className="truncate text-sm font-semibold">OpenBot</p>
             <p className="flex items-center gap-1 text-xs text-muted-foreground">
@@ -228,6 +223,7 @@ export function Messenger() {
                       shape={bot.eyes.shape as FaceShape}
                       mode={sidebarMode(bot)}
                       size={28}
+                      className="aspect-square shrink-0"
                     />
                     {bot.name}
                   </button>
@@ -376,39 +372,51 @@ export function Messenger() {
       </section>
       <Separator orientation="vertical" />
       <aside className="flex w-72 shrink-0 flex-col bg-sidebar text-sidebar-foreground">
-        <div className="flex h-14 items-center gap-2 px-4">
-          <Monitor className="size-3.5 text-muted-foreground" />
-          <h2 className="text-sm font-medium">This Computer</h2>
+        <div className="flex h-14 items-center justify-between gap-2 px-4">
+          <div className="flex min-w-0 items-center gap-2">
+            <Monitor className="size-3.5 text-muted-foreground" />
+            <h2 className="text-sm font-medium">This Computer</h2>
+          </div>
+          {computerOpen ? null : (
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              data-testid="open-computer"
+              aria-label="Open Computer"
+              onClick={openComputer}
+            >
+              <Maximize2 />
+            </Button>
+          )}
         </div>
         <Separator />
         <div className="p-3">
           <div className={cn(!computerOpen && "relative aspect-video")}>
             <div
+              data-testid={computerOpen ? "computer-expanded" : "computer-preview"}
               className={cn(
                 "overflow-hidden bg-black",
-                computerOpen ? "fixed inset-0 z-50" : "group relative aspect-video rounded-2xl",
+                computerOpen ? "fixed inset-0 z-50" : "group relative isolate aspect-video rounded-2xl",
               )}
             >
-              <ComputerScreen />
-              {computerOpen ? (
-                <Button
-                  type="button"
-                  size="lg"
-                  aria-label="Back to chat"
-                  onClick={() => setComputerOpen(false)}
-                  className="absolute top-4 right-4 z-10 h-12 rounded-full px-6 text-base shadow-lg [&_svg]:size-5"
-                >
-                  <MessageSquare />
-                  Chat
-                </Button>
-              ) : (
+              <ComputerScreen
+                botId={activeId}
+                expanded={computerOpen}
+                onClose={() => setComputerOpen(false)}
+              />
+              {computerOpen ? null : (
                 <button
                   type="button"
-                  onClick={() => setComputerOpen(true)}
-                  className="absolute inset-0 z-10 flex items-center justify-center bg-black/0 opacity-0 transition-opacity group-hover:bg-black/35 group-hover:opacity-100 focus-visible:bg-black/35 focus-visible:opacity-100 focus-visible:outline-none"
+                  data-testid="open-computer-preview"
                   aria-label="Open Computer"
+                  onClick={openComputer}
+                  className="absolute inset-0 z-30 flex cursor-pointer items-center justify-center bg-transparent"
                 >
-                  <span className="inline-flex items-center gap-2 rounded-full bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground shadow-lg">
+                  <span className="pointer-events-none absolute right-2 top-2 inline-flex size-7 items-center justify-center rounded-full bg-black/60 text-white shadow">
+                    <Maximize2 className="size-3.5" />
+                  </span>
+                  <span className="pointer-events-none inline-flex items-center gap-2 rounded-full bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground shadow-lg opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
                     <Maximize2 className="size-4" />
                     Open
                   </span>

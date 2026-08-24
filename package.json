@@ -8,7 +8,7 @@
     "test": "tsx --test daemon/test/*.test.ts",
     "typecheck": "tsc -p daemon/tsconfig.json --noEmit && tsc -p pwa/tsconfig.json --noEmit",
     "build:pwa": "vite build --config pwa/vite.config.ts",
-    "start": "tsx daemon/src/index.ts",
+    "start": "tsx daemon/src/start.ts",
     "dev:pwa": "vite --config pwa/vite.config.ts"
   },
   "devDependencies": {

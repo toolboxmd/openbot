@@ -19,3 +19,17 @@ security:
   brute_force_protection:
     blacklist_threshold: 10000
     blacklist_timeout: 1
+data_loss_prevention:
+  clipboard:
+    delay_between_operations: none
+    allow_mimetypes:
+      - chromium/x-web-custom-data
+      - text/html
+      - image/png
+      - text/plain
+    server_to_client:
+      enabled: true
+      size: unlimited
+    client_to_server:
+      enabled: true
+      size: unlimited
