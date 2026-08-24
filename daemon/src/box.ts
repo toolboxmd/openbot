@@ -3,7 +3,9 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
 import path from "node:path";
-import { BotStore, defaultWorkspaceDir } from "./bots.ts";
+import { BotStore, defaultWorkspaceDir, type BotStoreDeps } from "./bots.ts";
+import { NoopComputerRuntime, type ComputerRuntime } from "./computer.ts";
+import { kasmUpdateWrite } from "./kasm.ts";
 
 export type BoxOptions = {
   password: string;
@@ -14,7 +16,8 @@ export type BoxOptions = {
   kasmUser?: string;
   kasmPassword?: string;
   workspaceDir?: string;
-};
+  computer?: ComputerRuntime;
+} & Pick<BotStoreDeps, "spawnAcp" | "listHarnesses">;
 
 export type RunningBox = {
   url: string;
@@ -113,13 +116,18 @@ function isScreenPath(pathname: string): boolean {
   return pathname === SCREEN_PREFIX || pathname.startsWith(`${SCREEN_PREFIX}/`);
 }
 
-function stripScreenPrefix(pathname: string): string {
-  if (pathname === SCREEN_PREFIX) return "/";
-  if (pathname.startsWith(`${SCREEN_PREFIX}/`)) {
-    const rest = pathname.slice(SCREEN_PREFIX.length);
-    return rest.length === 0 ? "/" : rest;
+function parseScreenPath(pathname: string): { botId: string | null; rest: string } {
+  if (pathname === SCREEN_PREFIX || pathname === `${SCREEN_PREFIX}/`) {
+    return { botId: null, rest: "/" };
   }
-  return pathname;
+  if (!pathname.startsWith(`${SCREEN_PREFIX}/`)) return { botId: null, rest: "/" };
+  const rest = pathname.slice(SCREEN_PREFIX.length + 1);
+  if (!rest) return { botId: null, rest: "/" };
+  const cut = rest.indexOf("/");
+  const first = decodeURIComponent(cut === -1 ? rest : rest.slice(0, cut));
+  const tail = cut === -1 || cut === rest.length - 1 ? "/" : rest.slice(cut);
+  if (first === "websockify") return { botId: null, rest: `/${rest}` };
+  return { botId: first || null, rest: tail || "/" };
 }
 
 function kasmAuthorization(options: BoxOptions): string | undefined {
@@ -276,21 +284,86 @@ async function servePwa(
   }
 }
 
-async function screenIsReachable(
+/** node:http only. Do not fetch+AbortSignal against Kasm (undici can crash the host). */
+export function screenIsReachable(
   upstream: string | undefined,
   auth: string | undefined,
 ): Promise<boolean> {
-  if (!upstream) return false;
+  if (!upstream) return Promise.resolve(false);
+
+  let dest: URL;
   try {
-    await fetch(upstream, {
-      signal: AbortSignal.timeout(750),
-      redirect: "manual",
-      headers: auth ? { Authorization: auth } : undefined,
-    });
-    return true;
+    dest = new URL(upstream);
   } catch {
-    return false;
+    return Promise.resolve(false);
   }
+  if (dest.protocol !== "http:" && dest.protocol !== "https:") {
+    return Promise.resolve(false);
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+    };
+
+    const headers: http.OutgoingHttpHeaders = {
+      host: dest.host,
+      connection: "close",
+    };
+    if (auth) headers.authorization = auth;
+
+    let req: http.ClientRequest;
+    try {
+      req = requestFor(dest)(dest, {
+        method: "GET",
+        headers,
+        timeout: 750,
+      });
+    } catch {
+      done(false);
+      return;
+    }
+
+    const kill = () => {
+      try {
+        req.destroy();
+      } catch {
+        // ignore
+      }
+    };
+
+    req.setTimeout(750, () => {
+      kill();
+      done(false);
+    });
+    req.on("response", (res) => {
+      res.resume();
+      kill();
+      done(true);
+    });
+    req.on("timeout", () => {
+      kill();
+      done(false);
+    });
+    req.on("error", () => {
+      done(false);
+    });
+    req.on("socket", (socket) => {
+      socket.setTimeout(750, () => {
+        kill();
+        done(false);
+      });
+    });
+    try {
+      req.end();
+    } catch {
+      kill();
+      done(false);
+    }
+  });
 }
 
 function sendStoreError(res: http.ServerResponse, err: unknown): void {
@@ -304,7 +377,31 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
   const salt = crypto.randomBytes(16);
   const key = crypto.scryptSync(options.password, salt, 32);
   const auth = kasmAuthorization(options);
-  const store = new BotStore(options.workspaceDir ?? defaultWorkspaceDir());
+  const computer: ComputerRuntime =
+    options.computer ?? new NoopComputerRuntime(undefined, options.screenUpstream);
+  const store = new BotStore(options.workspaceDir ?? defaultWorkspaceDir(), {
+    computer,
+    spawnAcp: options.spawnAcp,
+    listHarnesses: options.listHarnesses,
+  });
+
+  function upstreamFor(botId: string | null): string | undefined {
+    if (botId && computer.upstream(botId)) return computer.upstream(botId);
+    return computer.computerUpstream() ?? options.screenUpstream;
+  }
+
+  async function applyKasmWrite(botId: string | null, write: boolean): Promise<void> {
+    if (!options.kasmUser || options.kasmPassword === undefined) return;
+    const upstream = upstreamFor(botId);
+    if (!upstream) return;
+    await kasmUpdateWrite({
+      upstream,
+      user: options.kasmUser,
+      password: options.kasmPassword,
+      name: options.kasmUser,
+      write,
+    });
+  }
 
   const server = http.createServer((req, res) => {
     void handle(req, res);
@@ -383,7 +480,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         }
         try {
           const name = typeof body.name === "string" ? body.name : "";
-          const bot = store.create(name);
+          const bot = await store.create(name);
           sendJson(res, 201, bot);
         } catch (err) {
           sendStoreError(res, err);
@@ -511,14 +608,83 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         }
       }
 
+      if (url.pathname === "/api/computer/zoom" && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        let body: Record<string, unknown> = {};
+        try {
+          const raw = await readBody(req);
+          body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        const botId = typeof body.botId === "string" ? body.botId : "";
+        const zoom = body.zoom !== false && body.zoom !== "false";
+        try {
+          if (!botId) {
+            await applyKasmWrite(null, zoom);
+            sendJson(res, 200, {
+              path: `${SCREEN_PREFIX}/`,
+              ready: true,
+              botId: null,
+              write: zoom,
+              viewOnly: !zoom,
+              zoom,
+              container: computer.containerName(),
+            });
+            return;
+          }
+          const bot = zoom ? store.zoom(botId) : store.unzoom(botId);
+          try {
+            await applyKasmWrite(botId, zoom);
+          } catch (err) {
+            if (zoom) store.unzoom(botId);
+            throw err;
+          }
+          sendJson(res, 200, {
+            ...bot,
+            path: `${SCREEN_PREFIX}/${botId}/`,
+            ready: true,
+            write: zoom,
+            viewOnly: !zoom,
+            zoom,
+            container: computer.containerName(),
+          });
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
       if (url.pathname === "/api/computer" && method === "GET") {
         if (!hasSession(req, key)) {
           sendJson(res, 401, { error: "unauthenticated" });
           return;
         }
+        const requested = url.searchParams.get("botId");
+        const bot = requested ? store.get(requested) : null;
+        if (requested && !bot) {
+          sendJson(res, 404, { error: "Bot not found" });
+          return;
+        }
+        const botId = bot?.id ?? null;
+        const upstream = upstreamFor(botId);
+        const zoomed = botId ? store.isZoomed(botId) : false;
+        const pathFor = botId ? `${SCREEN_PREFIX}/${botId}/` : `${SCREEN_PREFIX}/`;
+        const ready = await screenIsReachable(upstream, auth);
         sendJson(res, 200, {
-          path: `${SCREEN_PREFIX}/`,
-          ready: await screenIsReachable(options.screenUpstream, auth),
+          path: upstream ? pathFor : pathFor,
+          ready: Boolean(upstream) && ready,
+          botId,
+          write: zoomed,
+          viewOnly: !zoomed,
+          zoom: zoomed,
+          display: bot?.display ?? (upstream ? 1 : null),
+          container: computer.containerName(),
+          cookieJar: computer.cookieJar(),
         });
         return;
       }
@@ -533,14 +699,13 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
           sendJson(res, 401, { error: "unauthenticated" });
           return;
         }
-        if (!options.screenUpstream) {
-          sendJson(res, 503, { error: "Screen is not up" });
+        const parsed = parseScreenPath(url.pathname);
+        const destBase = upstreamFor(parsed.botId);
+        if (!destBase) {
+          sendJson(res, 503, { error: "Computer is not up" });
           return;
         }
-        const dest = new URL(
-          `${stripScreenPrefix(url.pathname)}${url.search}`,
-          options.screenUpstream,
-        );
+        const dest = new URL(`${parsed.rest}${url.search}`, destBase);
         proxyHttp(req, res, dest, auth);
         return;
       }
@@ -567,12 +732,14 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       socket.destroy();
       return;
     }
-    if (!options.screenUpstream) {
+    const parsed = parseScreenPath(url.pathname);
+    const destBase = upstreamFor(parsed.botId);
+    if (!destBase) {
       socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
     }
-    const dest = new URL(`${stripScreenPrefix(url.pathname)}${url.search}`, options.screenUpstream);
+    const dest = new URL(`${parsed.rest}${url.search}`, destBase);
     proxyUpgrade(req, socket, head, dest, auth);
   });
 
