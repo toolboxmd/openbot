@@ -1,9 +1,0 @@
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Chromium
-Comment=Web browser
-Exec=sh -c 'chromium --user-data-dir="${CHROME_USER_DATA_DIR:-$HOME/.config/chromium}" --no-first-run --disable-gpu --no-sandbox --test-type --disable-dev-shm-usage --disable-infobars chrome://new-tab-page'
-Icon=chromium
-Terminal=false
-Categories=Network;WebBrowser;
