@@ -223,6 +223,7 @@ export function Messenger() {
                       shape={bot.eyes.shape as FaceShape}
                       mode={sidebarMode(bot)}
                       size={28}
+                      className="shrink-0"
                     />
                     {bot.name}
                   </button>
