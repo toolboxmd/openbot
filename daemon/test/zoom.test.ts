@@ -283,4 +283,18 @@ describe("PWA has no Takeover button", () => {
     assert.match(computer, /expanded \? "pointer-events-auto" : "pointer-events-none"/);
     assert.match(computer, /setComputerZoom\(botId, expanded\)/);
   });
+
+  test("Computer iframe allows host clipboard into Screen", async () => {
+    const computer = await readFile(join(repoRoot, "pwa/src/components/Computer.tsx"), "utf8");
+    const yaml = await readFile(join(repoRoot, "screen/kasmvnc.yaml"), "utf8");
+    assert.match(computer, /allow="[^"]*clipboard-read/);
+    assert.match(computer, /allow="[^"]*clipboard-write/);
+    assert.match(computer, /searchParams\.set\("clipboard_up", "true"\)/);
+    assert.match(computer, /searchParams\.set\("clipboard_down", "true"\)/);
+    assert.match(computer, /searchParams\.set\("clipboard_seamless", "true"\)/);
+    assert.match(yaml, /client_to_server:[\s\S]*enabled:\s*true/);
+    assert.match(yaml, /server_to_client:[\s\S]*enabled:\s*true/);
+    assert.doesNotMatch(computer, /fake ACP/i);
+    assert.doesNotMatch(yaml, /fake ACP/i);
+  });
 });
