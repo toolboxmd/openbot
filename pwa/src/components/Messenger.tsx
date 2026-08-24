@@ -66,6 +66,31 @@ function receiptLabel(receipt: ChatMessage["receipt"]): string | null {
   return null;
 }
 
+/** iMessage-style: latest user bubble always shows its receipt; at most one Read. */
+export function showReceipt(
+  messages: Array<{ role: string; receipt?: ChatMessage["receipt"] }>,
+  index: number,
+): boolean {
+  const msg = messages[index];
+  if (!msg || msg.role !== "user") return false;
+  let lastUser = -1;
+  let lastRead = -1;
+  for (let i = 0; i < messages.length; i++) {
+    const row = messages[i];
+    if (row.role !== "user") continue;
+    lastUser = i;
+    if (row.receipt === "read") lastRead = i;
+  }
+  if (index === lastUser) return true;
+  if (msg.receipt !== "read") return false;
+  if (lastUser >= 0 && messages[lastUser]?.receipt === "read") return false;
+  return index === lastRead;
+}
+
+function isCancelledMessage(message: string): boolean {
+  return /cancel/i.test(message);
+}
+
 export function Messenger() {
   const [draft, setDraft] = useState("");
   const [nameDraft, setNameDraft] = useState("");
@@ -176,7 +201,8 @@ export function Messenger() {
       const bot = await sendMessage(activeId, text);
       setActive(bot);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not send.");
+      const message = err instanceof Error ? err.message : "Could not send.";
+      if (!isCancelledMessage(message)) setError(message);
     } finally {
       setBusy(false);
     }
@@ -315,7 +341,7 @@ export function Messenger() {
                   const showDay = Boolean(day && day !== prevDay);
                   const user = message.role === "user";
                   const time = timeLabel(message.createdAt);
-                  const receipt = user ? receiptLabel(message.receipt) : null;
+                  const receipt = user && showReceipt(visible, index) ? receiptLabel(message.receipt) : null;
                   return (
                     <Fragment key={message.id}>
                       {showDay ? (
@@ -431,7 +457,7 @@ export function Messenger() {
                 <Button
                   type="submit"
                   size="icon"
-                  disabled={!active || draft.trim().length === 0 || busy || writing}
+                  disabled={!active || draft.trim().length === 0 || busy}
                   aria-label="Send"
                   className="shrink-0"
                 >
