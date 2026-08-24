@@ -46,12 +46,17 @@ function mix([ar, ag, ab]: [number, number, number], [br, bg, bb]: [number, numb
   return `rgb(${Math.round(ar + (br - ar) * k)},${Math.round(ag + (bg - ag) * k)},${Math.round(ab + (bb - ab) * k)})`;
 }
 
+function working(mode: FaceMode): boolean {
+  return mode === "write" || mode === "work";
+}
+
 function pose(mode: FaceMode) {
   switch (mode) {
     case "think":
       return { lid: 0.12, eye: 0.92, look: { x: 0.28, y: -0.35 } };
+    case "write":
     case "work":
-      return { lid: 0.18, eye: 0.88, look: { x: 0, y: 0.12 } };
+      return { lid: 0.14, eye: 0.94, look: { x: 0.22, y: -0.16 } };
     case "needs-you":
       return { lid: 0, eye: 1.18, look: { x: 0, y: 0 } };
     case "sleep":
@@ -103,6 +108,7 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
       wrapT: rand(6, 11),
       wrapping: 0,
       breath: Math.random() * Math.PI * 2,
+      workT: 0,
     };
 
     function onMove(event: PointerEvent) {
@@ -133,16 +139,34 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
     }
 
     function paint(dt: number) {
-      const p = pose(mode);
+      const busy = working(mode);
+      let p = pose(mode);
       sim.lid = lerp(sim.lid, p.lid, 1 - Math.pow(0.001, dt));
       sim.breath += dt * Math.PI * 2 * 0.32;
+      if (busy && !reduced) sim.workT += dt;
+
+      if (busy && !reduced) {
+        const cycle = 0.68;
+        const phase = (sim.workT / cycle) % 3;
+        const i = Math.floor(phase);
+        const t = phase - i;
+        const k = t * t * (3 - 2 * t);
+        const looks = [
+          { x: -0.5, y: -0.14 },
+          { x: 0.46, y: 0.2 },
+          { x: 0.04, y: -0.36 },
+        ];
+        const a = looks[i];
+        const b = looks[(i + 1) % 3];
+        p = { ...p, look: { x: lerp(a.x, b.x, k), y: lerp(a.y, b.y, k) } };
+      }
 
       if (!reduced && mode !== "sleep") {
         sim.blinkT -= dt;
         if (sim.blinkT <= 0 && sim.blink <= 0) {
           sim.blink = 0.001;
           sim.double = Math.random() < 0.16;
-          sim.blinkT = rand(2.1, 5.8);
+          sim.blinkT = busy ? rand(0.85, 2.1) : rand(2.1, 5.8);
         }
       }
       let blinkLid = 0;
@@ -196,13 +220,20 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
         else sim.hop = 0;
         if (sim.hop > 0) sim.hop += dt;
       }
+      if (busy && !reduced) {
+        hopY = Math.sin(sim.workT * Math.PI * 2 * 1.55) * 3.4;
+      }
 
-      const aimYaw = reduced ? 0 : pointer.x * 0.55 + p.look.x + (mode === "idle" ? Math.sin(sim.breath * 0.35) * 0.18 : 0);
-      const aimPitch = reduced ? 0 : -pointer.y * 0.4 + p.look.y;
+      const aimYaw = reduced
+        ? 0
+        : busy
+          ? p.look.x + pointer.x * 0.12
+          : pointer.x * 0.55 + p.look.x + (mode === "idle" ? Math.sin(sim.breath * 0.35) * 0.18 : 0);
+      const aimPitch = reduced ? 0 : busy ? p.look.y - pointer.y * 0.08 : -pointer.y * 0.4 + p.look.y;
       sim.targetYaw = clamp(aimYaw, -0.7, 0.7);
       sim.targetPitch = clamp(aimPitch, -0.45, 0.4);
-      sim.yaw = lerp(sim.yaw, sim.targetYaw + sim.wrap, reduced ? 1 : 0.12);
-      sim.pitch = lerp(sim.pitch, sim.targetPitch, reduced ? 1 : 0.12);
+      sim.yaw = lerp(sim.yaw, sim.targetYaw + sim.wrap, reduced ? 1 : busy ? 0.22 : 0.12);
+      sim.pitch = lerp(sim.pitch, sim.targetPitch, reduced ? 1 : busy ? 0.22 : 0.12);
 
       const dpr = Math.min(2, window.devicePixelRatio || 1);
       const px = size * dpr;
@@ -213,7 +244,7 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
       g.setTransform(dpr, 0, 0, dpr, 0, hopY * (size / 100));
       g.clearRect(0, -20, size, size + 40);
 
-      const breath = reduced || mode === "work" ? 0 : Math.sin(sim.breath) * 0.012;
+      const breath = reduced ? 0 : Math.sin(sim.breath) * (busy ? 0.018 : 0.012);
       const live = {
         ...restFit,
         scale: restFit.scale * (1 + breath),
@@ -274,33 +305,6 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
     };
   }, [mode, resolvedColor, resolvedShape, size]);
 
-  if (mode === "write") {
-    const dot = Math.max(5, Math.round(size * 0.18));
-    return (
-      <span
-        data-testid="eyes-write"
-        aria-label="writing"
-        className={cn("inline-flex shrink-0 items-center justify-center gap-1", className)}
-        style={{ width: size, height: size }}
-      >
-        {[0, 1, 2].map((i) => (
-          <span
-            key={i}
-            className="inline-block rounded-full"
-            style={{
-              width: dot,
-              height: dot,
-              background: resolvedColor,
-              opacity: 0.35 + i * 0.25,
-              animation: "openbot-write 0.9s ease-in-out infinite",
-              animationDelay: `${i * 160}ms`,
-            }}
-          />
-        ))}
-      </span>
-    );
-  }
-
   return (
     <canvas
       ref={canvasRef}
@@ -309,6 +313,7 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
       aria-hidden
       data-face-name={name}
       data-face-shape={resolvedShape}
+      data-face-mode={mode}
       className={cn("block aspect-square shrink-0", className)}
       style={{ width: size, height: size }}
     />
