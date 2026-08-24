@@ -9,7 +9,13 @@ n="${DISPLAY#:}"
 export XDG_CONFIG_HOME="${HOME}/.config-d${n}"
 export XDG_CACHE_HOME="${HOME}/.cache-d${n}"
 export XDG_DATA_HOME="${HOME}/.local/share-d${n}"
-PROFILE="${CHROME_USER_DATA_DIR:-${HOME}/.config/chromium-d${n}}"
+if [ -n "${CHROME_USER_DATA_DIR:-}" ] && [ "$n" = "1" ]; then
+  PROFILE="$CHROME_USER_DATA_DIR"
+elif [ "$n" = "1" ]; then
+  PROFILE="${HOME}/.config/google-chrome"
+else
+  PROFILE="${HOME}/.config/google-chrome-d${n}"
+fi
 export CHROME_USER_DATA_DIR="$PROFILE"
 mkdir -p "$PROFILE" \
   "$XDG_CONFIG_HOME/xfce4/xfconf/xfce-perchannel-xml" \
@@ -46,12 +52,14 @@ fi
 # Unique headed profile per display. Shared cookies are copied in/out of
 # /computer/cookies by entrypoint. No CDP, no shared Chrome process, no PinchTab.
 CHROME_BIN=""
-if command -v chromium >/dev/null 2>&1; then
-  CHROME_BIN=chromium
-elif command -v chromium-browser >/dev/null 2>&1; then
-  CHROME_BIN=chromium-browser
+if command -v google-chrome-stable >/dev/null 2>&1; then
+  CHROME_BIN=google-chrome-stable
+elif command -v google-chrome >/dev/null 2>&1; then
+  CHROME_BIN=google-chrome
 fi
-if [ -n "$CHROME_BIN" ]; then
+if [ -z "$CHROME_BIN" ]; then
+  echo "google-chrome not found on PATH; Chromium is not a fallback" >&2
+else
   "$CHROME_BIN" \
     --user-data-dir="$PROFILE" \
     --no-first-run --disable-gpu --no-sandbox --test-type --disable-dev-shm-usage \

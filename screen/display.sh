@@ -11,7 +11,13 @@ HOME_DIR="/home/${USER_NAME}"
 COOKIE_JAR="${COOKIE_JAR:-/computer/cookies}"
 
 profile_dir() {
-  echo "${HOME_DIR}/.config/chromium-d${1}"
+  if [ -n "${CHROME_USER_DATA_DIR:-}" ] && [ "$1" = "1" ]; then
+    echo "$CHROME_USER_DATA_DIR"
+  elif [ "$1" = "1" ]; then
+    echo "${HOME_DIR}/.config/google-chrome"
+  else
+    echo "${HOME_DIR}/.config/google-chrome-d${1}"
+  fi
 }
 
 config_dir() {

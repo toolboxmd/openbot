@@ -24,8 +24,47 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       xfce4-terminal \
       xfdesktop4 \
       xfwm4 \
-      chromium \
+      gnupg \
     && rm -rf /var/lib/apt/lists/*
+
+# Google Chrome (not Debian Chromium). Official Linux build is amd64-only.
+# Retry Google apt, then the official .deb. Never fall back to Chromium.
+RUN set -eux; \
+    arch="${TARGETARCH:-amd64}"; \
+    case "$arch" in amd64|x86_64) ;; \
+      *) echo "google-chrome-stable is amd64-only (got ${arch}); not installing Chromium" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+      | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg; \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+      > /etc/apt/sources.list.d/google-chrome.list; \
+    ok=0; \
+    for i in 1 2 3 4 5; do \
+      if apt-get update && apt-get install -y google-chrome-stable; then ok=1; break; fi; \
+      echo "google-chrome-stable apt attempt ${i} failed; retrying"; \
+      sleep $((i * 3)); \
+    done; \
+    if [ "$ok" != 1 ]; then \
+      echo "apt repo failed; trying official .deb"; \
+      for i in 1 2 3; do \
+        if wget -q --tries=3 --timeout=60 -O /tmp/google-chrome.deb \
+             https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+           && apt-get update \
+           && apt-get install -y /tmp/google-chrome.deb; then \
+          ok=1; rm -f /tmp/google-chrome.deb; break; \
+        fi; \
+        rm -f /tmp/google-chrome.deb; \
+        echo "chrome .deb attempt ${i} failed; retrying"; \
+        sleep $((i * 3)); \
+      done; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*; \
+    if [ "$ok" != 1 ]; then \
+      echo "failed to install google-chrome-stable after retries; Chromium is not a fallback" >&2; \
+      exit 1; \
+    fi; \
+    command -v google-chrome-stable; \
+    google-chrome-stable --version
 
 RUN arch="${TARGETARCH:-amd64}"; \
     case "$arch" in \

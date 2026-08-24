@@ -12,7 +12,7 @@ Run package.json scripts.start with OPENBOT_PASSWORD set (default Password is `o
 
 That one command brings **one** Screen container up (Compose, screen only, detached) and runs Talk in the foreground on the host. Chat listens on [http://127.0.0.1:8080](http://127.0.0.1:8080). If Talk crashes while the command is still running, it is started again. Ctrl-C / SIGTERM stops Talk and **leaves Screen up**.
 
-The Computer pane is always a live XFCE desktop with Chromium open to https://www.google.com. Creating a second Bot adds a Kasm display inside the same container; it does not `docker run` another Debian. Host Kasm ports are a loopback range starting at 16901. **Never 6901** (the agent desktop often owns that).
+The Computer pane is always a live XFCE desktop with Google Chrome open on a New Tab. Creating a second Bot adds a Kasm display inside the same container; it does not `docker run` another Debian. Host Kasm ports are a loopback range starting at 16901. **Never 6901** (the agent desktop often owns that).
 
 Open **Computer** in the sidebar to watch. Zoom / Open is already write (mouse and keyboard). There is no Takeover button. Closing zoom returns to view-only. 2FA happens on the zoomed Screen. Never paste secrets in chat.
 
