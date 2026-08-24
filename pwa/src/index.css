@@ -81,15 +81,26 @@
   }
 }
 
-@keyframes openbot-write {
+@keyframes openbot-typing {
   0%,
-  80%,
+  70%,
   100% {
     opacity: 0.28;
-    transform: none;
+    transform: translateY(0);
   }
-  40% {
+  35% {
     opacity: 1;
-    transform: none;
+    transform: translateY(-2px);
+  }
+}
+
+.openbot-typing-dot {
+  animation: openbot-typing 1.05s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .openbot-typing-dot {
+    animation: none;
+    opacity: 0.65;
   }
 }

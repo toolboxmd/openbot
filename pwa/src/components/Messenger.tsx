@@ -105,6 +105,24 @@ function isCancelledMessage(message: string): boolean {
   return /cancel/i.test(message);
 }
 
+function isWorkingMode(mode: FaceMode | undefined): boolean {
+  return mode === "write" || mode === "work";
+}
+
+function TypingDots() {
+  return (
+    <span data-testid="typing-dots" aria-label="typing" className="inline-flex items-center gap-[5px] px-0.5 py-1">
+      {[0, 1, 2].map((i) => (
+        <span
+          key={i}
+          className="openbot-typing-dot inline-block size-[7px] rounded-full bg-muted-foreground/55"
+          style={{ animationDelay: `${i * 140}ms` }}
+        />
+      ))}
+    </span>
+  );
+}
+
 export function Messenger() {
   const [draft, setDraft] = useState("");
   const [nameDraft, setNameDraft] = useState("");
@@ -234,8 +252,9 @@ export function Messenger() {
   }
 
   const messages = active?.messages ?? [];
-  const writing = active?.eyes.mode === "write";
-  const sidebarMode = (bot: Bot): FaceMode => (bot.eyes.mode === "write" ? "idle" : (bot.eyes.mode as FaceMode));
+  const writing = isWorkingMode(active?.eyes.mode);
+  const sidebarMode = (bot: Bot): FaceMode =>
+    isWorkingMode(bot.eyes.mode) ? "idle" : (bot.eyes.mode as FaceMode);
 
   function openComputer() {
     setComputerOpen(true);
@@ -392,18 +411,34 @@ export function Messenger() {
                     </Fragment>
                   );
                 })}
+              {writing ? (
+                <li
+                  data-testid="working-indicator"
+                  className="flex max-w-[85%] flex-col items-start gap-1.5 self-start"
+                >
+                  <TypingDots />
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span
+                        data-testid="working-eyes"
+                        className="inline-flex"
+                        title={`${active.name} is working`}
+                        aria-label={`${active.name} is working`}
+                      >
+                        <Eyes
+                          name={active.name}
+                          color={active.eyes.color}
+                          shape={active.eyes.shape as FaceShape}
+                          mode={active.eyes.mode === "work" ? "work" : "write"}
+                          size={28}
+                        />
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent>{`${active.name} is working`}</TooltipContent>
+                  </Tooltip>
+                </li>
+              ) : null}
             </ul>
-            {writing ? (
-              <div className="mx-auto mt-3 w-full max-w-2xl">
-                <Eyes
-                  name={active.name}
-                  color={active.eyes.color}
-                  shape={active.eyes.shape as FaceShape}
-                  mode="write"
-                  size={28}
-                />
-              </div>
-            ) : null}
             {active.permission ? (
               <div className="mx-auto mt-3 w-full max-w-2xl rounded-2xl bg-secondary p-4 text-sm">
                 <p className="font-medium">{active.permission.title}</p>

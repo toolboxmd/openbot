@@ -19,6 +19,8 @@ type PublicMessage = {
 
 type BotBody = {
   id: string;
+  write?: boolean;
+  eyes?: { mode?: string };
   messages?: PublicMessage[];
 };
 
@@ -187,6 +189,16 @@ describe("Talk HTTP Turn bubbles and receipts", () => {
 
     const afterPost = await getBot(box.url, cookie, id);
     const viaMessages = await getMessages(box.url, cookie, id);
+    assert.equal(afterPost.write, true, "GET bot must expose write:true while the Turn is in flight");
+    assert.ok(
+      afterPost.eyes?.mode === "write" || afterPost.eyes?.mode === "work",
+      `eyes.mode must be write or work in flight, got ${afterPost.eyes?.mode}`,
+    );
+    assert.equal(
+      (afterPost.messages ?? []).some((m) => /is working/i.test(m.text)),
+      false,
+      "is working must not persist in messages[]",
+    );
     const user = (afterPost.messages ?? []).find((m) => m.role === "user");
     assert.ok(user, "user bubble must exist after POST");
     assert.equal(user.text, "Look at https://example.com/docs please");
@@ -223,6 +235,16 @@ describe("Talk HTTP Turn bubbles and receipts", () => {
     fake.releaseFinish();
     await tick();
     const done = await getBot(box.url, cookie, id);
+    assert.equal(done.write, false, "write must clear when the Turn lands");
+    assert.ok(
+      done.eyes?.mode !== "write" && done.eyes?.mode !== "work",
+      `eyes.mode must leave write/work when idle, got ${done.eyes?.mode}`,
+    );
+    assert.equal(
+      (done.messages ?? []).some((m) => /is working/i.test(m.text)),
+      false,
+      "is working must not land in the transcript",
+    );
     const messages = done.messages ?? [];
     const assistants = messages.filter((m) => m.role === "assistant");
     assert.equal(assistants.length, 2, "two ACP messages must be two bubbles; server must not concatenate");
