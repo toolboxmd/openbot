@@ -48,6 +48,17 @@ export function isAuthError(err: unknown): boolean {
   return code === -32000 || /auth/i.test(msg);
 }
 
+export function isCancelled(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown };
+  const code = String(e?.code ?? "");
+  const msg = String(e?.message ?? err ?? "");
+  return /cancel/i.test(code) || /cancel/i.test(msg);
+}
+
+function cancelledError(): Error {
+  return Object.assign(new Error("cancelled"), { code: "cancelled" });
+}
+
 export class AcpClient {
   private child: ChildProcessWithoutNullStreams;
   private nextId = 1;
@@ -60,6 +71,9 @@ export class AcpClient {
   private streaming = false;
   private idleResolvers: Array<() => void> = [];
   private gotIdle = false;
+  private generation = 0;
+  private activeGen = 0;
+  private promptId: RpcId | null = null;
   readonly spec: SpawnSpec;
 
   constructor(
@@ -166,6 +180,7 @@ export class AcpClient {
 
   private handleUpdate(update: Record<string, unknown> | undefined): void {
     if (!update) return;
+    if (this.activeGen !== this.generation) return;
     const kind = String(update.sessionUpdate ?? update.session_update ?? "");
     if (kind === "agent_message_chunk") {
       const piece = extractText(update.content);
@@ -227,11 +242,13 @@ export class AcpClient {
 
   async prompt(text: string): Promise<string> {
     if (!this.sessionId) throw new Error("no ACP session");
+    this.activeGen = ++this.generation;
     this.turnText = "";
     this.messageText = "";
     this.streaming = false;
     this.gotIdle = false;
     const id = this.nextId++;
+    this.promptId = id;
     const rpc = new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
     });
@@ -252,15 +269,48 @@ export class AcpClient {
         else resolve();
       });
     });
+    const myGen = this.activeGen;
     this.handlers.onPromptWritten?.();
     await flushed;
-    this.handlers.onPromptFlushed?.();
-    const result = (await rpc) as { stopReason?: string } | undefined;
-    if (!this.gotIdle && !(result && result.stopReason)) {
-      await this.waitIdle();
+    if (myGen !== this.generation) {
+      throw cancelledError();
     }
+    this.handlers.onPromptFlushed?.();
+    try {
+      const result = (await rpc) as { stopReason?: string } | undefined;
+      if (!this.gotIdle && !(result && result.stopReason)) {
+        await this.waitIdle();
+      }
+      this.streaming = false;
+      return this.turnText;
+    } finally {
+      if (this.promptId === id) this.promptId = null;
+    }
+  }
+
+  cancel(): void {
+    this.generation += 1;
     this.streaming = false;
-    return this.turnText;
+    this.messageText = "";
+    this.turnText = "";
+    this.gotIdle = true;
+    for (const resolve of this.idleResolvers) resolve();
+    this.idleResolvers = [];
+    if (this.promptId !== null) {
+      const pending = this.pending.get(this.promptId);
+      if (pending) {
+        this.pending.delete(this.promptId);
+        pending.reject(cancelledError());
+      }
+      this.promptId = null;
+    }
+    if (this.sessionId) {
+      this.send({
+        jsonrpc: "2.0",
+        method: "session/cancel",
+        params: { sessionId: this.sessionId },
+      });
+    }
   }
 
   respondPermission(rpcId: RpcId, optionId: string): void {
