@@ -59,6 +59,20 @@ function timeLabel(iso: string | undefined): string | null {
   return date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
 }
 
+function sameMinute(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  const left = new Date(a);
+  const right = new Date(b);
+  if (Number.isNaN(left.getTime()) || Number.isNaN(right.getTime())) return false;
+  return (
+    left.getFullYear() === right.getFullYear() &&
+    left.getMonth() === right.getMonth() &&
+    left.getDate() === right.getDate() &&
+    left.getHours() === right.getHours() &&
+    left.getMinutes() === right.getMinutes()
+  );
+}
+
 function receiptLabel(receipt: ChatMessage["receipt"]): string | null {
   if (receipt === "sent") return "Sent";
   if (receipt === "delivered") return "Delivered";
@@ -340,7 +354,10 @@ export function Messenger() {
                   const prevDay = index > 0 ? dayLabel(visible[index - 1]?.createdAt) : null;
                   const showDay = Boolean(day && day !== prevDay);
                   const user = message.role === "user";
-                  const time = timeLabel(message.createdAt);
+                  const prev = index > 0 ? visible[index - 1] : undefined;
+                  const grouped =
+                    Boolean(prev && prev.role === message.role && sameMinute(prev.createdAt, message.createdAt));
+                  const time = grouped ? null : timeLabel(message.createdAt);
                   const receipt = user && showReceipt(visible, index) ? receiptLabel(message.receipt) : null;
                   return (
                     <Fragment key={message.id}>

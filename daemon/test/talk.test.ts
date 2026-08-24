@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { isCancelled } from "../src/acp.ts";
+import { isCancelled, shouldStartBubble } from "../src/acp.ts";
 import { capTalkBubble, talkPrompt } from "../src/bots.ts";
 
 test("talkPrompt prefixes Talk voice and keeps the user line", () => {
@@ -33,4 +33,16 @@ test("isCancelled matches cancel message or code", () => {
   assert.equal(isCancelled(Object.assign(new Error("nope"), { code: "cancelled" })), true);
   assert.equal(isCancelled(new Error("Harness error")), false);
   assert.equal(isCancelled(new Error("ACP child exited")), false);
+});
+
+test("shouldStartBubble: missing id never forces a new bubble", () => {
+  assert.equal(shouldStartBubble(null, undefined), false);
+  assert.equal(shouldStartBubble("item-1", undefined), false);
+  assert.equal(shouldStartBubble("item-1", ""), false);
+});
+
+test("shouldStartBubble: a present id starts when it differs from the open one", () => {
+  assert.equal(shouldStartBubble(null, "item-1"), true);
+  assert.equal(shouldStartBubble("item-1", "item-1"), false);
+  assert.equal(shouldStartBubble("item-1", "item-2"), true);
 });

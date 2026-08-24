@@ -55,6 +55,17 @@ export function isCancelled(err: unknown): boolean {
   return /cancel/i.test(code) || /cancel/i.test(msg);
 }
 
+/** ACP v1 messageId is optional. Missing nextId keeps glue-by-streaming. A present id starts a bubble when it differs from the open one. */
+export function shouldStartBubble(prevId: string | null, nextId: string | undefined): boolean {
+  if (nextId == null || nextId === "") return false;
+  return prevId !== nextId;
+}
+
+function readMessageId(update: Record<string, unknown>): string | undefined {
+  const raw = update.messageId ?? update.message_id;
+  return typeof raw === "string" && raw.length > 0 ? raw : undefined;
+}
+
 function cancelledError(): Error {
   return Object.assign(new Error("cancelled"), { code: "cancelled" });
 }
@@ -69,6 +80,7 @@ export class AcpClient {
   private turnText = "";
   private messageText = "";
   private streaming = false;
+  private openMessageId: string | null = null;
   private idleResolvers: Array<() => void> = [];
   private gotIdle = false;
   private generation = 0;
@@ -185,8 +197,10 @@ export class AcpClient {
     if (kind === "agent_message_chunk") {
       const piece = extractText(update.content);
       if (!piece) return;
-      const start = !this.streaming;
+      const messageId = readMessageId(update);
+      const start = messageId !== undefined ? shouldStartBubble(this.openMessageId, messageId) : !this.streaming;
       if (start) this.messageText = "";
+      if (messageId !== undefined) this.openMessageId = messageId;
       this.streaming = true;
       this.messageText += piece;
       this.turnText += piece;
@@ -199,6 +213,8 @@ export class AcpClient {
       this.streaming = false;
       this.messageText = piece;
       this.turnText += piece;
+      const messageId = readMessageId(update);
+      if (messageId !== undefined) this.openMessageId = messageId;
       this.handlers.onAssistant?.(piece, { start: true, done: true });
       return;
     }
@@ -246,6 +262,7 @@ export class AcpClient {
     this.turnText = "";
     this.messageText = "";
     this.streaming = false;
+    this.openMessageId = null;
     this.gotIdle = false;
     const id = this.nextId++;
     this.promptId = id;
@@ -293,6 +310,7 @@ export class AcpClient {
     this.streaming = false;
     this.messageText = "";
     this.turnText = "";
+    this.openMessageId = null;
     this.gotIdle = true;
     for (const resolve of this.idleResolvers) resolve();
     this.idleResolvers = [];
