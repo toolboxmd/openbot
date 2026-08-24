@@ -6,7 +6,7 @@ Accepted (amended)
 ## Context
 ADR 0001 locked one Computer, N Screens, shared disk. The first implementation ran a full XFCE+Kasm container per Bot (hundreds of MB idle). Grok Bot is one persistent computer per account with a screen per Bot. Screens are work surfaces, not a security boundary. Chat is always-on and must not boot XFCE. The Computer pane shows one Screen at a time. Zooming that preview is how the user drives the desktop. A Takeover button is the wrong affordance.
 
-Idle "Screen is down" and docker-stop Sleep were shipped as a RAM trick (#13, #26, #28). That reading is rejected: the Computer pane must stay a live desktop (XFCE + Chrome on https://www.google.com), even when the Bot is not clicking. Stopping the Screen container to save RAM makes Chat look like a dead machine.
+Idle "Screen is down" and docker-stop Sleep were shipped as a RAM trick (#13, #26, #28). That reading is rejected: the Computer pane must stay a live desktop (XFCE + Chrome on a New Tab), even when the Bot is not clicking. Stopping the Screen container to save RAM makes Chat look like a dead machine.
 
 ## Decision
 One Computer (one Screen image / one Docker container / one machine). N Bots get N screens: extra displays (Kasm sessions on DISPLAY :1, :2, …) **inside that container**, not extra Debian containers. `docker compose up` / `npm start` starts that one `screen` service and keeps it up. Creating a Bot allocates a display on the existing Computer. Talk never `docker run`s `openbot-screen-${botId}`.

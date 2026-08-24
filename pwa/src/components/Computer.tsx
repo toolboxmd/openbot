@@ -9,6 +9,11 @@ function screenSrc(path: string, botId: string | null, viewOnly: boolean): strin
   url.searchParams.set("autoconnect", "1");
   url.searchParams.set("resize", "scale");
   url.searchParams.set("path", botId ? `screen/${botId}/websockify` : "screen/websockify");
+  // KasmVNC 1.5 disables clipboard_up/seamless when the client is in an iframe.
+  // URL params override that default so host Cmd/Ctrl+V reaches the desktop.
+  url.searchParams.set("clipboard_up", "true");
+  url.searchParams.set("clipboard_down", "true");
+  url.searchParams.set("clipboard_seamless", "true");
   // Kasm/noVNC: presence of view_only is truthy. Omit the param to grant control.
   if (viewOnly) url.searchParams.set("view_only", "true");
   return `${url.pathname}${url.search}`;
