@@ -2,7 +2,7 @@ import { getComputer, setComputerZoom, type Computer } from "@/lib/session";
 import { Button } from "@/components/ui/button";
 import { MessageSquare } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 function screenSrc(path: string, botId: string | null, viewOnly: boolean): string {
   const url = new URL(path, "http://openbot.local");
@@ -25,6 +25,7 @@ export function ComputerScreen({
 }) {
   const [computer, setComputer] = useState<Computer | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const frameRef = useRef<HTMLIFrameElement | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -84,6 +85,16 @@ export function ComputerScreen({
     return () => window.removeEventListener("keydown", onKey);
   }, [expanded, botId]);
 
+  useEffect(() => {
+    if (!expanded) return;
+    const node = frameRef.current;
+    if (!node) return;
+    const focus = () => node.focus();
+    focus();
+    node.addEventListener("load", focus);
+    return () => node.removeEventListener("load", focus);
+  }, [expanded, botId, computer?.path]);
+
   async function dismiss() {
     await setComputerZoom(botId, false).catch(() => undefined);
     onClose();
@@ -103,12 +114,14 @@ export function ComputerScreen({
   return (
     <>
       <iframe
+        ref={frameRef}
         title="Computer"
         key={`${botId ?? "computer"}-${viewOnly ? "view" : "write"}`}
         src={screenSrc(path, botId, viewOnly)}
+        tabIndex={expanded ? 0 : -1}
         className={cn(
-          "absolute inset-0 h-full w-full border-0 bg-black",
-          !expanded && "pointer-events-none",
+          "absolute inset-0 z-0 h-full w-full border-0 bg-black",
+          expanded ? "pointer-events-auto" : "pointer-events-none",
         )}
         allow="clipboard-read; clipboard-write; fullscreen"
       />
