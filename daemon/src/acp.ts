@@ -46,6 +46,7 @@ export class AcpClient {
   private nextId = 1;
   private pending = new Map<RpcId, Pending>();
   private closed = false;
+  private paused = false;
   private sessionId: string | null = null;
   private turnText = "";
   private idleResolvers: Array<() => void> = [];
@@ -226,10 +227,45 @@ export class AcpClient {
     });
   }
 
+  pause(): void {
+    if (this.closed || this.paused) return;
+    const pid = this.child.pid;
+    if (!pid) return;
+    try {
+      process.kill(pid, "SIGSTOP");
+      this.paused = true;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  resume(): void {
+    if (this.closed || !this.paused) return;
+    const pid = this.child.pid;
+    if (!pid) return;
+    try {
+      process.kill(pid, "SIGCONT");
+      this.paused = false;
+    } catch {
+      /* ignore */
+    }
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
     this.failAll(new Error("ACP client closed"));
+    if (this.paused) {
+      this.paused = false;
+      const pid = this.child.pid;
+      if (pid) {
+        try {
+          process.kill(pid, "SIGCONT");
+        } catch {
+          /* ignore */
+        }
+      }
+    }
     try {
       this.child.kill("SIGTERM");
     } catch {
