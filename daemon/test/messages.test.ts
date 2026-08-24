@@ -71,6 +71,7 @@ function gatedFakeAcp() {
       async newSession() {
         return "s1";
       },
+      cancel() {},
       async prompt() {
         promptCalls += 1;
         await until(written.promise);
