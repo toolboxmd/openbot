@@ -6,28 +6,28 @@ Glossary only. No implementation.
 Self-hosted Grok Bot. Named Bots on one Computer. MIT. Repo `toolboxmd/openbot`.
 
 ## Computer
-One Linux desktop per instance (Docker Screen). Shared files and browser cookie jar. Not a security boundary per Bot. Harness CLI logins live on the host OS, not inside Screen.
+One Linux desktop per instance (one Docker Screen container). Shared files and browser cookie jar. Not a security boundary per Bot. Harness CLI logins live on the host OS, not inside Screen. The Computer pane is always a live desktop. It is never a down / "Screen is down" gate.
 
 ## Bot
-A named teammate with a profile (name, title, description, Eyes, Harness) and its own Screen. Persistent.
+A named teammate with a profile (name, title, description, Eyes, Harness) and its own Screen (a display on the Computer). Persistent.
 
 ## Screen
-Private XFCE desktop for one Bot. Other Bots cannot see its windows. Watch via KasmVNC. Takeover for 2FA.
+Private XFCE display for one Bot, as an extra Kasm session inside the one Computer container. Other Bots cannot see its windows. Watch via KasmVNC. Zooming the Computer preview is write (2FA lives there). Not a second Debian.
 
 ## Active Bot
-A Bot whose Screen is currently running. RAM and CPU count per Active Bot, not per sidebar row.
+A Bot the user is talking to. RAM and CPU count per Computer plus per lit display, not per extra container.
 
 ## Sleep
-Stop an idle Screen so it stops costing RAM. Cold start when opened again. Also kills that Bot's Harness child.
+Not a user-visible down pane. Do not docker-stop the Computer. Displays stay lit. The Computer stays up.
 
 ## Harness
-The coding agent CLI already on the host OS (Codex, Claude Code, Grok Build, or Kimi Code) over ACP. The picker shows what is on PATH. The process runs beside Screen, not inside XFCE. The user does not watch its terminal. Files are a host folder also mounted on Screen. Vendor login is that host CLI home. Takeover is for site 2FA.
+The coding agent CLI already on the host OS (Codex, Claude Code, Grok Build, or Kimi Code) over ACP. The picker shows what is on PATH. The process runs beside Screen, not inside XFCE. The user does not watch its terminal. Files are a host folder also mounted on Screen. Vendor login is that host CLI home. Zoom (not a Takeover button) is for site 2FA. Zoom SIGSTOPs that Bot's ACP child so two pointers do not fight.
 
 ## PinchTab
 Headed Chrome driver on the Screen's DISPLAY. Default browser hands. Not Playwright.
 
 ## Takeover
-User drives the Screen for password, 2FA, captcha, or payment. Never paste secrets in chat. Not used for Harness CLI login.
+There is no Takeover button. Zooming or opening the Computer preview is already write. User drives the Screen for password, 2FA, captcha, or payment. Never paste secrets in chat. Not used for Harness CLI login.
 
 ## Eyes
 Code-drawn robot face (color + shape). States: idle, thinking, working, needs-you, asleep.
@@ -36,7 +36,7 @@ Code-drawn robot face (color + shape). States: idle, thinking, working, needs-yo
 User-provided Cloudflare tunnel so the PWA is reachable from a phone.
 
 ## Password
-Single shared secret that locks the PWA. Cookie after first entry.
+Single shared secret that locks the PWA. Cookie after first entry. Default `openbot`.
 
 ## Arena
 Parked. Public Twitch-plays demo. Not v1.
