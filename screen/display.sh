@@ -20,12 +20,20 @@ config_dir() {
 
 seed_display() {
   local n="$1"
-  local cfg
+  local cfg panel
   cfg="$(config_dir "$n")/xfce4/xfconf/xfce-perchannel-xml"
-  mkdir -p "$cfg" "$(profile_dir "$n")/Default/Network" "$HOME_DIR/.vnc"
+  panel="$(config_dir "$n")/xfce4/panel"
+  mkdir -p "$cfg" "$panel/launcher-1" "$panel/launcher-2" "$panel/launcher-3" \
+    "$(profile_dir "$n")/Default/Network" "$HOME_DIR/.vnc"
   cp /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml "$cfg/xfwm4.xml"
   cp /etc/xdg/xfce4/panel/default.xml "$cfg/xfce4-panel.xml"
   cp /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/displays.xml "$cfg/displays.xml"
+  cp /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml "$cfg/xfce4-desktop.xml"
+  cp /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml "$cfg/xsettings.xml"
+  cp /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml "$cfg/xfce4-session.xml"
+  cp /etc/xdg/xfce4/panel/launcher-1/*.desktop "$panel/launcher-1/"
+  cp /etc/xdg/xfce4/panel/launcher-2/*.desktop "$panel/launcher-2/"
+  cp /etc/xdg/xfce4/panel/launcher-3/*.desktop "$panel/launcher-3/"
   cp /etc/openbot/xstartup "$HOME_DIR/.vnc/xstartup"
   chmod +x "$HOME_DIR/.vnc/xstartup"
   touch "$HOME_DIR/.vnc/.de-was-selected"

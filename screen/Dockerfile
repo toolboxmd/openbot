@@ -45,6 +45,13 @@ COPY display.sh /usr/local/bin/openbot-display
 COPY xfce/xfwm4.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
 COPY xfce/panel-default.xml /etc/xdg/xfce4/panel/default.xml
 COPY xfce/displays.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/displays.xml
+COPY xfce/xfce4-desktop.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml
+COPY xfce/xsettings.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml
+COPY xfce/xfce4-session.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml
+COPY xfce/launcher-1 /etc/xdg/xfce4/panel/launcher-1
+COPY xfce/launcher-2 /etc/xdg/xfce4/panel/launcher-2
+COPY xfce/launcher-3 /etc/xdg/xfce4/panel/launcher-3
+COPY xfce/xfdesktop.desktop /etc/xdg/autostart/xfdesktop.desktop
 COPY www/openbot.css /usr/share/kasmvnc/www/openbot.css
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh /etc/openbot/xstartup /usr/local/bin/openbot-display \
@@ -52,6 +59,9 @@ RUN chmod +x /entrypoint.sh /etc/openbot/xstartup /usr/local/bin/openbot-display
          /usr/share/kasmvnc/www/index.html \
          /usr/share/kasmvnc/www/vnc.html \
          /usr/share/kasmvnc/www/screen.html
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      adwaita-icon-theme gnome-themes-extra \
+    && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 6901 6902 6903 6904 6905 6906 6907 6908
 CMD ["/entrypoint.sh"]
