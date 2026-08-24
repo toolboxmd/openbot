@@ -1,5 +1,6 @@
-export const DEFAULT_SCREEN_UPSTREAM = "http://127.0.0.1:6901";
+export const DEFAULT_SCREEN_UPSTREAM = "http://127.0.0.1:16901";
 export const SCREEN_SERVICE = "screen";
+export const FORBIDDEN_SCREEN_PORT = 6901;
 
 export type SupervisedChild = {
   pid?: number;
@@ -8,22 +9,33 @@ export type SupervisedChild = {
 };
 
 export type SuperviseDeps = {
-  composeUp: (service: string) => Promise<void>;
+  composeUp: (service: string, env: NodeJS.ProcessEnv) => Promise<void>;
   spawnDaemon: (env: NodeJS.ProcessEnv) => SupervisedChild;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
   onSignal: (handler: (signal: NodeJS.Signals) => void) => () => void;
+  pickPorts?: () => Promise<number[]>;
   log?: (message: string) => void;
   minRestartDelayMs?: number;
   maxRestartDelayMs?: number;
   stableAfterMs?: number;
 };
 
-export function childEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return {
-    ...env,
-    SCREEN_UPSTREAM: env.SCREEN_UPSTREAM || DEFAULT_SCREEN_UPSTREAM,
-  };
+export function childEnv(env: NodeJS.ProcessEnv, ports?: number[]): NodeJS.ProcessEnv {
+  const next: NodeJS.ProcessEnv = { ...env };
+  if (ports && ports.length > 0) {
+    if (ports.includes(FORBIDDEN_SCREEN_PORT)) {
+      throw new Error("refusing to publish Screen on 6901");
+    }
+    next.SCREEN_PORTS = ports.join(",");
+    ports.forEach((port, i) => {
+      next[`SCREEN_PORT_${i + 1}`] = String(port);
+    });
+    next.SCREEN_UPSTREAM = env.SCREEN_UPSTREAM || `http://127.0.0.1:${ports[0]}`;
+  } else {
+    next.SCREEN_UPSTREAM = env.SCREEN_UPSTREAM || DEFAULT_SCREEN_UPSTREAM;
+  }
+  return next;
 }
 
 export async function superviseTalk(
@@ -35,9 +47,10 @@ export async function superviseTalk(
   const stableAfterMs = deps.stableAfterMs ?? 10_000;
   const log = deps.log ?? ((message) => console.error(message));
 
-  await deps.composeUp(SCREEN_SERVICE);
+  const ports = deps.pickPorts ? await deps.pickPorts() : undefined;
+  const daemonEnv = childEnv(env, ports);
+  await deps.composeUp(SCREEN_SERVICE, daemonEnv);
 
-  const daemonEnv = childEnv(env);
   let stopping = false;
   let current: SupervisedChild | undefined;
   let delay = minRestartDelayMs;

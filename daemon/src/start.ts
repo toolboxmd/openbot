@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { pickScreenPorts } from "./computer.ts";
 import { superviseTalk, type SupervisedChild } from "./supervise.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -11,12 +12,12 @@ if (!process.env.OPENBOT_PASSWORD) {
   process.exit(1);
 }
 
-function composeUp(service: string): Promise<void> {
+function composeUp(service: string, env: NodeJS.ProcessEnv): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn("docker", ["compose", "up", "--detach", "--build", service], {
       cwd: repoRoot,
       stdio: "inherit",
-      env: process.env,
+      env,
     });
     child.on("error", reject);
     child.on("close", (code, signal) => {
@@ -73,6 +74,10 @@ function onSignal(handler: (signal: NodeJS.Signals) => void): () => void {
   };
 }
 
+async function pickPorts(): Promise<number[]> {
+  return pickScreenPorts(8);
+}
+
 try {
   await superviseTalk({
     composeUp,
@@ -80,6 +85,7 @@ try {
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     now: () => Date.now(),
     onSignal,
+    pickPorts,
     log: (message) => console.error(message),
   });
 } catch (err) {
