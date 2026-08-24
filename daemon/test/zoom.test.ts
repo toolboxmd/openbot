@@ -175,6 +175,19 @@ describe("Zoom HTTP seam",
       assert.equal(info.viewOnly, false);
       assert.equal(info.zoom, true);
 
+      const listed = await fetch(`${box.url}/api/bots`, { headers: { cookie } });
+      assert.ok(listed.ok);
+      const listBody = (await listed.json()) as { bots: Array<{ id: string; write?: boolean; zoom?: boolean }> };
+      const adaRow = listBody.bots.find((bot) => bot.id === adaId);
+      assert.ok(adaRow);
+      assert.equal(adaRow.write, true, "GET /api/bots must not keep Takeover write:false while zoomed");
+      assert.equal(adaRow.zoom, true);
+
+      const adaGet = await fetch(`${box.url}/api/bots/${adaId}`, { headers: { cookie } });
+      const adaBody = (await adaGet.json()) as { write?: boolean; zoom?: boolean };
+      assert.equal(adaBody.write, true);
+      assert.equal(adaBody.zoom, true);
+
       kasmWrites = [];
       const close = await fetch(`${box.url}/api/computer/zoom`, {
         method: "POST",
@@ -254,5 +267,20 @@ describe("PWA has no Takeover button", () => {
     assert.doesNotMatch(messenger, /Takeover/);
     assert.doesNotMatch(computer, /Screen is down/);
     assert.doesNotMatch(computer, /Wake this Bot/);
+  });
+
+  test("preview Open control is a real hit target and expanded iframe is writable", async () => {
+    const computer = await readFile(join(repoRoot, "pwa/src/components/Computer.tsx"), "utf8");
+    const messenger = await readFile(join(repoRoot, "pwa/src/components/Messenger.tsx"), "utf8");
+    assert.match(messenger, /data-testid="open-computer"/);
+    assert.match(messenger, /data-testid="open-computer-preview"/);
+    assert.match(messenger, /data-testid=\{computerOpen \? "computer-expanded" : "computer-preview"\}/);
+    assert.match(messenger, /aria-label="Open Computer"/);
+    assert.match(
+      messenger,
+      /data-testid="open-computer-preview"[\s\S]*?className="absolute inset-0 z-30 flex cursor-pointer items-center justify-center bg-transparent"/,
+    );
+    assert.match(computer, /expanded \? "pointer-events-auto" : "pointer-events-none"/);
+    assert.match(computer, /setComputerZoom\(botId, expanded\)/);
   });
 });
