@@ -61,6 +61,13 @@ function pose(mode: FaceMode) {
   }
 }
 
+function trace(ctx: CanvasRenderingContext2D, outline: { x: number; y: number }[]) {
+  if (!outline.length) return;
+  ctx.moveTo(outline[0].x, outline[0].y);
+  for (let i = 1; i < outline.length; i++) ctx.lineTo(outline[i].x, outline[i].y);
+  ctx.closePath();
+}
+
 export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle", className }: Props) {
   const resolvedShape = shape ?? pickShape(name);
   const resolvedColor = color ?? pickColor(name);
@@ -218,14 +225,9 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
       const r = live.maxDim / 2;
 
       const light: Vec3 = norm({ x: -0.42, y: 0.62, z: 0.66 });
-      const grad = g.createRadialGradient(
-        radius + light.x * r * 0.35,
-        radius - light.y * r * 0.35,
-        r * 0.08,
-        radius,
-        radius,
-        r,
-      );
+      const gx = radius + light.x * live.width * 0.22;
+      const gy = radius - light.y * live.height * 0.22;
+      const grad = g.createRadialGradient(gx, gy, r * 0.08, radius, radius, r);
       const highlight = mix(base, [255, 255, 255], resolvedColor === "#141414" ? 0.28 : 0.22);
       const shade = mix(base, [0, 0, 0], 0.55);
       grad.addColorStop(0, highlight);
@@ -236,25 +238,20 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
       if (resolvedShape === "sphere") {
         g.arc(radius, radius, r, 0, Math.PI * 2);
       } else {
-        const outline = shapeOutline(resolvedShape, sim.yaw, live, size);
-        if (outline.length) {
-          g.moveTo(outline[0].x, outline[0].y);
-          for (let i = 1; i < outline.length; i++) g.lineTo(outline[i].x, outline[i].y);
-          g.closePath();
-        }
+        trace(g, shapeOutline(resolvedShape, sim.yaw, live, size));
       }
       g.fillStyle = grad;
       g.fill();
 
-      // rim so the volume reads as a body, not a flat disc
       g.strokeStyle = mix(base, [0, 0, 0], 0.35);
       g.lineWidth = Math.max(1, size * 0.02);
+      g.lineJoin = "round";
       g.globalAlpha = 0.35;
       g.stroke();
       g.globalAlpha = 1;
 
       const lid = clamp(sim.lid + blinkLid * (1 - sim.lid), 0, 1);
-      const eyeScale = p.eye * (size / 88);
+      const eyeScale = p.eye * Math.max(size / 88, 0.42);
       const left0 = deform(norm({ x: -0.32, y: 0.1, z: 0.94 }), resolvedShape);
       const right0 = deform(norm({ x: 0.32, y: 0.1, z: 0.94 }), resolvedShape);
       const left = rotX(rotY(left0, sim.yaw), sim.pitch);
@@ -312,7 +309,7 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
       aria-hidden
       data-face-name={name}
       data-face-shape={resolvedShape}
-      className={cn("block shrink-0", className)}
+      className={cn("block aspect-square shrink-0", className)}
       style={{ width: size, height: size }}
     />
   );
