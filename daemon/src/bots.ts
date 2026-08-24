@@ -10,14 +10,18 @@ import {
   type HarnessId,
   type HarnessInfo,
 } from "./harness.ts";
-import { AcpClient, isAuthError, spawnAcp, type AcpHandlers, type PermissionPrompt } from "./acp.ts";
+import { AcpClient, isAuthError, isCancelled, spawnAcp, type AcpHandlers, type AssistantDelta, type PermissionPrompt } from "./acp.ts";
 import type { SpawnSpec } from "./harness.ts";
 import { NoopComputerRuntime, type ComputerRuntime, type DisplayHandle } from "./computer.ts";
+
+export type MessageReceipt = "sent" | "delivered" | "read";
 
 export type PublicMessage = {
   id: string;
   role: "user" | "assistant";
   text: string;
+  createdAt: string;
+  receipt?: MessageReceipt;
 };
 
 export type PublicPermission = {
@@ -46,6 +50,7 @@ export type AcpSession = {
   initialize(): Promise<unknown>;
   newSession(cwd: string): Promise<unknown>;
   prompt(text: string): Promise<string>;
+  cancel(): void;
   respondPermission(rpcId: PermissionPrompt["rpcId"], optionId: string): void;
 };
 
@@ -62,6 +67,8 @@ type Bot = {
   needsYou: { reason: "login"; hint: string } | null;
   permission: (PermissionPrompt & PublicPermission) | null;
   messages: PublicMessage[];
+  openAssistantId: string | null;
+  turnSeq: number;
   client: AcpSession | null;
 };
 
@@ -163,6 +170,8 @@ export class BotStore {
       needsYou: null,
       permission: null,
       messages: [],
+      openAssistantId: null,
+      turnSeq: 0,
       client: null,
     };
     this.bots.set(id, bot);
@@ -236,11 +245,14 @@ export class BotStore {
           bot.permission = prompt;
           bot.eyesMode = "needs-you";
         },
-        onAssistant: (text) => {
-          const last = bot.messages[bot.messages.length - 1];
-          if (last && last.role === "assistant" && bot.write) {
-            last.text = text;
-          }
+        onAssistant: (text, delta) => {
+          this.applyAssistant(bot, text, delta);
+        },
+        onPromptWritten: () => {
+          this.setUserReceipt(bot, "delivered");
+        },
+        onPromptFlushed: () => {
+          this.setUserReceipt(bot, "read");
         },
       });
     } catch (err) {
@@ -284,23 +296,44 @@ export class BotStore {
     if (bot.zoom || this.zoomedId === id) {
       throw Object.assign(new Error("Computer is zoomed"), { status: 409 });
     }
-    if (bot.write) throw Object.assign(new Error("turn already in flight"), { status: 409 });
     if (bot.needsYou?.reason === "login" || !bot.client) {
       throw Object.assign(new Error(bot.needsYou?.hint ?? loginHint("codex")), { status: 409 });
     }
+    if (bot.write) {
+      try {
+        bot.client.cancel();
+      } catch {
+        /* local cancel still proceeds */
+      }
+    }
 
-    bot.messages.push({ id: crypto.randomUUID(), role: "user", text: trimmed });
-    bot.messages.push({ id: crypto.randomUUID(), role: "assistant", text: "" });
+    bot.turnSeq += 1;
+    const turnSeq = bot.turnSeq;
+    bot.messages.push({
+      id: crypto.randomUUID(),
+      role: "user",
+      text: trimmed,
+      createdAt: nowIso(),
+      receipt: "sent",
+    });
+    bot.openAssistantId = null;
     bot.write = true;
     bot.eyesMode = "write";
     bot.permission = null;
 
     const client = bot.client;
+    const turnAt = bot.messages.length;
     void (async () => {
       try {
-        const reply = await client.prompt(trimmed);
-        this.fillAssistant(bot, reply || ".");
+        const reply = await client.prompt(talkPrompt(trimmed));
+        if (turnSeq !== bot.turnSeq) return;
+        const assistants = bot.messages.slice(turnAt).filter((m) => m.role === "assistant" && m.text);
+        if (assistants.length === 0) {
+          this.pushAssistant(bot, reply || ".");
+        }
       } catch (err) {
+        if (turnSeq !== bot.turnSeq) return;
+        if (isCancelled(err)) return;
         if (isAuthError(err) || isLikelyLogin(err)) {
           bot.eyesMode = "needs-you";
           bot.needsYou = { reason: "login", hint: loginHint("codex") };
@@ -309,6 +342,8 @@ export class BotStore {
           this.fillAssistant(bot, err instanceof Error ? err.message : "Harness error");
         }
       } finally {
+        if (turnSeq !== bot.turnSeq) return;
+        bot.openAssistantId = null;
         bot.write = false;
         if (bot.eyesMode === "write") bot.eyesMode = bot.needsYou ? "needs-you" : "idle";
         bot.permission = null;
@@ -338,14 +373,42 @@ export class BotStore {
   }
 
   private pushAssistant(bot: Bot, text: string): void {
-    bot.messages.push({ id: crypto.randomUUID(), role: "assistant", text });
+    bot.openAssistantId = null;
+    bot.messages.push({ id: crypto.randomUUID(), role: "assistant", text: capTalkBubble(text), createdAt: nowIso() });
+  }
+
+  private applyAssistant(bot: Bot, text: string, delta?: AssistantDelta): void {
+    const capped = capTalkBubble(text);
+    const startNew = Boolean(delta?.start) || !bot.openAssistantId;
+    if (startNew) {
+      const id = crypto.randomUUID();
+      bot.messages.push({ id, role: "assistant", text: capped, createdAt: nowIso() });
+      bot.openAssistantId = id;
+    } else {
+      const msg = bot.messages.find((item) => item.id === bot.openAssistantId);
+      if (msg) msg.text = capped;
+    }
+    if (delta?.done) bot.openAssistantId = null;
+  }
+
+  private setUserReceipt(bot: Bot, next: MessageReceipt): void {
+    for (let i = bot.messages.length - 1; i >= 0; i--) {
+      const msg = bot.messages[i];
+      if (msg.role === "user") {
+        msg.receipt = advanceReceipt(msg.receipt, next);
+        return;
+      }
+    }
   }
 
   private fillAssistant(bot: Bot, text: string): void {
-    const last = bot.messages[bot.messages.length - 1];
-    if (last && last.role === "assistant") {
-      last.text = text;
-      return;
+    if (bot.openAssistantId) {
+      const msg = bot.messages.find((item) => item.id === bot.openAssistantId);
+      if (msg) {
+        msg.text = text;
+        bot.openAssistantId = null;
+        return;
+      }
     }
     this.pushAssistant(bot, text);
   }
@@ -370,6 +433,37 @@ export class BotStore {
 
 function isLikelyLogin(err: unknown): boolean {
   return isAuthError(err) || /login|auth|not signed/i.test(String((err as Error)?.message ?? err));
+}
+
+const TALK_VOICE =
+  "You are chatting in OpenBot. Reply like a person in iMessage. Send several short ACP agent messages (one or two sentences each). No markdown essays. No headings. No numbered dumps. No tool JSON or transcripts in chat. Code in a bubble is fine. Attach a screenshot only when it helps.";
+
+export function talkPrompt(userText: string): string {
+  return `${TALK_VOICE}\n\n${userText}`;
+}
+
+const TALK_BUBBLE_CAP = 700;
+const TALK_CODE_CAP = 2000;
+
+export function capTalkBubble(text: string): string {
+  const fenced = text.trimStart().startsWith("```");
+  const limit = fenced ? TALK_CODE_CAP : TALK_BUBBLE_CAP;
+  if (text.length <= limit) return text;
+  const slice = text.slice(0, limit);
+  const cut = slice.replace(/\s+\S*$/, "");
+  return `${cut.length >= Math.floor(limit * 0.6) ? cut : slice}…`;
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+const RECEIPT_ORDER: MessageReceipt[] = ["sent", "delivered", "read"];
+
+function advanceReceipt(current: MessageReceipt | undefined, next: MessageReceipt): MessageReceipt {
+  const have = RECEIPT_ORDER.indexOf(current ?? "sent");
+  const want = RECEIPT_ORDER.indexOf(next);
+  return want > have ? next : (current ?? "sent");
 }
 
 export function defaultWorkspaceDir(): string {

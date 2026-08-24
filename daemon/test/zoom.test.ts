@@ -240,6 +240,7 @@ describe("Zoom pauses ACP child (injected spawn, no fake production ACP)", () =>
         async prompt() {
           return "ok";
         },
+        cancel() {},
         respondPermission() {},
       }),
     });

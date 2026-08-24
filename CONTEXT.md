@@ -42,7 +42,7 @@ While a Bot is writing: Eyes animate in the thread (three-dot / moving). Hover o
 A transcript item that is not a text bubble: screenshot, file chip, widget, Computer needs-you / Done. Human-facing. Never a dump of tool JSON or ACP logs.
 
 ## Turn
-One user send. The Bot may reply with several short bubbles (each ACP message is one bubble). The PWA does not split a long string. Tone is a few sentences, like a person. Markdown essays and tool transcripts are capped out of chat. Screenshots and files attach when they help, not as a default dump.
+One user send. The Bot may reply with several short bubbles (each ACP message / messageId is one bubble). The PWA does not split a long string. Tone is a few sentences, like a person. Markdown essays and tool transcripts are capped out of chat. Screenshots and files attach when they help, not as a default dump.
 
 ## Eyes
 Code-drawn robot face (color + shape). States: idle, thinking, working, needs-you, asleep.

@@ -32,7 +32,13 @@ export type Bot = {
     options: Array<{ optionId: string; name: string; kind?: string }>;
   } | null;
   needsYou: { reason: "login"; hint: string } | null;
-  messages?: Array<{ id: string; role: "user" | "assistant"; text: string }>;
+  messages?: Array<{
+    id: string;
+    role: "user" | "assistant";
+    text: string;
+    createdAt?: string;
+    receipt?: "sent" | "delivered" | "read";
+  }>;
 };
 
 export type BotList = { bots: Bot[] };
