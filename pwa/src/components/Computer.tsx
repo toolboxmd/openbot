@@ -1,4 +1,4 @@
-import { getComputer, releaseTakeover, takeoverBot, type Computer } from "@/lib/session";
+import { getComputer, releaseTakeover, takeoverBot, viewComputer, type Computer } from "@/lib/session";
 import { Button } from "@/components/ui/button";
 import { useEffect, useState } from "react";
 
@@ -33,7 +33,8 @@ export function ComputerScreen({
       setComputer(null);
       return;
     }
-    void getComputer(botId)
+    const load = expanded ? viewComputer(botId) : getComputer(botId);
+    void load
       .then((data) => {
         if (!cancelled) setComputer(data);
       })
@@ -51,7 +52,7 @@ export function ComputerScreen({
       cancelled = true;
       window.clearInterval(tick);
     };
-  }, [botId]);
+  }, [botId, expanded]);
 
   const held = Boolean(computer?.takeover || computer?.write);
   const viewOnly = computer?.viewOnly !== false && !held;
@@ -126,11 +127,15 @@ export function ComputerScreen({
     return <p className="px-6 text-sm text-muted-foreground">Create a Bot to open a Screen.</p>;
   }
 
-  if (screen === "asleep" || computer?.screen === "asleep") {
-    return <p className="px-6 text-sm text-muted-foreground">Screen is asleep.</p>;
+  if (!expanded && (screen === "asleep" || computer?.screen === "asleep")) {
+    return <p className="px-6 text-sm text-muted-foreground">Screen is down.</p>;
   }
 
-  if (screen === "waking" || computer?.screen === "waking" || (computer && !computer.ready)) {
+  if (
+    screen === "waking" ||
+    computer?.screen === "waking" ||
+    (expanded && (screen === "asleep" || computer?.screen === "asleep" || (computer && !computer.ready)))
+  ) {
     return <p className="px-6 text-sm text-muted-foreground">Screen is waking…</p>;
   }
 

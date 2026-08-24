@@ -17,7 +17,7 @@ export type BoxOptions = {
   kasmPassword?: string;
   workspaceDir?: string;
   screens?: ScreenRuntime;
-} & Pick<BotStoreDeps, "spawnAcp" | "listHarnesses">;
+} & Pick<BotStoreDeps, "spawnAcp" | "listHarnesses" | "now" | "idleMs" | "setInterval" | "clearInterval">;
 
 export type RunningBox = {
   url: string;
@@ -379,6 +379,10 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
     screens,
     spawnAcp: options.spawnAcp,
     listHarnesses: options.listHarnesses,
+    now: options.now,
+    idleMs: options.idleMs,
+    setInterval: options.setInterval,
+    clearInterval: options.clearInterval,
   });
 
   function upstreamFor(botId: string | null): string | undefined {
@@ -703,15 +707,9 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         }
       }
 
-      if (url.pathname === "/api/computer" && method === "GET") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
-        const requested = url.searchParams.get("botId");
-        const botId = requested || store.activeId();
+      async function computerPayload(botId: string | null): Promise<Record<string, unknown>> {
         if (!botId) {
-          sendJson(res, 200, {
+          return {
             path: null,
             ready: false,
             botId: null,
@@ -719,26 +717,71 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
             write: false,
             viewOnly: true,
             takeover: false,
-          });
-          return;
+          };
         }
         const bot = store.get(botId);
-        if (requested && !bot) {
-          sendJson(res, 404, { error: "Bot not found" });
-          return;
-        }
         const upstream = upstreamFor(botId);
         const taken = store.isTakeover(botId);
-        sendJson(res, 200, {
+        return {
           path: `${SCREEN_PREFIX}/${botId}/`,
-          ready: Boolean(upstream) && (bot?.screen === "active") && (await screenIsReachable(upstream, auth)),
+          ready: Boolean(upstream) && bot?.screen === "active" && (await screenIsReachable(upstream, auth)),
           botId,
           screen: bot?.screen ?? "asleep",
           cookieJar: screens.cookieJar(),
           write: taken,
           viewOnly: !taken,
           takeover: taken,
-        });
+        };
+      }
+
+      if (url.pathname === "/api/computer" && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        let body: Record<string, unknown> = {};
+        try {
+          const raw = await readBody(req);
+          body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        const requested = typeof body.botId === "string" ? body.botId : "";
+        if (!requested) {
+          sendJson(res, 400, { error: "botId is required" });
+          return;
+        }
+        try {
+          await store.wake(requested);
+        } catch (err) {
+          sendStoreError(res, err);
+          return;
+        }
+        sendJson(res, 200, await computerPayload(requested));
+        return;
+      }
+
+      if (url.pathname === "/api/computer" && method === "GET") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        const requested = url.searchParams.get("botId");
+        const start = url.searchParams.get("start") === "1";
+        if (requested && start) {
+          try {
+            await store.wake(requested);
+          } catch (err) {
+            sendStoreError(res, err);
+            return;
+          }
+        } else if (requested && !store.get(requested)) {
+          sendJson(res, 404, { error: "Bot not found" });
+          return;
+        }
+        const botId = requested || store.activeId();
+        sendJson(res, 200, await computerPayload(botId));
         return;
       }
 
@@ -755,6 +798,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         const parsed = parseScreenPath(url.pathname);
         const botId = parsed?.botId ?? store.activeId();
         const rest = parsed?.rest ?? "/";
+        if (botId) store.touchComputer(botId);
         const destBase = upstreamFor(botId);
         if (!botId || !destBase) {
           sendJson(res, 503, { error: "Screen is not up" });
@@ -790,6 +834,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
     const parsed = parseScreenPath(url.pathname);
     const botId = parsed?.botId ?? store.activeId();
     const rest = parsed?.rest ?? "/";
+    if (botId) store.touchComputer(botId);
     const destBase = upstreamFor(botId);
     if (!botId || !destBase) {
       socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");

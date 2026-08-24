@@ -84,6 +84,21 @@ describe("two Bots, private Screens, Sleep", () => {
       port: 0,
       workspaceDir: workspace,
       screens,
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: () => ({
+        close() {},
+        async initialize() {
+          return {};
+        },
+        async newSession() {
+          return "s1";
+        },
+        async prompt(text: string) {
+          if (text.includes("hang")) return new Promise<string>(() => {});
+          return "ok";
+        },
+        respondPermission() {},
+      }),
     });
   });
 
@@ -132,40 +147,81 @@ describe("two Bots, private Screens, Sleep", () => {
     assert.equal(body.bots.length, 2);
   });
 
-  test("wake starts that Screen; computer path is per-bot; sleep stops it", async () => {
+  test("GET Computer without start does not start XFCE", async () => {
     const cookie = await login(box.url);
     const listed = await fetch(`${box.url}/api/bots`, { headers: { cookie } });
-    const { bots } = (await listed.json()) as {
-      bots: Array<{ id: string; name: string }>;
-    };
+    const { bots } = (await listed.json()) as { bots: Array<{ id: string; name: string }> };
+    const ada = bots.find((bot) => bot.name === "Ada");
+    assert.ok(ada);
+    const peek = await fetch(`${box.url}/api/computer?botId=${encodeURIComponent(ada.id)}`, {
+      headers: { cookie },
+    });
+    assert.ok(peek.ok);
+    const peeked = (await peek.json()) as { ready?: boolean; screen?: string };
+    assert.equal(peeked.ready, false);
+    assert.equal(peeked.screen, "asleep");
+    assert.equal(screens.running(ada.id), false);
+  });
+
+  test("send to two Bots with no Screen", async () => {
+    const cookie = await login(box.url);
+    const listed = await fetch(`${box.url}/api/bots`, { headers: { cookie } });
+    const { bots } = (await listed.json()) as { bots: Array<{ id: string; name: string }> };
+    const ada = bots.find((bot) => bot.name === "Ada");
+    const ben = bots.find((bot) => bot.name === "Ben");
+    assert.ok(ada && ben);
+    for (const bot of [ada, ben]) {
+      if (screens.running(bot.id)) {
+        await fetch(`${box.url}/api/bots/${bot.id}/sleep`, { method: "POST", headers: { cookie } });
+      }
+      const pick = await fetch(`${box.url}/api/bots/${bot.id}/harness`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ harness: "codex" }),
+      });
+      if (pick.status !== 200) {
+        assert.equal(pick.status, 200, `pickHarness failed: ${pick.status} ${await pick.text()}`);
+      }
+      const send = await fetch(`${box.url}/api/bots/${bot.id}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: `hello ${bot.name}` }),
+      });
+      if (send.status !== 200) {
+        assert.equal(send.status, 200, `send without Screen failed: ${send.status} ${await send.text()}`);
+      }
+      const sent = (await send.json()) as { screen: string };
+      assert.equal(sent.screen, "asleep");
+      assert.equal(screens.running(bot.id), false);
+    }
+  });
+
+  test("opening Computer starts that Screen; opening B leaves A Up", async () => {
+    const cookie = await login(box.url);
+    const listed = await fetch(`${box.url}/api/bots`, { headers: { cookie } });
+    const { bots } = (await listed.json()) as { bots: Array<{ id: string; name: string }> };
     const ada = bots.find((bot) => bot.name === "Ada");
     const ben = bots.find((bot) => bot.name === "Ben");
     assert.ok(ada && ben);
 
-    const wake = await fetch(`${box.url}/api/bots/${ada.id}/wake`, {
-      method: "POST",
-      headers: { cookie },
-    });
-    assert.ok(wake.ok, `wake failed: ${wake.status}`);
-    const woke = (await wake.json()) as { id: string; screen: string; eyes: { mode: string } };
-    assert.equal(woke.screen, "active");
-    assert.ok(screens.started.includes(ada.id));
-    assert.equal(screens.running(ada.id), true);
-
-    const computer = await fetch(`${box.url}/api/computer?botId=${encodeURIComponent(ada.id)}`, {
-      headers: { cookie },
-    });
-    assert.ok(computer.ok);
-    const info = (await computer.json()) as {
+    const openA = await fetch(
+      `${box.url}/api/computer?botId=${encodeURIComponent(ada.id)}&start=1`,
+      { headers: { cookie } },
+    );
+    assert.ok(openA.ok, `open Computer A failed: ${openA.status}`);
+    const aInfo = (await openA.json()) as {
+      screen?: string;
+      botId?: string;
       path?: string;
       ready?: boolean;
-      botId?: string;
       cookieJar?: string;
     };
-    assert.equal(info.botId, ada.id);
-    assert.equal(info.path, `/screen/${ada.id}/`);
-    assert.equal(info.ready, true);
-    assert.equal(info.cookieJar, cookiesDir);
+    assert.equal(aInfo.botId, ada.id);
+    assert.equal(aInfo.screen, "active");
+    assert.equal(aInfo.path, `/screen/${ada.id}/`);
+    assert.equal(aInfo.ready, true);
+    assert.equal(aInfo.cookieJar, cookiesDir);
+    assert.equal(screens.running(ada.id), true);
 
     lastPath = undefined;
     const screen = await fetch(`${box.url}/screen/${ada.id}/`, { headers: { cookie } });
@@ -173,64 +229,33 @@ describe("two Bots, private Screens, Sleep", () => {
     assert.match(await screen.text(), /desktop-stub/);
     assert.equal(lastPath, "/");
 
-    const other = await fetch(`${box.url}/api/computer?botId=${encodeURIComponent(ben.id)}`, {
+    const peekB = await fetch(`${box.url}/api/computer?botId=${encodeURIComponent(ben.id)}`, {
       headers: { cookie },
     });
-    const otherInfo = (await other.json()) as { path?: string; ready?: boolean; botId?: string };
-    assert.equal(otherInfo.botId, ben.id);
-    assert.equal(otherInfo.path, `/screen/${ben.id}/`);
-    assert.equal(otherInfo.ready, false);
+    const peekInfo = (await peekB.json()) as { ready?: boolean; screen?: string };
+    assert.equal(peekInfo.ready, false);
+    assert.equal(peekInfo.screen, "asleep");
 
-    const sleep = await fetch(`${box.url}/api/bots/${ada.id}/sleep`, {
-      method: "POST",
-      headers: { cookie },
-    });
-    assert.ok(sleep.ok, `sleep failed: ${sleep.status}`);
-    const slept = (await sleep.json()) as { screen: string; eyes: { mode: string } };
-    assert.equal(slept.screen, "asleep");
-    assert.equal(slept.eyes.mode, "sleep");
-    assert.ok(screens.stopped.includes(ada.id));
-    assert.equal(screens.running(ada.id), false);
-
-    const after = await fetch(`${box.url}/api/computer?botId=${encodeURIComponent(ada.id)}`, {
-      headers: { cookie },
-    });
-    const afterInfo = (await after.json()) as { ready?: boolean };
-    assert.equal(afterInfo.ready, false);
-    const gone = await fetch(`${box.url}/screen/${ada.id}/`, { headers: { cookie } });
-    assert.equal(gone.status, 503);
-  });
-
-  test("waking B sleeps A so only one Screen is Active", async () => {
-    const cookie = await login(box.url);
-    const listed = await fetch(`${box.url}/api/bots`, { headers: { cookie } });
-    const { bots } = (await listed.json()) as { bots: Array<{ id: string; name: string; screen: string }> };
-    const ada = bots.find((bot) => bot.name === "Ada");
-    const ben = bots.find((bot) => bot.name === "Ben");
-    assert.ok(ada && ben);
-
-    const wakeA = await fetch(`${box.url}/api/bots/${ada.id}/wake`, { method: "POST", headers: { cookie } });
-    assert.ok(wakeA.ok);
-    const wakeB = await fetch(`${box.url}/api/bots/${ben.id}/wake`, { method: "POST", headers: { cookie } });
-    assert.ok(wakeB.ok);
-    const b = (await wakeB.json()) as { screen: string };
-    assert.equal(b.screen, "active");
+    const openB = await fetch(
+      `${box.url}/api/computer?botId=${encodeURIComponent(ben.id)}&start=1`,
+      { headers: { cookie } },
+    );
+    assert.ok(openB.ok, `open Computer B failed: ${openB.status}`);
+    const bInfo = (await openB.json()) as { screen?: string; botId?: string };
+    assert.equal(bInfo.botId, ben.id);
+    assert.equal(bInfo.screen, "active");
+    assert.equal(screens.running(ben.id), true);
+    assert.equal(screens.running(ada.id), true, "opening B must not docker-stop A");
 
     const again = await fetch(`${box.url}/api/bots`, { headers: { cookie } });
-    const body = (await again.json()) as {
-      bots: Array<{ id: string; name: string; screen: string }>;
-    };
-    const adaNow = body.bots.find((bot) => bot.name === "Ada");
-    const benNow = body.bots.find((bot) => bot.name === "Ben");
-    assert.equal(adaNow?.screen, "asleep");
-    assert.equal(benNow?.screen, "active");
-    assert.equal(screens.running(ada.id), false);
-    assert.equal(screens.running(ben.id), true);
+    const body = (await again.json()) as { bots: Array<{ name: string; screen: string }> };
+    assert.equal(body.bots.find((bot) => bot.name === "Ada")?.screen, "active");
+    assert.equal(body.bots.find((bot) => bot.name === "Ben")?.screen, "active");
   });
 });
 
-describe("Sleep kills the ACP child (injected spawn, no Docker)", () => {
-  test("sleeping Bot has no ACP child", async () => {
+describe("Sleep stops only the Screen (injected spawn, no Docker)", () => {
+  test("sleeping Bot keeps the ACP child so chat stays instant", async () => {
     const dir = await tempDir("openbot-acp-");
     const screens = new MemoryScreenRuntime({ cookiesDir: join(dir, "cookies") });
     const closed: boolean[] = [];
@@ -258,16 +283,20 @@ describe("Sleep kills the ACP child (injected spawn, no Docker)", () => {
     });
     const bot = store.create("Ada");
     assert.equal(store.hasAcpChild(bot.id), false);
-    await store.wake(bot.id);
     await store.pickHarness(bot.id, "codex");
     assert.equal(store.hasAcpChild(bot.id), true);
+    assert.equal(store.get(bot.id)?.screen, "asleep");
+    const sent = await store.send(bot.id, "hello without a Screen");
+    assert.equal(sent.screen, "asleep");
+    await store.wake(bot.id);
     await store.sleep(bot.id);
-    assert.equal(store.hasAcpChild(bot.id), false);
-    assert.equal(closed.length >= 1, true);
+    assert.equal(store.hasAcpChild(bot.id), true);
+    assert.equal(closed.length, 0);
     const publicBot = store.get(bot.id);
     assert.equal(publicBot?.screen, "asleep");
     assert.equal(publicBot?.eyes.mode, "sleep");
     store.close();
+    assert.equal(closed.length >= 1, true);
   });
 
   test("Eyes go sleep then waking while Screen starts", async () => {
@@ -282,6 +311,54 @@ describe("Sleep kills the ACP child (injected spawn, no Docker)", () => {
     assert.equal(store.get(bot.id)?.eyes.mode, "waking");
     await waking;
     assert.equal(store.get(bot.id)?.screen, "active");
+    store.close();
+  });
+});
+
+describe("idle Screen Sleep (injected clock)", () => {
+  test("unused Computer past idleMs docker-stops that Screen and keeps ACP", async () => {
+    const dir = await tempDir("openbot-idle-");
+    const screens = new MemoryScreenRuntime({ cookiesDir: join(dir, "cookies") });
+    let now = 1_000;
+    const closed: boolean[] = [];
+    const store = new BotStore(dir, {
+      screens,
+      now: () => now,
+      idleMs: 50,
+      setInterval: (() => 0) as unknown as typeof setInterval,
+      clearInterval: () => {},
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: () => ({
+        close() {
+          closed.push(true);
+        },
+        async initialize() {
+          return {};
+        },
+        async newSession() {
+          return "s1";
+        },
+        async prompt() {
+          return "ok";
+        },
+        respondPermission() {},
+      }),
+    });
+    const ada = store.create("Ada");
+    const ben = store.create("Ben");
+    await store.pickHarness(ada.id, "codex");
+    await store.wake(ada.id);
+    await store.wake(ben.id);
+    assert.equal(screens.running(ada.id), true);
+    assert.equal(screens.running(ben.id), true);
+    now = 1_040;
+    store.touchComputer(ben.id);
+    now = 1_051;
+    await store.sleepIdleScreens();
+    assert.equal(screens.running(ada.id), false);
+    assert.equal(screens.running(ben.id), true);
+    assert.equal(store.hasAcpChild(ada.id), true);
+    assert.equal(closed.length, 0);
     store.close();
   });
 });

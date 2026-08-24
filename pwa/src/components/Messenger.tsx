@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { ArrowUp, Maximize2, Monitor, Moon, Plus, Sun } from "lucide-react";
+import { ArrowUp, Maximize2, Monitor, Plus } from "lucide-react";
 import { ComputerScreen } from "@/components/Computer";
 import { Eyes } from "@/components/Eyes";
 import { Button } from "@/components/ui/button";
@@ -18,8 +18,6 @@ import {
   listHarnesses,
   pickHarness,
   sendMessage,
-  sleepBot,
-  wakeBot,
   type Bot,
   type Harness,
 } from "@/lib/session";
@@ -152,40 +150,9 @@ export function Messenger() {
     }
   }
 
-  async function onSleep(id: string) {
-    setBusy(true);
-    setError(null);
-    try {
-      const bot = await sleepBot(id);
-      setBots((rows) => rows.map((row) => (row.id === bot.id ? { ...row, ...bot } : row)));
-      if (activeId === id) setActive(bot);
-      await refresh(activeId);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not Sleep.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function onWake(id: string) {
-    setBusy(true);
-    setError(null);
-    try {
-      const bot = await wakeBot(id);
-      setActiveId(id);
-      setActive(bot);
-      await refresh(id);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not Wake.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
   const messages = active?.messages ?? [];
   const writing = Boolean(active?.write);
   const sidebarMode = (bot: Bot): FaceMode => (bot.eyes.mode === "write" ? "idle" : (bot.eyes.mode as FaceMode));
-  const live = bots.find((bot) => bot.screen === "active" || bot.screen === "waking") ?? (active?.screen !== "asleep" ? active : null);
 
   return (
     <div data-testid="messenger" className="flex h-full min-h-0 bg-background">
@@ -236,45 +203,27 @@ export function Messenger() {
             <ul className="space-y-1">
               {bots.map((bot) => (
                 <li key={bot.id}>
-                  <div
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveId(bot.id);
+                      void getBot(bot.id).then(setActive);
+                    }}
                     className={cn(
-                      "flex w-full items-center gap-1 rounded-2xl pr-1 hover:bg-sidebar-accent",
+                      "flex w-full items-center gap-2 rounded-2xl px-3 py-2 text-left text-sm hover:bg-sidebar-accent",
                       activeId === bot.id && "bg-sidebar-accent",
+                      sidebarMode(bot) === "sleep" && "opacity-70",
                     )}
                   >
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setActiveId(bot.id);
-                        void getBot(bot.id).then(setActive);
-                      }}
-                      className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left text-sm"
-                    >
-                      <Eyes
-                        name={bot.name}
-                        color={bot.eyes.color}
-                        shape={bot.eyes.shape as FaceShape}
-                        mode={sidebarMode(bot)}
-                        size={28}
-                      />
-                      <span className="min-w-0 truncate">{bot.name}</span>
-                    </button>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          type="button"
-                          size="icon-sm"
-                          variant="ghost"
-                          disabled={busy}
-                          aria-label={bot.screen === "asleep" ? "Wake" : "Sleep"}
-                          onClick={() => void (bot.screen === "asleep" ? onWake(bot.id) : onSleep(bot.id))}
-                        >
-                          {bot.screen === "asleep" ? <Sun /> : <Moon />}
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent>{bot.screen === "asleep" ? "Wake" : "Sleep"}</TooltipContent>
-                    </Tooltip>
-                  </div>
+                    <Eyes
+                      name={bot.name}
+                      color={bot.eyes.color}
+                      shape={bot.eyes.shape as FaceShape}
+                      mode={sidebarMode(bot)}
+                      size={28}
+                    />
+                    <span className="min-w-0 truncate">{bot.name}</span>
+                  </button>
                 </li>
               ))}
             </ul>
@@ -435,8 +384,8 @@ export function Messenger() {
               )}
             >
               <ComputerScreen
-                botId={live?.id ?? activeId}
-                screen={live?.screen ?? active?.screen}
+                botId={activeId}
+                screen={active?.screen}
                 expanded={computerOpen}
                 onClose={() => setComputerOpen(false)}
               />

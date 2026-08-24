@@ -120,8 +120,10 @@ describe("Takeover HTTP seam", () => {
     });
     adaId = ((await ada.json()) as { id: string }).id;
     benId = ((await ben.json()) as { id: string }).id;
-    const woke = await fetch(`${box.url}/api/bots/${adaId}/wake`, { method: "POST", headers: { cookie } });
-    assert.ok(woke.ok, `wake failed: ${woke.status}`);
+    const wokeA = await fetch(`${box.url}/api/bots/${adaId}/wake`, { method: "POST", headers: { cookie } });
+    assert.ok(wokeA.ok, `wake Ada failed: ${wokeA.status}`);
+    const wokeB = await fetch(`${box.url}/api/bots/${benId}/wake`, { method: "POST", headers: { cookie } });
+    assert.ok(wokeB.ok, `wake Ben failed: ${wokeB.status}`);
   });
 
   after(async () => {

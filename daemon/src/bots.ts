@@ -78,10 +78,17 @@ type PersistedBot = {
   messages: PublicMessage[];
 };
 
+/** Unused Computer for this long → docker-stop that Screen. ACP child stays. */
+export const SCREEN_IDLE_MS = 20 * 60 * 1000;
+
 export type BotStoreDeps = {
   screens?: ScreenRuntime;
   spawnAcp?: (spec: SpawnSpec, cwd: string, handlers?: AcpHandlers) => AcpSession;
   listHarnesses?: () => HarnessInfo[];
+  now?: () => number;
+  idleMs?: number;
+  setInterval?: typeof setInterval;
+  clearInterval?: typeof clearInterval;
 };
 
 function publicPermission(p: PermissionPrompt | null): PublicPermission | null {
@@ -139,6 +146,12 @@ export class BotStore {
   private spawnAcpFn: (spec: SpawnSpec, cwd: string, handlers?: AcpHandlers) => AcpSession;
   private listHarnessesFn: () => HarnessInfo[];
   private takenOverId: string | null = null;
+  private now: () => number;
+  private idleMs: number;
+  private lastComputer = new Map<string, number>();
+  private waking = new Map<string, Promise<PublicBot>>();
+  private idleHandle: ReturnType<typeof setInterval> | null = null;
+  private clearIntervalFn: typeof clearInterval;
 
   constructor(workspaceDir: string, deps: BotStoreDeps = {}) {
     this.workspaceDir = workspaceDir;
@@ -146,14 +159,41 @@ export class BotStore {
     this.screens = deps.screens ?? new NoopScreenRuntime();
     this.spawnAcpFn = deps.spawnAcp ?? spawnAcp;
     this.listHarnessesFn = deps.listHarnesses ?? listHarnessesOnPath;
+    this.now = deps.now ?? Date.now;
+    this.idleMs = deps.idleMs ?? Number(process.env.OPENBOT_SCREEN_IDLE_MS || SCREEN_IDLE_MS);
+    this.clearIntervalFn = deps.clearInterval ?? clearInterval;
     fs.mkdirSync(this.workspaceDir, { recursive: true });
     this.load();
+    const tick = deps.setInterval ?? setInterval;
+    const period = Math.min(30_000, Math.max(25, Math.floor(this.idleMs / 4)));
+    this.idleHandle = tick(() => {
+      void this.sleepIdleScreens();
+    }, period);
   }
 
   close(): void {
+    if (this.idleHandle) {
+      this.clearIntervalFn(this.idleHandle);
+      this.idleHandle = null;
+    }
     for (const bot of this.bots.values()) {
       bot.client?.close();
       bot.client = null;
+    }
+  }
+
+  touchComputer(id: string): void {
+    this.lastComputer.set(id, this.now());
+  }
+
+  async sleepIdleScreens(): Promise<void> {
+    const now = this.now();
+    for (const bot of [...this.bots.values()]) {
+      if (bot.screen !== "active" && bot.screen !== "waking") continue;
+      if (bot.takeover || this.takenOverId === bot.id) continue;
+      const last = this.lastComputer.get(bot.id) ?? 0;
+      if (now - last < this.idleMs) continue;
+      await this.sleep(bot.id);
     }
   }
 
@@ -233,7 +273,7 @@ export class BotStore {
   takeover(id: string): PublicBot {
     const bot = this.require(id);
     if (bot.screen !== "active") {
-      throw Object.assign(new Error("Wake this Bot first"), { status: 409 });
+      throw Object.assign(new Error("Screen is not up"), { status: 409 });
     }
     if (this.takenOverId && this.takenOverId !== id) {
       throw Object.assign(new Error("One Takeover per Screen"), { status: 409 });
@@ -281,29 +321,35 @@ export class BotStore {
     if (bot.takeover || this.takenOverId === id) {
       this.release(id);
     }
-    this.killChild(bot);
-    bot.write = false;
     bot.takeover = false;
-    bot.permission = null;
     bot.screen = "asleep";
-    bot.eyesMode = "sleep";
+    bot.eyesMode = bot.write ? "write" : bot.needsYou || bot.permission ? "needs-you" : "sleep";
     await this.screens.sleep(id);
     this.persist();
     return this.toPublic(bot, true);
   }
 
   async wake(id: string): Promise<PublicBot> {
+    const inflight = this.waking.get(id);
+    if (inflight) return inflight;
+    const run = this.wakeNow(id).finally(() => this.waking.delete(id));
+    this.waking.set(id, run);
+    return run;
+  }
+
+  private async wakeNow(id: string): Promise<PublicBot> {
     const bot = this.require(id);
-    const others = [...this.bots.values()].filter((other) => other.id !== id && other.screen !== "asleep");
-    for (const other of others) {
-      await this.sleep(other.id);
+    if (bot.screen === "active" && this.screens.running(id)) {
+      this.touchComputer(id);
+      return this.toPublic(bot, true);
     }
     bot.screen = "waking";
     bot.eyesMode = "waking";
     this.persist();
     await this.screens.wake(id);
+    this.touchComputer(id);
     bot.screen = "active";
-    bot.eyesMode = bot.needsYou ? "needs-you" : "idle";
+    bot.eyesMode = bot.needsYou ? "needs-you" : bot.write ? "write" : "idle";
     if (bot.harness === "codex" && !bot.client) {
       await this.connectHarness(bot);
     }
@@ -329,9 +375,6 @@ export class BotStore {
     bot.needsYou = null;
     bot.eyesMode = bot.screen === "asleep" ? "sleep" : "idle";
     this.persist();
-    if (bot.screen === "asleep") {
-      return this.toPublic(bot, true);
-    }
     await this.connectHarness(bot);
     return this.toPublic(bot, true);
   }
@@ -344,13 +387,13 @@ export class BotStore {
     if (bot.harness !== "codex") {
       throw Object.assign(new Error("Talk spawn is Codex-only in this slice"), { status: 400 });
     }
-    if (bot.screen === "asleep") {
-      throw Object.assign(new Error("Wake this Bot first"), { status: 409 });
-    }
     if (bot.takeover || this.takenOverId === id) {
       throw Object.assign(new Error("Screen is in Takeover"), { status: 409 });
     }
     if (bot.write) throw Object.assign(new Error("turn already in flight"), { status: 409 });
+    if (!bot.client && bot.harness === "codex") {
+      await this.connectHarness(bot);
+    }
     if (bot.needsYou?.reason === "login" || !bot.client) {
       throw Object.assign(new Error(bot.needsYou?.hint ?? loginHint("codex")), { status: 409 });
     }

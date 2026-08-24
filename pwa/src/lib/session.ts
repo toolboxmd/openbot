@@ -128,8 +128,25 @@ export type Computer = {
   takeover?: boolean;
 };
 
-export async function getComputer(botId?: string | null): Promise<Computer> {
-  const qs = botId ? `?botId=${encodeURIComponent(botId)}` : "";
+export async function viewComputer(botId: string): Promise<Computer> {
+  const res = await fetch("/api/computer", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ botId }),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Could not open Computer.");
+  }
+  return (await res.json()) as Computer;
+}
+
+export async function getComputer(botId?: string | null, opts?: { start?: boolean }): Promise<Computer> {
+  const params = new URLSearchParams();
+  if (botId) params.set("botId", botId);
+  if (opts?.start) params.set("start", "1");
+  const qs = params.toString() ? `?${params.toString()}` : "";
   const res = await fetch(`/api/computer${qs}`, { credentials: "same-origin" });
   if (!res.ok) {
     throw new Error("session expired");
