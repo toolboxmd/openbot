@@ -3,6 +3,8 @@
 # Ctrl-C of Talk leaves this container up.
 services:
   screen:
+    # Google Chrome is amd64-only. Mac ARM runs this image via qemu/Rosetta.
+    platform: linux/amd64
     build: ./screen
     image: openbot-screen
     container_name: openbot-screen
