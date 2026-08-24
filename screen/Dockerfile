@@ -41,16 +41,17 @@ RUN arch="${TARGETARCH:-amd64}"; \
 
 COPY kasmvnc.yaml /etc/kasmvnc/kasmvnc.yaml
 COPY xstartup /etc/openbot/xstartup
+COPY display.sh /usr/local/bin/openbot-display
 COPY xfce/xfwm4.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
 COPY xfce/panel-default.xml /etc/xdg/xfce4/panel/default.xml
 COPY xfce/displays.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/displays.xml
 COPY www/openbot.css /usr/share/kasmvnc/www/openbot.css
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh /etc/openbot/xstartup \
+RUN chmod +x /entrypoint.sh /etc/openbot/xstartup /usr/local/bin/openbot-display \
     && sed -i 's|</head>|<link rel="stylesheet" href="openbot.css"></head>|' \
          /usr/share/kasmvnc/www/index.html \
          /usr/share/kasmvnc/www/vnc.html \
          /usr/share/kasmvnc/www/screen.html
 
-EXPOSE 6901
+EXPOSE 6901 6902 6903 6904 6905 6906 6907 6908
 CMD ["/entrypoint.sh"]

@@ -1,11 +1,25 @@
-# Screen only. Talk is the host start script (ADR 0005). Ctrl-C leaves Screen up.
+# One Computer. Extra Bots are extra Kasm displays inside this container.
+# Host ports come from start.ts (never 6901; the agent desktop often owns it).
+# Ctrl-C of Talk leaves this container up.
 services:
   screen:
     build: ./screen
+    image: openbot-screen
+    container_name: openbot-screen
     ports:
-      - "127.0.0.1:6901:6901"
+      - "127.0.0.1:${SCREEN_PORT_1:-16901}:6901"
+      - "127.0.0.1:${SCREEN_PORT_2:-16902}:6902"
+      - "127.0.0.1:${SCREEN_PORT_3:-16903}:6903"
+      - "127.0.0.1:${SCREEN_PORT_4:-16904}:6904"
+      - "127.0.0.1:${SCREEN_PORT_5:-16905}:6905"
+      - "127.0.0.1:${SCREEN_PORT_6:-16906}:6906"
+      - "127.0.0.1:${SCREEN_PORT_7:-16907}:6907"
+      - "127.0.0.1:${SCREEN_PORT_8:-16908}:6908"
     environment:
       VNC_USER: openbot
       VNC_PASSWORD: ${OPENBOT_PASSWORD:-openbot}
+    volumes:
+      - ${OPENBOT_WORKSPACE:-./workspace}:/workspace
+      - ${OPENBOT_COOKIES:-./computer/cookies}:/computer/cookies
     shm_size: "1gb"
     restart: unless-stopped
