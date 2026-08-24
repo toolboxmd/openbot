@@ -16,12 +16,19 @@ import { NoopComputerRuntime, type ComputerRuntime, type DisplayHandle } from ".
 
 export type MessageReceipt = "sent" | "delivered" | "read";
 
+export type MessageReaction = {
+  emoji: string;
+  by: "user";
+};
+
 export type PublicMessage = {
   id: string;
   role: "user" | "assistant";
   text: string;
   createdAt: string;
   receipt?: MessageReceipt;
+  replyTo?: string;
+  reactions?: MessageReaction[];
 };
 
 export type PublicPermission = {
@@ -86,6 +93,7 @@ function publicPermission(p: PermissionPrompt | null): PublicPermission | null {
 export class BotStore {
   private bots = new Map<string, Bot>();
   private workspaceDir: string;
+  private persistPath: string;
   private computer: ComputerRuntime;
   private spawnAcpFn: (spec: SpawnSpec, cwd: string, handlers?: AcpHandlers) => AcpSession;
   private listHarnessesFn: () => HarnessInfo[];
@@ -97,6 +105,8 @@ export class BotStore {
     this.spawnAcpFn = deps.spawnAcp ?? spawnAcp;
     this.listHarnessesFn = deps.listHarnesses ?? listHarnessesOnPath;
     fs.mkdirSync(this.workspaceDir, { recursive: true });
+    this.persistPath = path.join(this.workspaceDir, "bots.json");
+    this.load();
   }
 
   close(): void {
@@ -175,6 +185,7 @@ export class BotStore {
       client: null,
     };
     this.bots.set(id, bot);
+    this.persist();
     return this.toPublic(bot, true);
   }
 
@@ -285,7 +296,7 @@ export class BotStore {
     return this.toPublic(bot, true);
   }
 
-  async send(id: string, text: string): Promise<PublicBot> {
+  async send(id: string, text: string, replyTo?: string): Promise<PublicBot> {
     const bot = this.require(id);
     const trimmed = text.trim();
     if (!trimmed) throw Object.assign(new Error("text is required"), { status: 400 });
@@ -299,6 +310,7 @@ export class BotStore {
     if (bot.needsYou?.reason === "login" || !bot.client) {
       throw Object.assign(new Error(bot.needsYou?.hint ?? loginHint("codex")), { status: 409 });
     }
+    const replyTarget = this.resolveReplyTarget(bot, replyTo);
     if (bot.write) {
       try {
         bot.client.cancel();
@@ -309,13 +321,16 @@ export class BotStore {
 
     bot.turnSeq += 1;
     const turnSeq = bot.turnSeq;
-    bot.messages.push({
+    const userMessage: PublicMessage = {
       id: crypto.randomUUID(),
       role: "user",
       text: trimmed,
       createdAt: nowIso(),
       receipt: "sent",
-    });
+    };
+    if (replyTarget) userMessage.replyTo = replyTarget.id;
+    bot.messages.push(userMessage);
+    this.persist();
     bot.openAssistantId = null;
     bot.write = true;
     bot.eyesMode = "write";
@@ -325,7 +340,7 @@ export class BotStore {
     const turnAt = bot.messages.length;
     void (async () => {
       try {
-        const reply = await client.prompt(talkPrompt(trimmed));
+        const reply = await client.prompt(talkPrompt(trimmed, replyTarget?.text));
         if (turnSeq !== bot.turnSeq) return;
         const assistants = bot.messages.slice(turnAt).filter((m) => m.role === "assistant" && m.text);
         if (assistants.length === 0) {
@@ -353,6 +368,22 @@ export class BotStore {
     return this.toPublic(bot, true);
   }
 
+  toggleReaction(id: string, messageId: string, emoji: string): PublicBot {
+    const bot = this.require(id);
+    const trimmed = emoji.trim();
+    if (!trimmed) throw Object.assign(new Error("emoji is required"), { status: 400 });
+    const msg = bot.messages.find((item) => item.id === messageId);
+    if (!msg) throw Object.assign(new Error("message not found"), { status: 404 });
+    const reactions = [...(msg.reactions ?? [])];
+    const idx = reactions.findIndex((item) => item.emoji === trimmed && item.by === "user");
+    if (idx >= 0) reactions.splice(idx, 1);
+    else reactions.push({ emoji: trimmed, by: "user" });
+    if (reactions.length) msg.reactions = reactions;
+    else delete msg.reactions;
+    this.persist();
+    return this.toPublic(bot, true);
+  }
+
   answerPermission(id: string, optionId: string): PublicBot {
     const bot = this.require(id);
     if (!bot.permission || !bot.client) {
@@ -372,9 +403,19 @@ export class BotStore {
     return bot;
   }
 
+  private resolveReplyTarget(bot: Bot, replyTo: string | undefined): PublicMessage | null {
+    if (replyTo === undefined) return null;
+    const targetId = replyTo.trim();
+    if (!targetId) throw Object.assign(new Error("replyTo is required"), { status: 400 });
+    const target = bot.messages.find((item) => item.id === targetId);
+    if (!target) throw Object.assign(new Error("reply target not found"), { status: 400 });
+    return target;
+  }
+
   private pushAssistant(bot: Bot, text: string): void {
     bot.openAssistantId = null;
     bot.messages.push({ id: crypto.randomUUID(), role: "assistant", text: capTalkBubble(text), createdAt: nowIso() });
+    this.persist();
   }
 
   private applyAssistant(bot: Bot, text: string, delta?: AssistantDelta): void {
@@ -389,6 +430,7 @@ export class BotStore {
       if (msg) msg.text = capped;
     }
     if (delta?.done) bot.openAssistantId = null;
+    this.persist();
   }
 
   private setUserReceipt(bot: Bot, next: MessageReceipt): void {
@@ -396,6 +438,7 @@ export class BotStore {
       const msg = bot.messages[i];
       if (msg.role === "user") {
         msg.receipt = advanceReceipt(msg.receipt, next);
+        this.persist();
         return;
       }
     }
@@ -407,6 +450,7 @@ export class BotStore {
       if (msg) {
         msg.text = text;
         bot.openAssistantId = null;
+        this.persist();
         return;
       }
     }
@@ -429,6 +473,39 @@ export class BotStore {
     if (withMessages) out.messages = bot.messages;
     return out;
   }
+
+  private persist(): void {
+    const bots = [...this.bots.values()].map((bot) => ({
+      id: bot.id,
+      name: bot.name,
+      color: bot.color,
+      shape: bot.shape,
+      harness: bot.harness,
+      messages: bot.messages,
+    }));
+    try {
+      fs.writeFileSync(this.persistPath, `${JSON.stringify({ bots }, null, 2)}\n`);
+    } catch {
+      /* persist is best-effort; Talk still holds the Bot in RAM */
+    }
+  }
+
+  private load(): void {
+    if (!fs.existsSync(this.persistPath)) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(fs.readFileSync(this.persistPath, "utf8"));
+    } catch {
+      return;
+    }
+    if (!parsed || typeof parsed !== "object" || !("bots" in parsed)) return;
+    const rows = (parsed as { bots?: unknown }).bots;
+    if (!Array.isArray(rows)) return;
+    for (const row of rows) {
+      const bot = reviveBot(row);
+      if (bot) this.bots.set(bot.id, bot);
+    }
+  }
 }
 
 function isLikelyLogin(err: unknown): boolean {
@@ -438,8 +515,9 @@ function isLikelyLogin(err: unknown): boolean {
 const TALK_VOICE =
   "You are chatting in OpenBot. Reply like a person in iMessage. Send several short ACP agent messages (one or two sentences each). No markdown essays. No headings. No numbered dumps. No tool JSON or transcripts in chat. Code in a bubble is fine. Attach a screenshot only when it helps.";
 
-export function talkPrompt(userText: string): string {
-  return `${TALK_VOICE}\n\n${userText}`;
+export function talkPrompt(userText: string, replyToText?: string): string {
+  const body = replyToText ? `Replying to: ${replyToText}\n\n${userText}` : userText;
+  return `${TALK_VOICE}\n\n${body}`;
 }
 
 const TALK_BUBBLE_CAP = 700;
@@ -464,6 +542,60 @@ function advanceReceipt(current: MessageReceipt | undefined, next: MessageReceip
   const have = RECEIPT_ORDER.indexOf(current ?? "sent");
   const want = RECEIPT_ORDER.indexOf(next);
   return want > have ? next : (current ?? "sent");
+}
+
+function reviveBot(row: unknown): Bot | null {
+  if (!row || typeof row !== "object") return null;
+  const rec = row as Record<string, unknown>;
+  if (typeof rec.id !== "string" || typeof rec.name !== "string") return null;
+  const messages = Array.isArray(rec.messages)
+    ? rec.messages.map(reviveMessage).filter((item): item is PublicMessage => item != null)
+    : [];
+  return {
+    id: rec.id,
+    name: rec.name,
+    color: typeof rec.color === "string" ? rec.color : pickColor(rec.name),
+    shape: typeof rec.shape === "string" ? (rec.shape as FaceShape) : pickShape(rec.name, []),
+    harness: typeof rec.harness === "string" && isHarnessId(rec.harness) ? rec.harness : null,
+    write: false,
+    zoom: false,
+    display: null,
+    eyesMode: "idle",
+    needsYou: null,
+    permission: null,
+    messages,
+    openAssistantId: null,
+    turnSeq: 0,
+    client: null,
+  };
+}
+
+function reviveMessage(row: unknown): PublicMessage | null {
+  if (!row || typeof row !== "object") return null;
+  const rec = row as Record<string, unknown>;
+  if (typeof rec.id !== "string") return null;
+  if (rec.role !== "user" && rec.role !== "assistant") return null;
+  if (typeof rec.text !== "string") return null;
+  const msg: PublicMessage = {
+    id: rec.id,
+    role: rec.role,
+    text: rec.text,
+    createdAt: typeof rec.createdAt === "string" ? rec.createdAt : new Date().toISOString(),
+  };
+  if (rec.receipt === "sent" || rec.receipt === "delivered" || rec.receipt === "read") msg.receipt = rec.receipt;
+  if (typeof rec.replyTo === "string" && rec.replyTo) msg.replyTo = rec.replyTo;
+  if (Array.isArray(rec.reactions)) {
+    const reactions = rec.reactions.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const emoji = (item as { emoji?: unknown }).emoji;
+      const by = (item as { by?: unknown }).by;
+      if (typeof emoji !== "string" || !emoji.trim()) return [];
+      if (by !== "user") return [];
+      return [{ emoji, by: "user" as const }];
+    });
+    if (reactions.length) msg.reactions = reactions;
+  }
+  return msg;
 }
 
 export function defaultWorkspaceDir(): string {
