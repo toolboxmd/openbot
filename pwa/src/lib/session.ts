@@ -1,3 +1,5 @@
+import type { Channel } from "./channels";
+
 export async function readSession(): Promise<boolean> {
   const res = await fetch("/api/session", { credentials: "same-origin" });
   return res.ok;
@@ -44,6 +46,38 @@ export type Bot = {
 };
 
 export type BotList = { bots: Bot[] };
+
+export type { Channel, ChannelKind, ChannelMember } from "./channels";
+
+export async function listChannels(): Promise<{ channels: Channel[] }> {
+  const res = await fetch("/api/channels", { credentials: "same-origin" });
+  if (!res.ok) {
+    throw new Error("session expired");
+  }
+  return (await res.json()) as { channels: Channel[] };
+}
+
+export async function createGroupChannel(input: { title?: string; botIds: string[] }): Promise<Channel> {
+  const res = await fetch("/api/channels", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ kind: "group", title: input.title, botIds: input.botIds }),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Could not create group Channel.");
+  }
+  return (await res.json()) as Channel;
+}
+
+export async function getChannel(id: string): Promise<Channel> {
+  const res = await fetch(`/api/channels/${encodeURIComponent(id)}`, { credentials: "same-origin" });
+  if (!res.ok) {
+    throw new Error("Channel not found");
+  }
+  return (await res.json()) as Channel;
+}
 
 export async function listBots(): Promise<BotList> {
   const res = await fetch("/api/bots", { credentials: "same-origin" });
