@@ -70,6 +70,7 @@ export class HomeStore {
   readonly homeDir: string;
   readonly databasePath: string;
   private readonly db: DatabaseSync;
+  private closed = false;
 
   constructor(homeDir = defaultHomeDir()) {
     this.homeDir = path.resolve(homeDir);
@@ -85,6 +86,8 @@ export class HomeStore {
   }
 
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.db.close();
   }
 
@@ -152,6 +155,7 @@ export class HomeStore {
   }
 
   appendMessage(channelId: string, message: NewMessage): void {
+    if (this.closed) return;
     this.transaction(() => {
       this.db
         .prepare(
@@ -181,11 +185,13 @@ export class HomeStore {
   }
 
   updateMessageText(messageId: string, text: string): void {
+    if (this.closed) return;
     const changed = this.db.prepare("UPDATE messages SET text = ? WHERE id = ?").run(text, messageId);
     if (changed.changes !== 1) throw new Error("message not found");
   }
 
   setReceipt(messageId: string, recipientBotId: string, receipt: MessageReceipt, updatedAt: string): void {
+    if (this.closed) return;
     this.db
       .prepare(
         `INSERT INTO deliveries (message_id, recipient_kind, recipient_id, state, updated_at)

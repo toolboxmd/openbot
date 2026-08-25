@@ -179,12 +179,12 @@ describe("Zoom HTTP seam",
       const listBody = (await listed.json()) as { bots: Array<{ id: string; write?: boolean; zoom?: boolean }> };
       const adaRow = listBody.bots.find((bot) => bot.id === adaId);
       assert.ok(adaRow);
-      assert.equal(adaRow.write, true, "GET /api/bots must not keep Takeover write:false while zoomed");
+      assert.equal(adaRow.write, false, "GET /api/bots write is Working, not Screen zoom");
       assert.equal(adaRow.zoom, true);
 
       const adaGet = await fetch(`${box.url}/api/bots/${adaId}`, { headers: { cookie } });
       const adaBody = (await adaGet.json()) as { write?: boolean; zoom?: boolean };
-      assert.equal(adaBody.write, true);
+      assert.equal(adaBody.write, false);
       assert.equal(adaBody.zoom, true);
 
       kasmWrites = [];

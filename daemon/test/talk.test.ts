@@ -7,7 +7,7 @@ test("talkPrompt prefixes Talk voice and keeps the user line", () => {
   const prompt = talkPrompt("hey");
   assert.match(prompt, /You are chatting in OpenBot/);
   assert.match(prompt, /several short ACP agent messages/);
-  assert.ok(prompt.endsWith("\n\nhey"));
+  assert.match(prompt, /New message from You:\nhey$/);
   assert.equal(prompt.includes("hey") && !prompt.startsWith("hey"), true);
 });
 

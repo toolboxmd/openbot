@@ -78,6 +78,20 @@ async function pollAssistant(
   );
 }
 
+
+async function pollIdle(url: string, cookie: string, botId: string, timeoutMs = POLL_MS): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const res = await fetch(`${url}/api/bots/${botId}`, { headers: { cookie } });
+    const body = await res.text();
+    if (!res.ok) throw new Error(`GET bot failed: ${res.status} ${body}`);
+    const bot = JSON.parse(body) as { write?: boolean };
+    if (bot.write === false) return;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error("timed out waiting for the Turn to go idle");
+}
+
 async function openBox(homeDir: string): Promise<RunningBox> {
   return startBox({
     password: PASSWORD,
@@ -168,6 +182,7 @@ describeLive("Live Codex Talk HTTP", () => {
         const first = await pollAssistant(box.url, cookie, ada.id, 1);
         assert.ok(first.some((message) => message.role === "user" && message.text === phrase));
         assert.ok(first.some((message) => message.role === "assistant" && message.text));
+        await pollIdle(box.url, cookie, ada.id);
 
         await box.close();
         box = await openBox(homeDir);
@@ -197,6 +212,7 @@ describeLive("Live Codex Talk HTTP", () => {
         assert.ok(
           after.filter((message) => message.role === "assistant" && message.text).length >= assistantCount + 1,
         );
+        await pollIdle(box.url, cookie2, ada.id);
       } finally {
         await box.close();
       }
