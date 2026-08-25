@@ -180,6 +180,36 @@ function plantPoison(): { path: string; restore: () => void } {
   };
 }
 
+function plantCanarySkill(name: string): { restore: () => void } {
+  const dir = join(homedir(), ".agents", "skills", name);
+  const file = join(dir, "SKILL.md");
+  const dirExisted = existsSync(dir);
+  const previous = existsSync(file) ? readFileSync(file, "utf8") : null;
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    file,
+    `---
+name: ${name}
+description: OpenBot Isolated HOME canary. Use when listing skills or when asked about HH58-CANARY. If you can use this skill, include ${name} in your reply.
+---
+
+# ${name}
+
+This is a host USER skill. If you loaded it, include the token ${name}.
+`,
+  );
+  return {
+    restore() {
+      if (previous === null) {
+        if (existsSync(file)) rmSync(file);
+        if (!dirExisted && existsSync(dir)) rmSync(dir, { recursive: true });
+      } else {
+        writeFileSync(file, previous);
+      }
+    },
+  };
+}
+
 describe("Live Codex Isolated Harness Home", () => {
   test(
     "Isolated cwd, markers, All Bots, Host switch, auth symlink",
@@ -274,6 +304,52 @@ describe("Live Codex Isolated Harness Home", () => {
         assert.match(hostCombined, new RegExp(poison));
       } finally {
         poisonFile.restore();
+        await box.close();
+      }
+    },
+  );
+
+  test(
+    "Isolated HOME does not load host $HOME/.agents canary skill; Host does",
+    { timeout: 900_000 },
+    async () => {
+      const token = `HH58C-${Date.now()}`;
+      const canary = `HH58-CANARY-${token}`;
+      const homeDir = await liveHomeDir();
+      const canarySkill = plantCanarySkill(canary);
+      const box = await openBox(homeDir);
+      try {
+        const cookie = await login(box.url);
+        const adaId = await createBot(box.url, cookie, "Ada");
+        const skillAsk =
+          "List the names of skills you can use. If you have a skill whose name starts with HH58-CANARY, reply with that full skill name. If you do not, reply with the exact words NO-HOST-CANARY. Do not invent a skill name.";
+        await postText(box.url, cookie, adaId, skillAsk);
+        const isolatedIdle = await pollIdle(box.url, cookie, adaId);
+        assert.equal(isolatedIdle.needsYou, null, "Isolated Session must reuse host login");
+        const isolatedCombined = assistantText(isolatedIdle.messages ?? []);
+        assert.doesNotMatch(
+          isolatedCombined,
+          new RegExp(canary),
+          `Isolated must not load host $HOME/.agents canary; reply=${isolatedCombined}`,
+        );
+
+        const switched = await fetch(`${box.url}/api/bots/${adaId}`, {
+          method: "PATCH",
+          headers: { cookie, "content-type": "application/json" },
+          body: JSON.stringify({ configMode: "host" }),
+        });
+        assert.ok(switched.ok, await switched.text());
+        const isolatedCount = (isolatedIdle.messages ?? []).filter((m) => m.role === "assistant" && m.text).length;
+        await postText(box.url, cookie, adaId, skillAsk);
+        const hostIdle = await pollIdle(box.url, cookie, adaId);
+        const hostCombined = assistantText(hostIdle.messages ?? [], isolatedCount);
+        assert.match(
+          hostCombined,
+          new RegExp(canary),
+          `Host must load the host $HOME/.agents canary (test invalid if Host cannot see it); reply=${hostCombined}`,
+        );
+      } finally {
+        canarySkill.restore();
         await box.close();
       }
     },
