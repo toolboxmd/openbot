@@ -73,12 +73,14 @@ export class HomeStore {
 
   constructor(homeDir = defaultHomeDir()) {
     this.homeDir = path.resolve(homeDir);
+    this.databasePath = path.join(this.homeDir, "talk.sqlite");
+    if (fs.existsSync(this.databasePath)) assertSupportedSchema(this.databasePath);
     fs.mkdirSync(this.homeDir, { recursive: true, mode: 0o700 });
     fs.chmodSync(this.homeDir, 0o700);
-    this.databasePath = path.join(this.homeDir, "talk.sqlite");
+    if (!fs.existsSync(this.databasePath)) fs.closeSync(fs.openSync(this.databasePath, "wx", 0o600));
     this.db = new DatabaseSync(this.databasePath, { enableForeignKeyConstraints: true });
-    fs.chmodSync(this.databasePath, 0o600);
     this.migrate();
+    fs.chmodSync(this.databasePath, 0o600);
     this.db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
   }
 
@@ -218,17 +220,10 @@ export class HomeStore {
   }
 
   private migrate(): void {
-    const versionRow = this.db.prepare("PRAGMA user_version").get() as { user_version?: unknown } | undefined;
-    const version = Number(versionRow?.user_version ?? 0);
-    if (!Number.isInteger(version) || version < 0) {
-      this.db.close();
-      throw new Error("talk.sqlite has an invalid schema version");
-    }
+    const version = readSchemaVersion(this.db);
     if (version > HOME_SCHEMA_VERSION) {
       this.db.close();
-      throw new Error(
-        `talk.sqlite schema ${version} is newer than this Talk (supports ${HOME_SCHEMA_VERSION}); refusing to write`,
-      );
+      throw newerSchemaError(version);
     }
     if (version === HOME_SCHEMA_VERSION) return;
 
@@ -419,4 +414,29 @@ function isChannelKind(value: unknown): value is ChannelKind {
 
 function isReceipt(value: unknown): value is MessageReceipt {
   return value === "sent" || value === "delivered" || value === "read";
+}
+
+function assertSupportedSchema(databasePath: string): void {
+  const probe = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const version = readSchemaVersion(probe);
+    if (version > HOME_SCHEMA_VERSION) throw newerSchemaError(version);
+  } finally {
+    probe.close();
+  }
+}
+
+function readSchemaVersion(database: DatabaseSync): number {
+  const row = database.prepare("PRAGMA user_version").get() as { user_version?: unknown } | undefined;
+  const version = Number(row?.user_version ?? 0);
+  if (!Number.isInteger(version) || version < 0) {
+    throw new Error("talk.sqlite has an invalid schema version");
+  }
+  return version;
+}
+
+function newerSchemaError(version: number): Error {
+  return new Error(
+    `talk.sqlite schema ${version} is newer than this Talk (supports ${HOME_SCHEMA_VERSION}); refusing to write`,
+  );
 }

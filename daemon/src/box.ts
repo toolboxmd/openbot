@@ -391,9 +391,11 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
   const auth = kasmAuthorization(options);
   const computer: ComputerRuntime =
     options.computer ?? new NoopComputerRuntime(undefined, options.screenUpstream);
-  const homeDir =
-    options.homeDir ?? (options.workspaceDir ? `${path.resolve(options.workspaceDir)}-home` : defaultHomeDir());
-  const workspaceDir = options.workspaceDir ?? defaultWorkspaceDir(homeDir);
+  const homeDir = path.resolve(options.homeDir ?? defaultHomeDir());
+  const workspaceDir = defaultWorkspaceDir(homeDir);
+  if (options.workspaceDir && path.resolve(options.workspaceDir) !== workspaceDir) {
+    throw new Error("workspaceDir must be $OPENBOT_HOME/workspace");
+  }
   const store = new BotStore(homeDir, {
     computer,
     spawnAcp: options.spawnAcp,

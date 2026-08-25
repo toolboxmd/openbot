@@ -6,19 +6,19 @@ Glossary only. No implementation.
 Self-hosted Grok Bot. Named Bots on one Computer. MIT. Repo `toolboxmd/openbot`.
 
 ## Home
-Private OpenBot state at `$OPENBOT_HOME`, default `~/.openbot`. Contains `talk.sqlite`, attachments, Bot prompts, and the Computer workspace. A wipe of Home is the wipe. Talk gives Screen and Harnesses the workspace, not Home itself.
+The private OpenBot state tree. It contains durable Talk state and the shared Workspace. A wipe of Home is the wipe. Bots do not receive Home itself.
 
 ## Workspace
-Shared files at `$OPENBOT_HOME/workspace`. ACP cwd and the Screen `/workspace` mount are this same folder. Every Bot can see it. Home itself is not the workspace and is not exposed to Bots.
+Files shared by every Bot on one Computer. Workspace is inside Home but is distinct from Talk's private state.
 
 ## Channel
 A persistent conversation with members. A direct Channel is you plus one Bot and is born with that Bot. Group and Bot-to-Bot are other Channel kinds. The Channel owns its Transcript. The Bot owns its Harness.
 
 ## Transcript
-The human-facing messages, Cards, receipts, replies, reactions, and attachments in a Channel. Stored by Talk in `talk.sqlite`. Harness JSONL is not the Transcript.
+The human-facing messages, Cards, receipts, replies, reactions, and attachments in a Channel. Harness logs are not the Transcript.
 
 ## Session
-One live Harness conversation for one Bot in one Channel. A Bot may run several Sessions at once. A new Session receives recent Channel history from Talk when it cannot load prior Harness state.
+One live Harness conversation for one Bot in one Channel. A Bot may run several Sessions at once.
 
 ## Computer
 One Linux desktop per instance (one Docker Screen container). Shared workspace and browser cookie jar. Not a security boundary per Bot. Harness CLI logins live on the host OS, not inside Screen. The Computer pane is always a live desktop. It is never a down / "Screen is down" gate.

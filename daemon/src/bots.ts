@@ -605,6 +605,8 @@ const HISTORY_TURN_LIMIT = 20;
 const HISTORY_CHARACTER_LIMIT = 64_000;
 
 export function channelHistory(messages: PublicMessage[], botName: string): string {
+  const heading = "Recent Channel transcript:\n";
+  const transcriptLimit = HISTORY_CHARACTER_LIMIT - heading.length;
   const userIndexes = messages.flatMap((message, index) => (message.role === "user" ? [index] : []));
   if (userIndexes.length === 0) return "";
   const firstTurn = userIndexes[Math.max(0, userIndexes.length - HISTORY_TURN_LIMIT)] ?? 0;
@@ -613,11 +615,11 @@ export function channelHistory(messages: PublicMessage[], botName: string): stri
     return `${speaker}: ${message.text}`;
   });
   let transcript = lines.join("\n");
-  if (transcript.length > HISTORY_CHARACTER_LIMIT) {
+  if (transcript.length > transcriptLimit) {
     const marker = "[Earlier transcript clipped]\n";
-    transcript = `${marker}${transcript.slice(-(HISTORY_CHARACTER_LIMIT - marker.length))}`;
+    transcript = `${marker}${transcript.slice(-(transcriptLimit - marker.length))}`;
   }
-  return `Recent Channel transcript:\n${transcript}`;
+  return `${heading}${transcript}`;
 }
 
 export function talkPrompt(userText: string, replyToText?: string, history = ""): string {
