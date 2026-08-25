@@ -139,6 +139,27 @@ describe("Isolated Harness Home layout", () => {
     assert.equal(host.KIMI_CODE_HOME, undefined);
   });
 
+  test("Isolated applyVendorHomeEnv with botHome sets HOME; Host leaves HOME", () => {
+    const homeDir = "/tmp/openbot-home-x";
+    const botHome = "/tmp/openbot-ws/bots/ada";
+    const isolated = applyVendorHomeEnv(
+      { HOME: "/Users/mac", PATH: "/bin" },
+      "isolated",
+      homeDir,
+      botHome,
+    );
+    assert.equal(isolated.HOME, botHome);
+    assert.equal(isolated.CODEX_HOME, join(homeDir, "harness", "codex"));
+    const host = applyVendorHomeEnv(
+      { HOME: "/Users/mac", CODEX_HOME: "/old" },
+      "host",
+      homeDir,
+      botHome,
+    );
+    assert.equal(host.HOME, "/Users/mac");
+    assert.equal(host.CODEX_HOME, undefined);
+  });
+
   test("workspace jail and permission path extraction", () => {
     const workspace = "/tmp/openbot-ws";
     assert.equal(isInsideWorkspace("/tmp/openbot-ws/bots/ada/file.txt", workspace), true);
@@ -319,6 +340,7 @@ describe("BotStore Isolated cwd and env", () => {
     assert.equal(fake.spawned[0]?.cwd, botDir);
     assert.deepEqual(fake.spawned[0]?.sessionCwd, [botDir]);
     assert.equal(fake.spawned[0]?.spec.env.CODEX_HOME, join(homeDir, "harness", "codex"));
+    assert.equal(fake.spawned[0]?.spec.env.HOME, botDir);
     assert.equal(existsSync(join(botDir, "AGENTS.md")), true);
     assert.equal(lstatSync(join(botDir, "CLAUDE.md")).isSymbolicLink(), true);
     store.close();
@@ -337,6 +359,7 @@ describe("BotStore Isolated cwd and env", () => {
     await store.send(ada.id, "hi");
     await waitUntil(() => fake.spawned.length > 0);
     assert.equal(fake.spawned[0]?.spec.env.CODEX_HOME, undefined);
+    assert.equal(fake.spawned[0]?.spec.env.HOME, process.env.HOME);
     store.close();
   });
 
