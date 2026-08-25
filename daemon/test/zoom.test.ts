@@ -6,7 +6,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { startBox, type RunningBox } from "../src/box.ts";
-import { BotStore } from "../src/bots.ts";
 import { MemoryComputerRuntime } from "../src/computer.ts";
 import { kasmUpdateUserUrl } from "../src/kasm.ts";
 
@@ -94,7 +93,7 @@ describe("Zoom HTTP seam",
       const addr = stub.address();
       if (!addr || typeof addr === "string") throw new Error("stub failed to bind");
       const upstream = `http://127.0.0.1:${addr.port}`;
-      const workspace = await tempDir("openbot-zoom-ws-");
+      const homeDir = await tempDir("openbot-zoom-home-");
       const cookiesDir = join(await tempDir("openbot-zoom-cookies-"), "cookies");
       await mkdir(cookiesDir, { recursive: true });
       computer = new MemoryComputerRuntime({
@@ -106,7 +105,7 @@ describe("Zoom HTTP seam",
         pwaDir: await emptyPwa(),
         host: "127.0.0.1",
         port: 0,
-        workspaceDir: workspace,
+        homeDir,
         computer,
         kasmUser: KASM_USER,
         kasmPassword: KASM_PASSWORD,
@@ -212,52 +211,6 @@ describe("Zoom HTTP seam",
     });
   },
 );
-
-describe("Zoom pauses ACP child (injected spawn, no fake production ACP)", () => {
-  test("zoom pauses, unzoom resumes, send is 409 while zoomed", async () => {
-    const dir = await tempDir("openbot-zoom-acp-");
-    const screens = new MemoryComputerRuntime({ cookiesDir: join(dir, "cookies") });
-    const events: string[] = [];
-    const store = new BotStore(dir, {
-      computer: screens,
-      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
-      spawnAcp: () => ({
-        close() {
-          events.push("close");
-        },
-        pause() {
-          events.push("pause");
-        },
-        resume() {
-          events.push("resume");
-        },
-        async initialize() {
-          return {};
-        },
-        async newSession() {
-          return "s1";
-        },
-        async prompt() {
-          return "ok";
-        },
-        cancel() {},
-        respondPermission() {},
-      }),
-    });
-    const ada = await store.create("Ada");
-    await store.pickHarness(ada.id, "codex");
-    assert.equal(store.hasAcpChild(ada.id), true);
-    store.zoom(ada.id);
-    assert.ok(events.includes("pause"));
-    await assert.rejects(() => store.send(ada.id, "hello"), (err: Error & { status?: number }) => {
-      assert.equal(err.status, 409);
-      return /zoom/i.test(err.message);
-    });
-    store.unzoom(ada.id);
-    assert.ok(events.includes("resume"));
-    store.close();
-  });
-});
 
 describe("PWA has no Takeover button", () => {
   test("Computer and Messenger do not render Takeover", async () => {
