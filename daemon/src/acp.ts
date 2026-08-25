@@ -14,6 +14,10 @@ export type PermissionPrompt = {
   title: string;
   description?: string;
   options: Array<{ optionId: string; name: string; kind?: string }>;
+  locations?: Array<{ path?: string }>;
+  rawInput?: Record<string, unknown> | null;
+  toolKind?: string;
+  meta?: unknown;
 };
 
 export type AssistantDelta = {
@@ -163,15 +167,25 @@ export class AcpClient {
     if (msg.method === "session/request_permission") {
       const params = (msg.params ?? {}) as {
         title?: string;
-        toolCall?: { title?: string; kind?: string };
+        toolCall?: {
+          title?: string;
+          kind?: string;
+          locations?: Array<{ path?: string }>;
+          rawInput?: Record<string, unknown>;
+        };
         description?: string;
         options?: Array<{ optionId: string; name: string; kind?: string }>;
+        _meta?: unknown;
       };
       this.handlers.onPermission?.({
         rpcId: msg.id as RpcId,
         title: params.title ?? params.toolCall?.title ?? "Allow this tool?",
-        description: params.description,
+        description: params.description ?? params.toolCall?.title,
         options: Array.isArray(params.options) ? params.options : [],
+        locations: params.toolCall?.locations,
+        rawInput: params.toolCall?.rawInput ?? null,
+        toolKind: params.toolCall?.kind,
+        meta: params._meta,
       });
       return;
     }
