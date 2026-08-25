@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -136,9 +137,65 @@ export class HomeStore {
 
   directChannelId(botId: string): string | null {
     const row = this.db
-      .prepare("SELECT channel_id FROM bot_channel_state WHERE bot_id = ? LIMIT 1")
+      .prepare(
+        `SELECT channels.id AS channel_id
+         FROM channels
+         JOIN channel_members ON channel_members.channel_id = channels.id
+         WHERE channels.kind = 'direct'
+           AND channel_members.member_kind = 'bot'
+           AND channel_members.member_id = ?
+         LIMIT 1`,
+      )
       .get(botId) as SqlRow | undefined;
     return typeof row?.channel_id === "string" ? row.channel_id : null;
+  }
+
+  getChannel(id: string): StoredChannel | null {
+    const row = this.db
+      .prepare("SELECT id, kind, title, created_at FROM channels WHERE id = ?")
+      .get(id) as SqlRow | undefined;
+    if (!row) return null;
+    return this.reviveChannel(row);
+  }
+
+  createGroup(input: { title?: string | null; memberBotIds: string[] }): StoredChannel {
+    const memberBotIds = uniqueIds(input.memberBotIds);
+    if (memberBotIds.length === 0) {
+      throw Object.assign(new Error("members are required"), { status: 400 });
+    }
+    const bots = this.listBots();
+    const byId = new Map(bots.map((bot) => [bot.id, bot]));
+    for (const id of memberBotIds) {
+      if (!byId.has(id)) throw Object.assign(new Error("unknown Bot"), { status: 400 });
+    }
+    if (memberBotIds.length < 2) {
+      throw Object.assign(new Error("group needs several Bots"), { status: 400 });
+    }
+    const title = typeof input.title === "string" && input.title.trim() ? input.title.trim() : null;
+    const createdAt = new Date().toISOString();
+    const id = crypto.randomUUID();
+    const members: ChannelMember[] = [
+      { kind: "user", id: HUMAN_MEMBER_ID },
+      ...memberBotIds.map((botId) => ({ kind: "bot" as const, id: botId })),
+    ];
+    this.transaction(() => {
+      this.db
+        .prepare("INSERT INTO channels (id, kind, title, created_at) VALUES (?, 'group', ?, ?)")
+        .run(id, title, createdAt);
+      const insertMember = this.db.prepare(
+        "INSERT INTO channel_members (channel_id, member_kind, member_id, position) VALUES (?, ?, ?, ?)",
+      );
+      members.forEach((member, index) => {
+        insertMember.run(id, member.kind, member.id, index);
+      });
+      const insertState = this.db.prepare(
+        "INSERT INTO bot_channel_state (bot_id, channel_id, harness_id, session_id) VALUES (?, ?, ?, NULL)",
+      );
+      for (const botId of memberBotIds) {
+        insertState.run(botId, id, byId.get(botId)?.harness ?? null);
+      }
+    });
+    return { id, kind: "group", title, createdAt, members, messages: [] };
   }
 
   createBot(bot: StoredBot, channelId: string): StoredChannel {
@@ -463,6 +520,18 @@ function reviveBot(row: SqlRow): StoredBot[] {
 function reviveMember(row: SqlRow): ChannelMember[] {
   if ((row.member_kind !== "user" && row.member_kind !== "bot") || typeof row.member_id !== "string") return [];
   return [{ kind: row.member_kind, id: row.member_id }];
+}
+
+function uniqueIds(ids: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of ids) {
+    const id = raw.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
 }
 
 function isChannelKind(value: unknown): value is ChannelKind {
