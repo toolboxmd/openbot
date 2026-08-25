@@ -4,6 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "description": "Self-hosted Grok Bot. Named Bots on one Computer.",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "test": "tsx --test daemon/test/*.test.ts",
     "typecheck": "tsc -p daemon/tsconfig.json --noEmit && tsc -p pwa/tsconfig.json --noEmit",

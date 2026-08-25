@@ -22,6 +22,7 @@ export type Bot = {
   id: string;
   name: string;
   harness: string | null;
+  channelId: string;
   eyes: { color: string; shape: string; mode: EyesMode };
   write: boolean;
   zoom?: boolean;

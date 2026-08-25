@@ -1,3 +1,5 @@
+import { defaultHomeDir, defaultWorkspaceDir } from "./home.ts";
+
 export const DEFAULT_SCREEN_UPSTREAM = "http://127.0.0.1:16901";
 export const SCREEN_SERVICE = "screen";
 export const FORBIDDEN_SCREEN_PORT = 6901;
@@ -23,6 +25,9 @@ export type SuperviseDeps = {
 
 export function childEnv(env: NodeJS.ProcessEnv, ports?: number[]): NodeJS.ProcessEnv {
   const next: NodeJS.ProcessEnv = { ...env };
+  const homeDir = defaultHomeDir(env);
+  next.OPENBOT_HOME = homeDir;
+  next.OPENBOT_WORKSPACE = defaultWorkspaceDir(homeDir);
   if (ports && ports.length > 0) {
     if (ports.includes(FORBIDDEN_SCREEN_PORT)) {
       throw new Error("refusing to publish Screen on 6901");

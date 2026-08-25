@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
 import path from "node:path";
-import { BotStore, defaultWorkspaceDir, type BotStoreDeps } from "./bots.ts";
+import { BotStore, defaultHomeDir, defaultWorkspaceDir, type BotStoreDeps } from "./bots.ts";
 import { NoopComputerRuntime, type ComputerRuntime } from "./computer.ts";
 import { kasmUpdateWrite } from "./kasm.ts";
 
@@ -15,6 +15,7 @@ export type BoxOptions = {
   screenUpstream?: string;
   kasmUser?: string;
   kasmPassword?: string;
+  homeDir?: string;
   workspaceDir?: string;
   computer?: ComputerRuntime;
 } & Pick<BotStoreDeps, "spawnAcp" | "listHarnesses">;
@@ -390,10 +391,14 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
   const auth = kasmAuthorization(options);
   const computer: ComputerRuntime =
     options.computer ?? new NoopComputerRuntime(undefined, options.screenUpstream);
-  const store = new BotStore(options.workspaceDir ?? defaultWorkspaceDir(), {
+  const homeDir =
+    options.homeDir ?? (options.workspaceDir ? `${path.resolve(options.workspaceDir)}-home` : defaultHomeDir());
+  const workspaceDir = options.workspaceDir ?? defaultWorkspaceDir(homeDir);
+  const store = new BotStore(homeDir, {
     computer,
     spawnAcp: options.spawnAcp,
     listHarnesses: options.listHarnesses,
+    workspaceDir,
   });
 
   function upstreamFor(botId: string | null): string | undefined {
@@ -496,6 +501,30 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         } catch (err) {
           sendStoreError(res, err);
         }
+        return;
+      }
+
+      if (url.pathname === "/api/channels" && method === "GET") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        sendJson(res, 200, { channels: store.listChannels() });
+        return;
+      }
+
+      const channelMatch = url.pathname.match(/^\/api\/channels\/([^/]+)$/);
+      if (channelMatch && method === "GET") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        const channel = store.getChannel(decodeURIComponent(channelMatch[1]));
+        if (!channel) {
+          sendJson(res, 404, { error: "Channel not found" });
+          return;
+        }
+        sendJson(res, 200, channel);
         return;
       }
 

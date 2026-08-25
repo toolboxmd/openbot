@@ -21,7 +21,7 @@ services:
       VNC_USER: openbot
       VNC_PASSWORD: ${OPENBOT_PASSWORD:-openbot}
     volumes:
-      - ${OPENBOT_WORKSPACE:-./workspace}:/workspace
+      - ${OPENBOT_WORKSPACE:-${OPENBOT_HOME:-${HOME}/.openbot}/workspace}:/workspace
       - ${OPENBOT_COOKIES:-./computer/cookies}:/computer/cookies
     shm_size: "1gb"
     restart: unless-stopped

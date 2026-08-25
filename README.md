@@ -6,7 +6,7 @@ This slice is one Computer (one Screen container) with N displays, plus Talk to 
 
 ## Run
 
-You need Docker for Screen, and Codex on PATH to Talk. From the repo root:
+You need Docker for Screen, Node.js 22.13 or newer, and Codex on PATH to Talk. From the repo root:
 
 Run package.json scripts.start with OPENBOT_PASSWORD set (default Password is `openbot`).
 
@@ -19,6 +19,8 @@ Open **Computer** in the sidebar to watch. Zoom / Open is already write (mouse a
 See [ADR 0005](docs/adr/0005-harness-on-host-os.md) and [ADR 0006](docs/adr/0006-screens-are-displays.md). The ACP child is a host OS process. Compose cannot exec Mac Codex. Do not start a Compose box service -- there is none.
 
 Keep-alive while the start script runs is not keep-alive after logout, sleep, or reboot.
+
+Talk state lives in private Home at `$OPENBOT_HOME`, default `~/.openbot`. The Channel Transcript is in `talk.sqlite`; the shared Computer and ACP workspace is `$OPENBOT_HOME/workspace`. Talk does not import the old `workspace/bots.json` blob. See [ADR 0007](docs/adr/0007-home-channels-and-sessions.md).
 
 ## What this Computer runs
 
