@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { COMPUTER_CONTAINER, WORKSPACE_MOUNT } from "./computer.ts";
 import { HARNESS_IDS, type HarnessId } from "./harness.ts";
 
 export const CONFIG_MODES = ["isolated", "host"] as const;
@@ -38,9 +39,22 @@ const HOST_AUTH_FILES: Record<HarnessId, string[]> = {
 
 export const OPENBOT_MD = `# OpenBot
 
-You are a named Bot on this Computer. Chat like a person in iMessage: several short bubbles, one or two sentences each. No markdown essays. No headings. No numbered dumps. No tool JSON or transcripts in chat.
+You are a named Bot on this Computer. This Session is Isolated, not Host.
+
+Chat like a person in iMessage: several short bubbles, one or two sentences each. No markdown essays. No headings. No numbered dumps. No tool JSON or transcripts in chat.
 
 Workspace is the jail. You may read and write the shared drop and every Bot directory without asking. Paths on the host PC outside Workspace need a Host grant.
+
+Isolated commands run in Screen (the Computer container), not on the host OS. You must run process exec (\`gh\`, \`git\`, \`npm\`, \`bash\`, \`ls\`, and any other command) with \`docker exec\` into Screen. Do not run those commands on the host. File read, search, and patch stay on the host Workspace path; that folder is the same tree Screen mounts.
+
+Use:
+- container: \`$OPENBOT_SCREEN_CONTAINER\` (default \`${COMPUTER_CONTAINER}\`)
+- Isolated ~ and cwd in Screen: \`$OPENBOT_SCREEN_WORKSPACE/bots/$OPENBOT_BOT_ID\` (default \`${WORKSPACE_MOUNT}/bots/$OPENBOT_BOT_ID\`)
+
+Example:
+\`docker exec -w ${WORKSPACE_MOUNT}/bots/$OPENBOT_BOT_ID -e HOME=${WORKSPACE_MOUNT}/bots/$OPENBOT_BOT_ID $OPENBOT_SCREEN_CONTAINER <command>\`
+
+If Screen is not up, do not fall back to a host shell. Wait.
 
 This file is product-locked Isolated user-level instructions. Users do not edit it. They edit All Bots (\`AGENTS.md\` at the Workspace root) and This Bot (\`AGENTS.md\` in your cwd).
 `;
@@ -91,11 +105,17 @@ export function thisBotAgentsPath(workspaceDir: string, botId: string): string {
   return path.join(botWorkspaceDir(workspaceDir, botId), "AGENTS.md");
 }
 
+export type SessionEnvOpts = {
+  botId?: string;
+  screenContainer?: string;
+};
+
 export function applyVendorHomeEnv(
   env: NodeJS.ProcessEnv,
   mode: ConfigMode,
   homeDir: string,
   botHome?: string,
+  session?: SessionEnvOpts,
 ): NodeJS.ProcessEnv {
   const next = { ...env };
   for (const id of HARNESS_IDS) {
@@ -103,14 +123,39 @@ export function applyVendorHomeEnv(
     if (mode === "isolated") next[key] = vendorDir(homeDir, id);
     else delete next[key];
   }
-  if (mode === "isolated" && botHome) next.HOME = path.resolve(botHome);
+  next.OPENBOT_CONFIG_MODE = mode;
+  if (mode === "isolated") {
+    if (botHome) next.HOME = path.resolve(botHome);
+    const botId = session?.botId ?? botIdFromBotHome(botHome);
+    if (botId) next.OPENBOT_BOT_ID = botId;
+    next.OPENBOT_SCREEN_CONTAINER =
+      session?.screenContainer ?? env.OPENBOT_SCREEN_CONTAINER ?? COMPUTER_CONTAINER;
+    next.OPENBOT_SCREEN_WORKSPACE = WORKSPACE_MOUNT;
+  } else {
+    delete next.OPENBOT_BOT_ID;
+    delete next.OPENBOT_SCREEN_CONTAINER;
+    delete next.OPENBOT_SCREEN_WORKSPACE;
+  }
   return next;
+}
+
+function botIdFromBotHome(botHome: string | undefined): string | undefined {
+  if (!botHome) return undefined;
+  const parts = path.resolve(botHome).split(path.sep);
+  const idx = parts.lastIndexOf("bots");
+  const id = idx >= 0 ? parts[idx + 1] : undefined;
+  return id || undefined;
 }
 
 export function isInsideWorkspace(target: string, workspaceDir: string): boolean {
   const resolved = path.resolve(target);
   const root = path.resolve(workspaceDir);
   return resolved === root || resolved.startsWith(root + path.sep);
+}
+
+export function isInsideScreenWorkspace(target: string): boolean {
+  const resolved = path.resolve(target);
+  return resolved === WORKSPACE_MOUNT || resolved.startsWith(WORKSPACE_MOUNT + path.sep);
 }
 
 export function pathCoveredByGrant(requestPath: string, grantPath: string): boolean {
@@ -239,7 +284,7 @@ export function ensureHarnessHome(homeDir: string, workspaceDir: string): void {
   fs.mkdirSync(path.join(shared, "skills"), { recursive: true });
   fs.mkdirSync(path.join(shared, "plugins"), { recursive: true });
   fs.mkdirSync(path.join(shared, "hooks"), { recursive: true });
-  writeIfMissing(path.join(shared, "OPENBOT.md"), OPENBOT_MD);
+  writeProductFile(path.join(shared, "OPENBOT.md"), OPENBOT_MD);
   ensureWorkspaceLayout(workspace);
 
   for (const id of HARNESS_IDS) {
@@ -272,28 +317,41 @@ export function writeAgentsFile(filePath: string, text: string): void {
   fs.writeFileSync(filePath, text, { encoding: "utf8", mode: 0o644 });
 }
 
-function writeIsolatedConfig(configPath: string, workspaceDir: string): void {
-  if (fs.existsSync(configPath)) return;
-  const body = `# OpenBot Isolated Harness Home. Native Isolated config for this Computer.
-# Do not put OPENBOT_HOME under /tmp: Codex refuses helper binaries there and the jail will not hold.
+const ISOLATED_CONFIG_BODY = `# OpenBot Isolated Harness Home. Native Isolated config for this Computer.
+# Isolated Seatbelt is off so Isolated can docker exec into Screen (ADR 0010).
+# allow_login_shell is off so Isolated ~ is This Bot's directory, not the host login home.
+# Isolated native host shell stays. Isolated exec is post-v1 (#69).
+# Do not put OPENBOT_HOME under /tmp: Codex refuses helper binaries there.
 approval_policy = "on-request"
-sandbox_mode = "workspace-write"
-
-[sandbox_workspace_write]
-writable_roots = [${tomlString(workspaceDir)}]
-exclude_slash_tmp = true
-exclude_tmpdir_env_var = true
-network_access = false
+sandbox_mode = "danger-full-access"
+allow_login_shell = false
 `;
+
+function writeIsolatedConfig(configPath: string, _workspaceDir: string): void {
+  if (!fs.existsSync(configPath)) {
+    fs.writeFileSync(configPath, ISOLATED_CONFIG_BODY, { encoding: "utf8", mode: 0o644 });
+    return;
+  }
+  let body = fs.readFileSync(configPath, "utf8");
+  body = upsertTomlBareKey(body, "sandbox_mode", '"danger-full-access"');
+  body = upsertTomlBareKey(body, "allow_login_shell", "false");
   fs.writeFileSync(configPath, body, { encoding: "utf8", mode: 0o644 });
 }
 
-function tomlString(value: string): string {
-  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+function upsertTomlBareKey(text: string, key: string, value: string): string {
+  const pattern = new RegExp(`^${key}\\s*=\\s*.*$`, "m");
+  if (pattern.test(text)) return text.replace(pattern, `${key} = ${value}`);
+  const trimmed = text.trimEnd();
+  return `${trimmed}${trimmed ? "\n" : ""}${key} = ${value}\n`;
 }
 
 function writeIfMissing(filePath: string, body: string): void {
   if (fs.existsSync(filePath)) return;
+  writeProductFile(filePath, body);
+}
+
+function writeProductFile(filePath: string, body: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, body, { encoding: "utf8", mode: 0o644 });
 }
 

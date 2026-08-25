@@ -13,6 +13,7 @@ import {
   applyVendorHomeEnv,
   ensureHarnessHome,
   extractPermissionPath,
+  isInsideScreenWorkspace,
   isInsideWorkspace,
   vendorDir,
 } from "../src/harness-home.ts";
@@ -123,6 +124,42 @@ describe("Isolated Harness Home layout", () => {
     assert.equal(existsSync(join(claude, "CLAUDE.md")), true);
     assert.equal(existsSync(join(claude, "settings.json")), true);
     assert.equal(existsSync(join(claude, "AGENTS.md")), false);
+
+    const openbot = readFileSync(join(homeDir, "harness", "shared", "OPENBOT.md"), "utf8");
+    assert.match(openbot, /This Session is Isolated/);
+    assert.match(openbot, /docker exec/);
+    assert.match(openbot, /Screen/);
+    assert.match(openbot, /OPENBOT_SCREEN_CONTAINER/);
+    assert.doesNotMatch(openbot, /optional hint/i);
+
+    const isolatedConfig = readFileSync(join(codex, "config.toml"), "utf8");
+    assert.match(isolatedConfig, /sandbox_mode = "danger-full-access"/);
+    assert.match(isolatedConfig, /allow_login_shell = false/);
+    assert.doesNotMatch(isolatedConfig, /sandbox_mode = "workspace-write"/);
+  });
+
+  test("ensureHarnessHome pins Isolated OPENBOT.md and Isolated Seatbelt off on existing homes", async () => {
+    const homeDir = await tempHome();
+    const workspace = join(homeDir, "workspace");
+    const sharedOpenbot = join(homeDir, "harness", "shared", "OPENBOT.md");
+    const codexConfig = join(homeDir, "harness", "codex", "config.toml");
+    mkdirSync(join(homeDir, "harness", "shared"), { recursive: true });
+    mkdirSync(join(homeDir, "harness", "codex"), { recursive: true });
+    writeFileSync(sharedOpenbot, "# stale Isolated instructions\n");
+    writeFileSync(
+      codexConfig,
+      `approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+allow_login_shell = true
+`,
+    );
+    ensureHarnessHome(homeDir, workspace);
+    const openbot = readFileSync(sharedOpenbot, "utf8");
+    assert.match(openbot, /This Session is Isolated/);
+    assert.match(openbot, /docker exec/);
+    const isolatedConfig = readFileSync(codexConfig, "utf8");
+    assert.match(isolatedConfig, /sandbox_mode = "danger-full-access"/);
+    assert.match(isolatedConfig, /allow_login_shell = false/);
   });
 
   test("Isolated env sets vendor homes; Host unsets them", async () => {
@@ -132,11 +169,16 @@ describe("Isolated Harness Home layout", () => {
     assert.equal(isolated.CLAUDE_CONFIG_DIR, join(homeDir, "harness", "claude"));
     assert.equal(isolated.GROK_HOME, join(homeDir, "harness", "grok"));
     assert.equal(isolated.KIMI_CODE_HOME, join(homeDir, "harness", "kimi"));
+    assert.equal(isolated.OPENBOT_CONFIG_MODE, "isolated");
+    assert.equal(isolated.OPENBOT_SCREEN_CONTAINER, "openbot-screen");
+    assert.equal(isolated.OPENBOT_SCREEN_WORKSPACE, "/workspace");
     const host = applyVendorHomeEnv({ CODEX_HOME: "/old", GROK_HOME: "/g" }, "host", homeDir);
     assert.equal(host.CODEX_HOME, undefined);
     assert.equal(host.CLAUDE_CONFIG_DIR, undefined);
     assert.equal(host.GROK_HOME, undefined);
     assert.equal(host.KIMI_CODE_HOME, undefined);
+    assert.equal(host.OPENBOT_CONFIG_MODE, "host");
+    assert.equal(host.OPENBOT_SCREEN_CONTAINER, undefined);
   });
 
   test("Isolated applyVendorHomeEnv with botHome sets HOME; Host leaves HOME", () => {
@@ -150,6 +192,8 @@ describe("Isolated Harness Home layout", () => {
     );
     assert.equal(isolated.HOME, botHome);
     assert.equal(isolated.CODEX_HOME, join(homeDir, "harness", "codex"));
+    assert.equal(isolated.OPENBOT_CONFIG_MODE, "isolated");
+    assert.equal(isolated.OPENBOT_BOT_ID, "ada");
     const host = applyVendorHomeEnv(
       { HOME: "/Users/mac", CODEX_HOME: "/old" },
       "host",
@@ -158,6 +202,8 @@ describe("Isolated Harness Home layout", () => {
     );
     assert.equal(host.HOME, "/Users/mac");
     assert.equal(host.CODEX_HOME, undefined);
+    assert.equal(host.OPENBOT_CONFIG_MODE, "host");
+    assert.equal(host.OPENBOT_BOT_ID, undefined);
   });
 
   test("workspace jail and permission path extraction", () => {
@@ -189,6 +235,10 @@ describe("Isolated Harness Home layout", () => {
       "/tmp/openbot-ws/bots/ada",
     );
     assert.equal(fromExec, "/home/box/.openbot-hh-live/outside/grant.txt");
+    assert.equal(isInsideScreenWorkspace("/workspace"), true);
+    assert.equal(isInsideScreenWorkspace("/workspace/bots/ada"), true);
+    assert.equal(isInsideScreenWorkspace("/workspace/bots/$OPENBOT_BOT_ID"), true);
+    assert.equal(isInsideScreenWorkspace("/tmp/secret.txt"), false);
   });
 });
 
@@ -341,6 +391,10 @@ describe("BotStore Isolated cwd and env", () => {
     assert.deepEqual(fake.spawned[0]?.sessionCwd, [botDir]);
     assert.equal(fake.spawned[0]?.spec.env.CODEX_HOME, join(homeDir, "harness", "codex"));
     assert.equal(fake.spawned[0]?.spec.env.HOME, botDir);
+    assert.equal(fake.spawned[0]?.spec.env.OPENBOT_CONFIG_MODE, "isolated");
+    assert.equal(fake.spawned[0]?.spec.env.OPENBOT_BOT_ID, ada.id);
+    assert.equal(fake.spawned[0]?.spec.env.OPENBOT_SCREEN_CONTAINER, "openbot-screen");
+    assert.equal(fake.spawned[0]?.spec.env.OPENBOT_SCREEN_WORKSPACE, "/workspace");
     assert.equal(existsSync(join(botDir, "AGENTS.md")), true);
     assert.equal(lstatSync(join(botDir, "CLAUDE.md")).isSymbolicLink(), true);
     store.close();
@@ -360,6 +414,8 @@ describe("BotStore Isolated cwd and env", () => {
     await waitUntil(() => fake.spawned.length > 0);
     assert.equal(fake.spawned[0]?.spec.env.CODEX_HOME, undefined);
     assert.equal(fake.spawned[0]?.spec.env.HOME, process.env.HOME);
+    assert.equal(fake.spawned[0]?.spec.env.OPENBOT_CONFIG_MODE, "host");
+    assert.equal(fake.spawned[0]?.spec.env.OPENBOT_BOT_ID, undefined);
     store.close();
   });
 
@@ -413,6 +469,43 @@ describe("BotStore Isolated cwd and env", () => {
     });
     assert.equal(store.get(ben.id)?.permission, null);
     assert.ok(fake.answered.includes("allow-once"));
+    store.close();
+  });
+
+  test("Isolated docker exec Screen /workspace path auto-allows; Host does not", async () => {
+    const homeDir = await tempHome();
+    const fake = recordingFake();
+    const store = new BotStore(homeDir, {
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: fake.spawnAcp,
+    });
+    const ada = await store.create("Ada");
+    await store.pickHarness(ada.id, "codex");
+    await store.send(ada.id, "hi");
+    await waitUntil(() => fake.spawned.length > 0);
+    fake.fire({
+      rpcId: 30,
+      title: "Exec",
+      options: allowDenyOptions,
+      locations: [{ path: "/workspace/bots/$OPENBOT_BOT_ID" }],
+      toolKind: "execute",
+    });
+    assert.deepEqual(fake.answered, ["allow-once"]);
+    assert.equal(store.get(ada.id)?.permission, null);
+
+    await store.setConfigMode(ada.id, "host");
+    await store.send(ada.id, "hi");
+    await waitUntil(() => fake.spawned.length > 1);
+    fake.fire({
+      rpcId: 31,
+      title: "Exec",
+      options: allowDenyOptions,
+      locations: [{ path: "/workspace/secret.txt" }],
+      toolKind: "execute",
+    });
+    const pending = store.get(ada.id)?.permission;
+    assert.ok(pending?.hostGrant);
+    assert.equal(pending?.hostGrant?.path, "/workspace/secret.txt");
     store.close();
   });
 

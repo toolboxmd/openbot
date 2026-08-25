@@ -82,6 +82,8 @@ export type SpawnSpecOptions = {
   mode?: SpawnMode;
   homeDir?: string;
   cwd?: string;
+  botId?: string;
+  screenContainer?: string;
 };
 
 export function spawnSpec(id: HarnessId, opts: SpawnSpecOptions = {}): SpawnSpec {
@@ -93,7 +95,10 @@ export function spawnSpec(id: HarnessId, opts: SpawnSpecOptions = {}): SpawnSpec
   delete env.DISPLAY;
   if (opts.homeDir) {
     const mode = opts.mode ?? "isolated";
-    env = applyVendorHomeEnv(env, mode, opts.homeDir, opts.cwd);
+    env = applyVendorHomeEnv(env, mode, opts.homeDir, opts.cwd, {
+      botId: opts.botId,
+      screenContainer: opts.screenContainer,
+    });
   }
   const codex = resolveBin("codex");
   if (!codex) {

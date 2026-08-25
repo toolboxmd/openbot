@@ -29,7 +29,7 @@ if (!liveCodexAvailable()) {
   throw new Error("codex is required on PATH for Isolated Harness Home live Done; do not skip");
 }
 
-const LIVE_ROOT = join("/home/box", ".openbot-hh-live");
+const LIVE_ROOT = join(homedir(), ".openbot-hh-live");
 
 async function liveHomeDir(): Promise<string> {
   mkdirSync(LIVE_ROOT, { recursive: true });
@@ -431,6 +431,51 @@ describe("Live Codex Isolated Harness Home", () => {
         await box.close();
         if (existsSync(allowPath)) rmSync(allowPath);
         if (existsSync(denyPath)) rmSync(denyPath);
+      }
+    },
+  );
+
+  test(
+    "Isolated native shell HOME is This Bot directory, not host login home",
+    { timeout: 900_000 },
+    async () => {
+      const token = `HH58H-${Date.now()}`;
+      const homeDir = await liveHomeDir();
+      const workspace = defaultWorkspaceDir(homeDir);
+      const box = await openBox(homeDir);
+      try {
+        const cookie = await login(box.url);
+        const adaId = await createBot(box.url, cookie, "Ada");
+        const adaDir = join(workspace, "bots", adaId);
+        const report = join(adaDir, `isolated-home-${token}.txt`);
+        await postText(
+          box.url,
+          cookie,
+          adaId,
+          [
+            `Create the file isolated-home-${token}.txt in your current working directory using a file write, not a shell command and not docker exec.`,
+            "Write exactly two lines: the Isolated Unix HOME for this Session, then OPENBOT_CONFIG_MODE.",
+            "Those values are already in this Isolated Session environment. HOME is This Bot's directory. OPENBOT_CONFIG_MODE is isolated.",
+            "Reply with done when the file exists.",
+          ].join(" "),
+        );
+        const idle = await pollIdle(box.url, cookie, adaId);
+        assert.equal(
+          existsSync(report),
+          true,
+          `Isolated HOME report missing; reply=${assistantText(idle.messages ?? [])}`,
+        );
+        const body = readFileSync(report, "utf8");
+        const screenHome = `/workspace/bots/${adaId}`;
+        assert.equal(
+          body.includes(adaDir) || body.includes(screenHome),
+          true,
+          `Isolated ~ must be This Bot directory (host mount or Screen /workspace); report=\n${body}`,
+        );
+        assert.match(body, /isolated/i);
+        assert.doesNotMatch(body, /^\/Users\/[^/\n]+$/m);
+      } finally {
+        await box.close();
       }
     },
   );

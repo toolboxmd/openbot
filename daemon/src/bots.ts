@@ -30,6 +30,7 @@ import {
   isHostGrantAccess,
   isHostGrantDuration,
   isInsideWorkspace,
+  isInsideScreenWorkspace,
   pickAllowOption,
   pickRejectOption,
   readAgentsFile,
@@ -535,7 +536,13 @@ export class BotStore {
     const cwd = ensureBotWorkspace(this.workspaceDir, bot.id);
     let spec: SpawnSpec;
     try {
-      spec = spawnSpec(harness, { mode: bot.configMode, homeDir: this.home.homeDir, cwd });
+      spec = spawnSpec(harness, {
+        mode: bot.configMode,
+        homeDir: this.home.homeDir,
+        cwd,
+        botId: bot.id,
+        screenContainer: this.computer.containerName(),
+      });
     } catch (err) {
       if (this.spawnAcpFn === spawnAcp) {
         bot.eyesMode = "needs-you";
@@ -545,7 +552,7 @@ export class BotStore {
       spec = {
         command: "injected-acp",
         args: [],
-        env: spawnSpecEnvFallback(bot.configMode, this.home.homeDir, cwd),
+        env: spawnSpecEnvFallback(bot.configMode, this.home.homeDir, cwd, bot.id, this.computer.containerName()),
       };
     }
 
@@ -679,14 +686,17 @@ export class BotStore {
     const cwd = this.botCwd(bot.id);
     const requestPath = extractPermissionPath(prompt, cwd);
     const requested = requestedAccessFromKind(prompt.toolKind);
-    if (requestPath && isInsideWorkspace(requestPath, this.workspaceDir)) {
+    const inJail =
+      (requestPath && isInsideWorkspace(requestPath, this.workspaceDir)) ||
+      (requestPath && bot.configMode === "isolated" && isInsideScreenWorkspace(requestPath));
+    if (inJail) {
       const allow = pickAllowOption(prompt.options);
       if (allow) {
         client.respondPermission(prompt.rpcId, allow);
         return;
       }
     }
-    if (requestPath && !isInsideWorkspace(requestPath, this.workspaceDir)) {
+    if (requestPath && !inJail) {
       const grant = this.home.matchHostGrant(requestPath, requested);
       if (grant) {
         if (grant.access === "deny") {
@@ -822,8 +832,14 @@ export function capTalkBubble(text: string): string {
   return `${cut.length >= Math.floor(limit * 0.6) ? cut : slice}…`;
 }
 
-function spawnSpecEnvFallback(mode: ConfigMode, homeDir: string, botHome: string): NodeJS.ProcessEnv {
-  return applyVendorHomeEnv({ ...process.env }, mode, homeDir, botHome);
+function spawnSpecEnvFallback(
+  mode: ConfigMode,
+  homeDir: string,
+  botHome: string,
+  botId: string,
+  screenContainer: string,
+): NodeJS.ProcessEnv {
+  return applyVendorHomeEnv({ ...process.env }, mode, homeDir, botHome, { botId, screenContainer });
 }
 
 function nowIso(): string {

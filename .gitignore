@@ -5,3 +5,5 @@ pwa/dist
 .DS_Store
 workspace
 computer/cookies
+.grok/
+skills-lock.json
