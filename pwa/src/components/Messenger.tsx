@@ -18,7 +18,11 @@ import {
   sidebarGroups,
   type Channel,
 } from "@/lib/channels";
+import { AgentsEditors } from "@/components/AgentsEditors";
+import { HostGrantCard } from "@/components/HostGrantCard";
+import { isHostGrantPermission } from "@/lib/harness-home";
 import {
+  answerHostGrant,
   answerPermission,
   createBot,
   createGroupChannel,
@@ -29,6 +33,7 @@ import {
   listHarnesses,
   pickHarness,
   sendMessage,
+  setConfigMode,
   toggleReaction,
   type Bot,
   type Harness,
@@ -412,6 +417,31 @@ export function Messenger() {
     }
   }
 
+  async function onConfigMode(configMode: "isolated" | "host") {
+    if (!activeId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const bot = await setConfigMode(activeId, configMode);
+      setActive(bot);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not set Isolated or Host.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onHostGrant(access: "read" | "read-write" | "deny", duration: "once" | "session" | "until-revoked") {
+    if (!activeId) return;
+    setBusy(true);
+    try {
+      const bot = await answerHostGrant(activeId, access, duration);
+      setActive(bot);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function onReact(messageId: string, emoji: string) {
     if (!activeId) return;
     try {
@@ -424,6 +454,16 @@ export function Messenger() {
   }
 
   function renderBubble(message: ChatMessage, prev: ChatMessage | undefined, nested: boolean) {
+    if (message.kind === "host-grant") {
+      return (
+        <li key={message.id} className="self-center w-full max-w-2xl">
+          <div data-testid="host-grant-history" className="rounded-2xl bg-secondary px-4 py-3 text-sm">
+            <p className="font-medium">Host grant</p>
+            <p className="mt-1 whitespace-pre-wrap break-all text-muted-foreground">{message.text}</p>
+          </div>
+        </li>
+      );
+    }
     const user = message.role === "user";
     const index = visible.findIndex((row) => row.id === message.id);
     const grouped = Boolean(prev && prev.role === message.role && sameMinute(prev.createdAt, message.createdAt));
@@ -706,23 +746,39 @@ export function Messenger() {
             {activeGroup ? groupDisplayTitle(activeGroup) : (active?.name ?? "Thread")}
           </h1>
           {active && !activeGroup ? (
-            <label className="flex items-center gap-2 text-xs text-muted-foreground">
-              Harness
-              <select
-                className="h-8 rounded-full border border-input bg-background px-3 text-sm text-foreground"
-                value={active.harness ?? ""}
-                disabled={busy}
-                onChange={(event) => void onPick(event.target.value)}
-              >
-                <option value="">Pick a Harness</option>
-                {harnesses.map((item) => (
-                  <option key={item.id} value={item.id} disabled={!item.talk && item.id !== "codex"}>
-                    {item.name}
-                    {item.id !== "codex" ? " (detected)" : ""}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <div className="flex items-start gap-3">
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                Harness
+                <select
+                  className="h-8 rounded-full border border-input bg-background px-3 text-sm text-foreground"
+                  value={active.harness ?? ""}
+                  disabled={busy}
+                  onChange={(event) => void onPick(event.target.value)}
+                >
+                  <option value="">Pick a Harness</option>
+                  {harnesses.map((item) => (
+                    <option key={item.id} value={item.id} disabled={!item.talk && item.id !== "codex"}>
+                      {item.name}
+                      {item.id !== "codex" ? " (detected)" : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                Config
+                <select
+                  data-testid="config-mode"
+                  className="h-8 rounded-full border border-input bg-background px-3 text-sm text-foreground"
+                  value={active.configMode ?? "isolated"}
+                  disabled={busy}
+                  onChange={(event) => void onConfigMode(event.target.value === "host" ? "host" : "isolated")}
+                >
+                  <option value="isolated">Isolated</option>
+                  <option value="host">Host</option>
+                </select>
+              </label>
+              <AgentsEditors botId={active.id} />
+            </div>
           ) : null}
         </header>
         <Separator />
@@ -798,7 +854,13 @@ export function Messenger() {
                 </li>
               ) : null}
             </ul>
-            {active.permission ? (
+            {active.permission && isHostGrantPermission(active.permission) && active.permission.hostGrant ? (
+              <HostGrantCard
+                grant={active.permission.hostGrant}
+                busy={busy}
+                onAnswer={(access, duration) => void onHostGrant(access, duration)}
+              />
+            ) : active.permission ? (
               <div className="mx-auto mt-3 w-full max-w-2xl rounded-2xl bg-secondary p-4 text-sm">
                 <p className="font-medium">{active.permission.title}</p>
                 {active.permission.description ? (
