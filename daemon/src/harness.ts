@@ -75,13 +75,33 @@ export function isHarnessId(value: string): value is HarnessId {
  * The adapter is https://github.com/agentclientprotocol/codex-acp and wraps
  * the host `codex` via CODEX_PATH. Do not use Grok websocket agent serve.
  */
-export function spawnSpec(id: HarnessId): SpawnSpec {
+export type SpawnMode = "isolated" | "host";
+
+export type SpawnSpecOptions = {
+  mode?: SpawnMode;
+  homeDir?: string;
+};
+
+export function spawnSpec(id: HarnessId, opts: SpawnSpecOptions = {}): SpawnSpec {
   if (id !== "codex") {
     throw new Error("Talk spawn is Codex-only in this slice");
   }
   const env: NodeJS.ProcessEnv = { ...process.env };
   env.PATH = pathWithLocalBin(env.PATH ?? "");
   delete env.DISPLAY;
+  if (opts.homeDir) {
+    const mode = opts.mode ?? "isolated";
+    const homes: Record<string, string> = {
+      CODEX_HOME: path.join(opts.homeDir, "harness", "codex"),
+      CLAUDE_CONFIG_DIR: path.join(opts.homeDir, "harness", "claude"),
+      GROK_HOME: path.join(opts.homeDir, "harness", "grok"),
+      KIMI_CODE_HOME: path.join(opts.homeDir, "harness", "kimi"),
+    };
+    for (const [key, value] of Object.entries(homes)) {
+      if (mode === "isolated") env[key] = value;
+      else delete env[key];
+    }
+  }
   const codex = resolveBin("codex");
   if (!codex) {
     throw new Error("codex is not on PATH");
