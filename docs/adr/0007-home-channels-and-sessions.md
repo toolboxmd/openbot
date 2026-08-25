@@ -1,7 +1,7 @@
 # ADR 0007: Home owns Channels and Transcripts
 
 ## Status
-Accepted
+Accepted. Superseded in part by 0008 (per-Bot cwd).
 
 ## Context
 Talk stored Bots and chat bubbles in one `bots.json` blob inside the shared Computer workspace. The PWA thread survived a restart, but the Harness restarted blank. A Bot blob was not a Channel, there was no private Home, and one Bot could not have independent conversations in several Channels.
@@ -9,7 +9,7 @@ Talk stored Bots and chat bubbles in one `bots.json` blob inside the shared Comp
 Harness JSONL is vendor state, not the human-facing OpenBot Transcript. ACP has no history field. The shared workspace must stay available to every Bot without exposing Talk's private state.
 
 ## Decision
-OpenBot has a private Home at `$OPENBOT_HOME`, default `~/.openbot`. Talk stores one `talk.sqlite` there. The Computer workspace is `$OPENBOT_HOME/workspace`; it is both ACP cwd and the Screen `/workspace` mount. Home itself is not mounted into Screen or given to Harnesses. There is no per-Bot cwd.
+OpenBot has a private Home at `$OPENBOT_HOME`, default `~/.openbot`. Talk stores one `talk.sqlite` there. The Computer workspace is `$OPENBOT_HOME/workspace`; it is the Screen `/workspace` mount. Home itself is not mounted into Screen or given to Harnesses.
 
 The database uses integer, additive schema migrations. It stores Bots, Channels, members, messages, reactions, attachments, deliveries, and per-Bot per-Channel state. A Talk binary refuses to write a schema version newer than it supports. This is greenfield state: Talk does not import the old workspace blob.
 
