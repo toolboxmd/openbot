@@ -1,8 +1,9 @@
 import { FormEvent, Fragment, useEffect, useState, type ReactNode } from "react";
 import { motion } from "framer-motion";
-import { ArrowUp, Maximize2, Monitor, MoreHorizontal, Plus, Reply, Smile, X } from "lucide-react";
+import { ArrowUp, Maximize2, Monitor, MoreHorizontal, Plus, Reply, Smile, Users, X } from "lucide-react";
 import { ComputerScreen } from "@/components/Computer";
 import { Eyes } from "@/components/Eyes";
+import { StackedEyes } from "@/components/StackedEyes";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
@@ -11,10 +12,20 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "@/lib/utils";
 import type { FaceMode, FaceShape } from "@/lib/face";
 import {
+  botMembers,
+  composerSendEnabled,
+  groupDisplayTitle,
+  sidebarGroups,
+  type Channel,
+} from "@/lib/channels";
+import {
   answerPermission,
   createBot,
+  createGroupChannel,
   getBot,
+  getChannel,
   listBots,
+  listChannels,
   listHarnesses,
   pickHarness,
   sendMessage,
@@ -215,11 +226,15 @@ function HoverActions({
 export function Messenger() {
   const [draft, setDraft] = useState("");
   const [nameDraft, setNameDraft] = useState("");
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useState<false | "bot" | "group">(false);
   const [bots, setBots] = useState<Bot[]>([]);
+  const [channels, setChannels] = useState<Channel[]>([]);
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [active, setActive] = useState<Bot | null>(null);
+  const [activeGroup, setActiveGroup] = useState<Channel | null>(null);
+  const [groupTitleDraft, setGroupTitleDraft] = useState("");
+  const [groupBotIds, setGroupBotIds] = useState<string[]>([]);
   const [computerOpen, setComputerOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -227,23 +242,31 @@ export function Messenger() {
   const [reactingId, setReactingId] = useState<string | null>(null);
 
   async function refresh(id = activeId) {
-    const [listed, available] = await Promise.all([listBots(), listHarnesses()]);
+    const [listed, available, channelList] = await Promise.all([listBots(), listHarnesses(), listChannels()]);
     setBots(listed.bots);
     setHarnesses(available.harnesses);
+    setChannels(channelList.channels);
     if (id) {
       const detail = await getBot(id);
       setActive(detail);
+      setActiveGroup(null);
       return detail;
+    }
+    if (activeGroup) {
+      const detail = await getChannel(activeGroup.id);
+      setActiveGroup(detail);
+      return null;
     }
     return null;
   }
 
   useEffect(() => {
     let cancelled = false;
-    void listBots()
-      .then(async (data) => {
+    void Promise.all([listBots(), listChannels()])
+      .then(async ([data, channelList]) => {
         if (cancelled) return;
         setBots(data.bots);
+        setChannels(channelList.channels);
         const first = data.bots[0];
         if (first) {
           setActiveId(first.id);
@@ -251,7 +274,10 @@ export function Messenger() {
         }
       })
       .catch(() => {
-        if (!cancelled) setBots([]);
+        if (!cancelled) {
+          setBots([]);
+          setChannels([]);
+        }
       });
     void listHarnesses()
       .then((data) => {
@@ -303,9 +329,36 @@ export function Messenger() {
       setCreating(false);
       setActiveId(bot.id);
       setActive(bot);
+      setActiveGroup(null);
       await refresh(bot.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not create Bot.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onCreateGroup(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (groupBotIds.length < 2) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const channel = await createGroupChannel({
+        title: groupTitleDraft.trim() || undefined,
+        botIds: groupBotIds,
+      });
+      setGroupTitleDraft("");
+      setGroupBotIds([]);
+      setCreating(false);
+      setActiveId(null);
+      setActive(null);
+      setActiveGroup(channel);
+      await refresh();
+      const detail = await getChannel(channel.id);
+      setActiveGroup(detail);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not create group Channel.");
     } finally {
       setBusy(false);
     }
@@ -328,6 +381,7 @@ export function Messenger() {
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!composerSendEnabled(activeGroup ? "group" : active ? "direct" : null)) return;
     if (!activeId || draft.trim().length === 0) return;
     const text = draft.trim();
     const targetId = replyTo?.id;
@@ -497,7 +551,7 @@ export function Messenger() {
         </div>
         <Separator />
         <div className="flex-1 overflow-y-auto px-3 py-3">
-          {creating ? (
+          {creating === "bot" ? (
             <form onSubmit={onCreate} className="mb-3 space-y-2 px-1">
               <Input
                 autoFocus
@@ -515,17 +569,75 @@ export function Messenger() {
                 </Button>
               </div>
             </form>
+          ) : creating === "group" ? (
+            <form onSubmit={onCreateGroup} className="mb-3 space-y-2 px-1">
+              <Input
+                autoFocus
+                name="group-title"
+                placeholder="Title (optional)"
+                value={groupTitleDraft}
+                onChange={(event) => setGroupTitleDraft(event.target.value)}
+              />
+              <div className="space-y-1">
+                {bots.map((bot) => (
+                  <label key={bot.id} className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={groupBotIds.includes(bot.id)}
+                      onChange={(event) => {
+                        setGroupBotIds((ids) =>
+                          event.target.checked ? [...ids, bot.id] : ids.filter((id) => id !== bot.id),
+                        );
+                      }}
+                    />
+                    {bot.name}
+                  </label>
+                ))}
+              </div>
+              <div className="flex gap-2">
+                <Button type="submit" size="sm" disabled={busy || groupBotIds.length < 2}>
+                  Create
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    setCreating(false);
+                    setGroupBotIds([]);
+                    setGroupTitleDraft("");
+                  }}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </form>
           ) : (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="mb-3 w-full justify-start"
-              onClick={() => setCreating(true)}
-            >
-              <Plus />
-              New Bot
-            </Button>
+            <div className="mb-3 space-y-1">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="w-full justify-start"
+                onClick={() => setCreating("bot")}
+              >
+                <Plus />
+                New Bot
+              </Button>
+              {bots.length >= 2 ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="w-full justify-start"
+                  data-testid="new-group"
+                  onClick={() => setCreating("group")}
+                >
+                  <Users />
+                  New group
+                </Button>
+              ) : null}
+            </div>
           )}
           {bots.length > 0 ? (
             <ul className="space-y-1">
@@ -535,11 +647,12 @@ export function Messenger() {
                     type="button"
                     onClick={() => {
                       setActiveId(bot.id);
+                      setActiveGroup(null);
                       void getBot(bot.id).then(setActive);
                     }}
                     className={cn(
                       "flex w-full items-center gap-2 rounded-2xl px-3 py-2 text-left text-sm hover:bg-sidebar-accent",
-                      activeId === bot.id && "bg-sidebar-accent",
+                      activeId === bot.id && !activeGroup && "bg-sidebar-accent",
                     )}
                   >
                     <Eyes
@@ -554,6 +667,32 @@ export function Messenger() {
                   </button>
                 </li>
               ))}
+              {sidebarGroups(channels).map((channel) => (
+                <li key={channel.id}>
+                  <button
+                    type="button"
+                    data-testid="group-channel-row"
+                    onClick={() => {
+                      setActiveId(null);
+                      setActive(null);
+                      void getChannel(channel.id).then(setActiveGroup);
+                    }}
+                    className={cn(
+                      "flex w-full items-center gap-2 rounded-2xl px-3 py-2 text-left text-sm hover:bg-sidebar-accent",
+                      activeGroup?.id === channel.id && "bg-sidebar-accent",
+                    )}
+                  >
+                    <StackedEyes
+                      faces={botMembers(channel).map((member) => ({
+                        name: member.name,
+                        color: member.eyes?.color,
+                        shape: member.eyes?.shape,
+                      }))}
+                    />
+                    <span className="truncate">{groupDisplayTitle(channel)}</span>
+                  </button>
+                </li>
+              ))}
             </ul>
           ) : (
             <p className="px-3 py-4 text-sm text-muted-foreground">No Bots yet.</p>
@@ -563,8 +702,10 @@ export function Messenger() {
       <Separator orientation="vertical" />
       <section className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 items-center justify-between gap-3 px-6">
-          <h1 className="truncate text-sm font-medium">{active?.name ?? "Thread"}</h1>
-          {active ? (
+          <h1 className="truncate text-sm font-medium">
+            {activeGroup ? groupDisplayTitle(activeGroup) : (active?.name ?? "Thread")}
+          </h1>
+          {active && !activeGroup ? (
             <label className="flex items-center gap-2 text-xs text-muted-foreground">
               Harness
               <select
@@ -585,7 +726,34 @@ export function Messenger() {
           ) : null}
         </header>
         <Separator />
-        {active && messages.length > 0 ? (
+        {activeGroup ? (
+          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-6 py-6">
+            <div data-testid="group-members" className="mx-auto w-full max-w-2xl">
+              <p className="mb-4 text-sm text-muted-foreground">Members</p>
+              <ul className="space-y-2">
+                {activeGroup.members.map((member) => (
+                  <li key={`${member.kind}:${member.id}`} className="flex items-center gap-3 text-sm">
+                    {member.kind === "bot" ? (
+                      <Eyes
+                        name={member.name}
+                        color={member.eyes?.color}
+                        shape={member.eyes?.shape as FaceShape | undefined}
+                        size={32}
+                        className="aspect-square shrink-0"
+                      />
+                    ) : (
+                      <span className="flex size-8 items-center justify-center rounded-full bg-secondary text-xs font-medium">
+                        You
+                      </span>
+                    )}
+                    {member.name}
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-6 text-sm text-muted-foreground">Sending in a group is not this slice.</p>
+            </div>
+          </div>
+        ) : active && messages.length > 0 ? (
           <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-6 py-4">
             <ul className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-3">
               {rootsOf(visible).map((message, index, roots) => {
@@ -717,16 +885,24 @@ export function Messenger() {
                 }
               }}
               placeholder={
-                !active ? "Create a Bot first…" : replyTo ? "Reply…" : "Message a Bot…"
+                activeGroup
+                  ? "Sending in a group is not this slice."
+                  : !active
+                    ? "Create a Bot first…"
+                    : replyTo
+                      ? "Reply…"
+                      : "Message a Bot…"
               }
-              disabled={!active}
+              disabled={!composerSendEnabled(activeGroup ? "group" : active ? "direct" : null)}
               className="min-h-10 resize-none"
             />
+            {composerSendEnabled(activeGroup ? "group" : active ? "direct" : null) ? (
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
                   type="submit"
                   size="icon"
+                  data-testid="composer-send"
                   disabled={!active || draft.trim().length === 0 || busy}
                   aria-label="Send"
                   className="shrink-0"
@@ -736,6 +912,7 @@ export function Messenger() {
               </TooltipTrigger>
               <TooltipContent>Send</TooltipContent>
             </Tooltip>
+            ) : null}
             </div>
           </div>
         </form>
