@@ -14,8 +14,11 @@ import {
   HUMAN_MEMBER_ID,
   HomeStore,
   defaultWorkspaceDir,
+  type ChannelKind,
+  type ChannelMember,
   type MessageReceipt,
   type StoredBot,
+  type StoredChannel,
   type TranscriptMessage,
 } from "./home.ts";
 import {
@@ -50,6 +53,19 @@ export type PublicBot = {
   permission: PublicPermission | null;
   needsYou: { reason: "login"; hint: string } | null;
   messages?: PublicMessage[];
+};
+
+export type PublicChannelMember = ChannelMember & {
+  name: string;
+  eyes?: { color: string; shape: FaceShape; mode: EyesMode };
+};
+
+export type PublicChannel = {
+  id: string;
+  kind: ChannelKind;
+  title: string | null;
+  createdAt: string;
+  members: PublicChannelMember[];
 };
 
 export type AcpSession = {
@@ -169,6 +185,28 @@ export class BotStore {
       permission: publicPermission(bot.permission),
       needsYou: bot.needsYou,
     };
+  }
+
+  createGroup(input: { title?: unknown; botIds?: unknown }): PublicChannel {
+    if (!Array.isArray(input.botIds) || input.botIds.some((id) => typeof id !== "string")) {
+      throw Object.assign(new Error("botIds is required"), { status: 400 });
+    }
+    const title = typeof input.title === "string" ? input.title : undefined;
+    const channel = this.home.createGroup({ title, memberBotIds: input.botIds as string[] });
+    return this.toPublicChannel(channel);
+  }
+
+  listChannels(): PublicChannel[] {
+    return this.home
+      .listChannels()
+      .filter((channel) => channel.kind !== "bot-to-bot")
+      .map((channel) => this.toPublicChannel(channel));
+  }
+
+  getChannel(id: string): PublicChannel | null {
+    const channel = this.home.getChannel(id);
+    if (!channel) return null;
+    return this.toPublicChannel(channel);
   }
 
   async create(name: string): Promise<PublicBot> {
@@ -512,6 +550,32 @@ export class BotStore {
       return;
     }
     this.pushAssistant(bot, channelId, text);
+  }
+
+  private toPublicChannel(channel: StoredChannel): PublicChannel {
+    const bots = this.home.listBots();
+    const byId = new Map(bots.map((bot) => [bot.id, bot]));
+    return {
+      id: channel.id,
+      kind: channel.kind,
+      title: channel.title,
+      createdAt: channel.createdAt,
+      members: channel.members.map((member) => {
+        if (member.kind === "user") {
+          return { kind: "user" as const, id: member.id, name: "You" };
+        }
+        const bot = byId.get(member.id);
+        const out: PublicChannelMember = {
+          kind: "bot",
+          id: member.id,
+          name: bot?.name ?? member.id,
+        };
+        if (bot) {
+          out.eyes = { color: bot.color, shape: bot.shape, mode: "idle" };
+        }
+        return out;
+      }),
+    };
   }
 
   private toPublic(bot: Bot, withMessages: boolean): PublicBot {
