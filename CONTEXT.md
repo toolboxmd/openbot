@@ -5,8 +5,23 @@ Glossary only. No implementation.
 ## OpenBot
 Self-hosted Grok Bot. Named Bots on one Computer. MIT. Repo `toolboxmd/openbot`.
 
+## Home
+The private OpenBot state tree. It contains durable Talk state and the shared Workspace. A wipe of Home is the wipe. Bots do not receive Home itself.
+
+## Workspace
+Files shared by every Bot on one Computer. Workspace is inside Home but is distinct from Talk's private state.
+
+## Channel
+A persistent conversation with members. A direct Channel is you plus one Bot and is born with that Bot. Group and Bot-to-Bot are other Channel kinds. The Channel owns its Transcript. The Bot owns its Harness.
+
+## Transcript
+The human-facing messages, Cards, receipts, replies, reactions, and attachments in a Channel. Harness logs are not the Transcript.
+
+## Session
+One live Harness conversation for one Bot in one Channel. A Bot may run several Sessions at once.
+
 ## Computer
-One Linux desktop per instance (one Docker Screen container). Shared files and browser cookie jar. Not a security boundary per Bot. Harness CLI logins live on the host OS, not inside Screen. The Computer pane is always a live desktop. It is never a down / "Screen is down" gate.
+One Linux desktop per instance (one Docker Screen container). Shared workspace and browser cookie jar. Not a security boundary per Bot. Harness CLI logins live on the host OS, not inside Screen. The Computer pane is always a live desktop. It is never a down / "Screen is down" gate.
 
 ## Bot
 A named teammate with a profile (name, title, description, Eyes, Harness) and its own Screen (a display on the Computer). Persistent.
@@ -21,13 +36,13 @@ A Bot the user is talking to. RAM and CPU count per Computer plus per lit displa
 Not a user-visible down pane. Do not docker-stop the Computer. Displays stay lit. The Computer stays up.
 
 ## Harness
-The coding agent CLI already on the host OS (Codex, Claude Code, Grok Build, or Kimi Code) over ACP. The picker shows what is on PATH. The process runs beside Screen, not inside XFCE. The user does not watch its terminal. Files are a host folder also mounted on Screen. Vendor login is that host CLI home. Zoom (not a Takeover button) is for site 2FA. Zoom SIGSTOPs that Bot's ACP child so two pointers do not fight.
+The coding agent CLI already on the host OS (Codex, Claude Code, Grok Build, or Kimi Code) over ACP. The picker shows what is on PATH. The process runs beside Screen, not inside XFCE. The user does not watch its terminal. Files are the shared workspace also mounted on Screen. Vendor login is that host CLI home. Zoom (not a Takeover button) is for site 2FA. Zoom does not pause Sessions. Ask the Bot to stop if two pointers fight.
 
 ## PinchTab
 Headed Chrome driver on the Screen's DISPLAY. Default browser hands. Not Playwright.
 
 ## Takeover
-There is no Takeover button on the Computer pane. Zooming or opening the Computer preview is already write. In chat, a needs-you Computer card says it needs you; its action is **Open computer** (same as zoom). Not a second mode. User drives the Screen for password, 2FA, captcha, or payment. Never paste secrets in chat. Not used for Harness CLI login.
+There is no Takeover button on the Computer pane. Zooming or opening the Computer preview is already write and does not pause Sessions. In chat, a needs-you Computer card says it needs you; its action is **Open computer** (same as zoom). Not a second mode. User drives the Screen for password, 2FA, captcha, or payment. Never paste secrets in chat. Not used for Harness CLI login.
 
 ## Open computer
 The primary action on a needs-you Computer card. Opens that Bot's Computer (already write). Same as clicking the preview.
