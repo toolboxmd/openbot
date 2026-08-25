@@ -95,6 +95,7 @@ export function applyVendorHomeEnv(
   env: NodeJS.ProcessEnv,
   mode: ConfigMode,
   homeDir: string,
+  botHome?: string,
 ): NodeJS.ProcessEnv {
   const next = { ...env };
   for (const id of HARNESS_IDS) {
@@ -102,6 +103,7 @@ export function applyVendorHomeEnv(
     if (mode === "isolated") next[key] = vendorDir(homeDir, id);
     else delete next[key];
   }
+  if (mode === "isolated" && botHome) next.HOME = path.resolve(botHome);
   return next;
 }
 

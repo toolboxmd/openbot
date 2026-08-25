@@ -39,10 +39,10 @@ Not a user-visible down pane. Do not docker-stop the Computer. Displays stay lit
 The coding agent CLI already on the host OS (Codex, Claude Code, Grok Build, or Kimi Code) over ACP. The picker shows what is on PATH. The process runs beside Screen, not inside XFCE. The user does not watch its terminal. Session cwd is that Bot's directory under Workspace. Vendor login is reused from the host CLI (auth file or keychain symlink only). Config mode is Isolated or Host. Zoom (not a Takeover button) is for site 2FA. Zoom does not pause Sessions. Ask the Bot to stop if two pointers fight.
 
 ## Isolated
-Config mode. Talk sets the vendor home env (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `GROK_HOME`, `KIMI_CODE_HOME`) to Harness Home on the Computer. The Bot does not load the user's global AGENTS.md, hooks, plugins, or MCP. Auth is still the host login. Computer default. Override per Bot.
+Config mode. Talk sets the vendor home env (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `GROK_HOME`, `KIMI_CODE_HOME`) to Harness Home on the Computer. Unix ~ is This Bot's directory. The Bot does not load the user's global AGENTS.md, hooks, plugins, MCP, or the host `$HOME/.agents`. Auth is still the host login. Computer default. Override per Bot.
 
 ## Host
-Config mode. Unset those env vars. The Harness uses the user's real `~/.codex` (and friends). `OPENBOT.md` is not injected. Workspace AGENTS.md files still load because they live in cwd.
+Config mode. Unset those env vars. Unix ~ is the host home. The Harness uses the user's real `~/.codex` (and friends). `OPENBOT.md` is not injected. Workspace AGENTS.md files still load because they live in cwd.
 
 ## Harness Home
 On the Computer, not inside `~/.codex`. One vendor dir each (`harness/codex`, `claude`, `grok`, `kimi`) plus Computer `shared/` (skills, plugins, hook scripts). Isolated homes keep native `config.toml` / Claude `settings.json`. Shared content is a symlink into `shared/`. Do not symlink auth, sessions, or logs. Auth is a host-login symlink. Only link the vendor filename that Harness reads (Grok gets `AGENTS.md` only, not also `CLAUDE.md`).
