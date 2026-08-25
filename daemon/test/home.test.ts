@@ -303,6 +303,36 @@ describe("HomeStore sqlite", () => {
     assert.equal(messages[0]?.receipt, "sent");
     again.close();
   });
+
+  test("setSessionId persists on bot_channel_state and setHarness NULLs it", async () => {
+    const homeDir = await tempHome();
+    const adaId = crypto.randomUUID();
+    const channelId = crypto.randomUUID();
+    const home = new HomeStore(homeDir);
+    home.createBot(
+      {
+        id: adaId,
+        name: "Ada",
+        color: "#ff3b5c",
+        shape: "capsule",
+        harness: null,
+        createdAt: iso(),
+      },
+      channelId,
+    );
+    assert.equal(home.getSessionId(adaId, channelId), null);
+    home.setSessionId(adaId, channelId, "sess_abc");
+    assert.equal(home.getSessionId(adaId, channelId), "sess_abc");
+    home.setHarness(adaId, "codex");
+    assert.equal(home.getSessionId(adaId, channelId), null);
+    home.setSessionId(adaId, channelId, "sess_again");
+    home.close();
+    home.setSessionId(adaId, channelId, "sess_after_close");
+
+    const again = new HomeStore(homeDir);
+    assert.equal(again.getSessionId(adaId, channelId), "sess_again");
+    again.close();
+  });
 });
 
 describe("channelHistory and talkPrompt", () => {
@@ -346,6 +376,50 @@ describe("channelHistory and talkPrompt", () => {
   });
 });
 
+
+type FakeAcpLoad = "ok" | "throw" | "missing";
+
+function trackingFakeAcp(opts: { load?: FakeAcpLoad } = {}) {
+  const methods: string[] = [];
+  const prompts: string[] = [];
+  const loaded: string[] = [];
+  let nextId = 1;
+
+  function spawnAcp(_spec: SpawnSpec, _cwd: string): AcpSession {
+    const session: AcpSession = {
+      close() {},
+      async initialize() {
+        methods.push("initialize");
+        return {};
+      },
+      async newSession() {
+        methods.push("session/new");
+        const id = `s${nextId}`;
+        nextId += 1;
+        return id;
+      },
+      async prompt(text: string) {
+        methods.push("session/prompt");
+        prompts.push(text);
+        return "ok";
+      },
+      cancel() {},
+      respondPermission() {},
+    };
+    if (opts.load !== "missing") {
+      session.loadSession = async (sessionId: string) => {
+        methods.push("session/load");
+        loaded.push(sessionId);
+        if (opts.load === "throw") throw new Error("no such session");
+        return sessionId;
+      };
+    }
+    return session;
+  }
+
+  return { methods, prompts, loaded, spawnAcp };
+}
+
 describe("BotStore sqlite is the only Transcript", () => {
   test("create does not write bots.json", async () => {
     const homeDir = await tempHome();
@@ -380,58 +454,188 @@ describe("BotStore sqlite is the only Transcript", () => {
     store.close();
   });
 
-  test("next send after restart uses session/new + inject, not session/load", async () => {
+  test("after send, sqlite session_id is the id returned by session/new", async () => {
     const homeDir = await tempHome();
-    const methods: string[] = [];
-    const prompts: string[] = [];
+    const fake = trackingFakeAcp();
+    const store = new BotStore(homeDir, {
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: fake.spawnAcp,
+    });
+    const ada = await store.create("Ada");
+    await store.pickHarness(ada.id, "codex");
+    await store.send(ada.id, "remember LIVE-ORBIT-1");
+    await waitUntil(() => fake.methods.includes("session/prompt"));
+    store.close();
 
-    function spawnAcp(_spec: SpawnSpec, _cwd: string): AcpSession {
-      return {
-        close() {},
-        async initialize() {
-          methods.push("initialize");
-          return {};
-        },
-        async newSession() {
-          methods.push("session/new");
-          return "s1";
-        },
-        async prompt(text: string) {
-          methods.push("session/prompt");
-          prompts.push(text);
-          return "ok";
-        },
-        cancel() {},
-        respondPermission() {},
-      };
-    }
+    const home = new HomeStore(homeDir);
+    const channelId = home.directChannelId(ada.id);
+    assert.ok(channelId);
+    assert.equal(home.getSessionId(ada.id, channelId), "s1");
+    home.close();
+  });
 
+  test("restart send uses session/load and does not inject Channel history", async () => {
+    const homeDir = await tempHome();
+    const fake = trackingFakeAcp();
     const first = new BotStore(homeDir, {
       listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
-      spawnAcp,
+      spawnAcp: fake.spawnAcp,
     });
     const ada = await first.create("Ada");
     await first.pickHarness(ada.id, "codex");
     assert.equal(first.hasAcpChild(ada.id), false, "pickHarness must not spawn until send");
     await first.send(ada.id, "remember LIVE-ORBIT-1");
-    await waitUntil(() => methods.includes("session/prompt"));
+    await waitUntil(() => fake.methods.includes("session/prompt"));
     first.close();
 
-    assert.ok(methods.includes("session/new"));
-    assert.equal(methods.includes("session/load"), false);
-
-    methods.length = 0;
-    prompts.length = 0;
+    fake.methods.length = 0;
+    fake.prompts.length = 0;
+    fake.loaded.length = 0;
     const again = new BotStore(homeDir, {
       listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
-      spawnAcp,
+      spawnAcp: fake.spawnAcp,
     });
     await again.send(ada.id, "LIVE-AGAIN-1");
-    await waitUntil(() => methods.includes("session/prompt") && prompts.length > 0);
-    assert.ok(methods.includes("session/new"));
-    assert.equal(methods.includes("session/load"), false);
-    assert.ok(prompts.some((text) => text.includes("LIVE-ORBIT-1")));
-    assert.ok(prompts.some((text) => /New message from You:\nLIVE-AGAIN-1/.test(text)));
+    await waitUntil(() => fake.methods.includes("session/prompt") && fake.prompts.length > 0);
+    assert.deepEqual(fake.loaded, ["s1"]);
+    assert.ok(fake.methods.includes("session/load"));
+    assert.equal(fake.methods.includes("session/new"), false);
+    assert.ok(fake.prompts.some((text) => /New message from You:\nLIVE-AGAIN-1/.test(text)));
+    assert.equal(
+      fake.prompts.some((text) => text.includes("LIVE-ORBIT-1") || text.includes("Recent Channel transcript")),
+      false,
+      "successful session/load must not inject Channel history",
+    );
+    again.close();
+  });
+
+  test("if session/load rejects, next send is session/new plus last-20 inject", async () => {
+    const homeDir = await tempHome();
+    const fake = trackingFakeAcp({ load: "throw" });
+    const first = new BotStore(homeDir, {
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: fake.spawnAcp,
+    });
+    const ada = await first.create("Ada");
+    await first.pickHarness(ada.id, "codex");
+    await first.send(ada.id, "remember LIVE-ORBIT-1");
+    await waitUntil(() => fake.methods.includes("session/prompt"));
+    first.close();
+
+    fake.methods.length = 0;
+    fake.prompts.length = 0;
+    const again = new BotStore(homeDir, {
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: fake.spawnAcp,
+    });
+    await again.send(ada.id, "LIVE-AGAIN-1");
+    await waitUntil(() => fake.methods.includes("session/prompt") && fake.prompts.length > 0);
+    assert.ok(fake.methods.includes("session/load"));
+    assert.ok(fake.methods.includes("session/new"));
+    assert.ok(fake.prompts.some((text) => text.includes("LIVE-ORBIT-1")));
+    assert.ok(fake.prompts.some((text) => /New message from You:\nLIVE-AGAIN-1/.test(text)));
+    const home = new HomeStore(homeDir);
+    const channelId = home.directChannelId(ada.id);
+    assert.ok(channelId);
+    assert.equal(home.getSessionId(ada.id, channelId), "s2");
+    home.close();
+    again.close();
+  });
+
+  test("pickHarness harness change clears session_id; next send never loads the old id", async () => {
+    const homeDir = await tempHome();
+    const fake = trackingFakeAcp();
+    const first = new BotStore(homeDir, {
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: fake.spawnAcp,
+    });
+    const ada = await first.create("Ada");
+    await first.pickHarness(ada.id, "codex");
+    await first.send(ada.id, "remember LIVE-ORBIT-1");
+    await waitUntil(() => fake.methods.includes("session/prompt"));
+    first.close();
+
+    const home = new HomeStore(homeDir);
+    const channelId = home.directChannelId(ada.id);
+    assert.ok(channelId);
+    assert.equal(home.getSessionId(ada.id, channelId), "s1");
+    home.setHarness(ada.id, "grok");
+    assert.equal(home.getSessionId(ada.id, channelId), null);
+    home.setHarness(ada.id, "codex");
+    assert.equal(home.getSessionId(ada.id, channelId), null);
+    home.close();
+
+    fake.methods.length = 0;
+    fake.prompts.length = 0;
+    fake.loaded.length = 0;
+    const again = new BotStore(homeDir, {
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: fake.spawnAcp,
+    });
+    await again.send(ada.id, "LIVE-AGAIN-1");
+    await waitUntil(() => fake.methods.includes("session/prompt") && fake.prompts.length > 0);
+    assert.equal(fake.methods.includes("session/load"), false);
+    assert.deepEqual(fake.loaded, []);
+    assert.ok(fake.methods.includes("session/new"));
+    assert.ok(fake.prompts.some((text) => text.includes("LIVE-ORBIT-1")));
+    again.close();
+  });
+
+  test("cross-Harness leftover session_id is never loaded", async () => {
+    const homeDir = await tempHome();
+    const fake = trackingFakeAcp();
+    const first = new BotStore(homeDir, {
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: fake.spawnAcp,
+    });
+    const ada = await first.create("Ada");
+    await first.pickHarness(ada.id, "codex");
+    await first.send(ada.id, "remember LIVE-ORBIT-1");
+    await waitUntil(() => fake.methods.includes("session/prompt"));
+    first.close();
+
+    const db = new DatabaseSync(join(homeDir, "talk.sqlite"));
+    db.prepare("UPDATE bot_channel_state SET harness_id = 'grok' WHERE bot_id = ?").run(ada.id);
+    db.close();
+
+    fake.methods.length = 0;
+    fake.loaded.length = 0;
+    const again = new BotStore(homeDir, {
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: fake.spawnAcp,
+    });
+    await again.send(ada.id, "LIVE-AGAIN-1");
+    await waitUntil(() => fake.methods.includes("session/prompt"));
+    assert.equal(fake.methods.includes("session/load"), false);
+    assert.deepEqual(fake.loaded, []);
+    assert.ok(fake.methods.includes("session/new"));
+    again.close();
+  });
+
+  test("fake without loadSession falls back to session/new + inject", async () => {
+    const homeDir = await tempHome();
+    const fake = trackingFakeAcp({ load: "missing" });
+    const first = new BotStore(homeDir, {
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: fake.spawnAcp,
+    });
+    const ada = await first.create("Ada");
+    await first.pickHarness(ada.id, "codex");
+    await first.send(ada.id, "remember LIVE-ORBIT-1");
+    await waitUntil(() => fake.methods.includes("session/prompt"));
+    first.close();
+
+    fake.methods.length = 0;
+    fake.prompts.length = 0;
+    const again = new BotStore(homeDir, {
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: fake.spawnAcp,
+    });
+    await again.send(ada.id, "LIVE-AGAIN-1");
+    await waitUntil(() => fake.methods.includes("session/prompt") && fake.prompts.length > 0);
+    assert.equal(fake.methods.includes("session/load"), false);
+    assert.ok(fake.methods.includes("session/new"));
+    assert.ok(fake.prompts.some((text) => text.includes("LIVE-ORBIT-1")));
     again.close();
   });
 });
