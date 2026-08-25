@@ -94,7 +94,7 @@ describe("Zoom HTTP seam",
       const addr = stub.address();
       if (!addr || typeof addr === "string") throw new Error("stub failed to bind");
       const upstream = `http://127.0.0.1:${addr.port}`;
-      const workspace = await tempDir("openbot-zoom-ws-");
+      const homeDir = await tempDir("openbot-zoom-home-");
       const cookiesDir = join(await tempDir("openbot-zoom-cookies-"), "cookies");
       await mkdir(cookiesDir, { recursive: true });
       computer = new MemoryComputerRuntime({
@@ -106,7 +106,7 @@ describe("Zoom HTTP seam",
         pwaDir: await emptyPwa(),
         host: "127.0.0.1",
         port: 0,
-        workspaceDir: workspace,
+        homeDir,
         computer,
         kasmUser: KASM_USER,
         kasmPassword: KASM_PASSWORD,
@@ -180,12 +180,12 @@ describe("Zoom HTTP seam",
       const listBody = (await listed.json()) as { bots: Array<{ id: string; write?: boolean; zoom?: boolean }> };
       const adaRow = listBody.bots.find((bot) => bot.id === adaId);
       assert.ok(adaRow);
-      assert.equal(adaRow.write, true, "GET /api/bots must not keep Takeover write:false while zoomed");
+      assert.equal(adaRow.write, false, "GET /api/bots write is Session Working, not Screen zoom");
       assert.equal(adaRow.zoom, true);
 
       const adaGet = await fetch(`${box.url}/api/bots/${adaId}`, { headers: { cookie } });
       const adaBody = (await adaGet.json()) as { write?: boolean; zoom?: boolean };
-      assert.equal(adaBody.write, true);
+      assert.equal(adaBody.write, false);
       assert.equal(adaBody.zoom, true);
 
       kasmWrites = [];
@@ -213,8 +213,8 @@ describe("Zoom HTTP seam",
   },
 );
 
-describe("Zoom pauses ACP child (injected spawn, no fake production ACP)", () => {
-  test("zoom pauses, unzoom resumes, send is 409 while zoomed", async () => {
+describe("Zoom does not pause Sessions", () => {
+  test("zoom does not SIGSTOP, and send is not 409 while zoomed", async () => {
     const dir = await tempDir("openbot-zoom-acp-");
     const screens = new MemoryComputerRuntime({ cookiesDir: join(dir, "cookies") });
     const events: string[] = [];
@@ -224,12 +224,6 @@ describe("Zoom pauses ACP child (injected spawn, no fake production ACP)", () =>
       spawnAcp: () => ({
         close() {
           events.push("close");
-        },
-        pause() {
-          events.push("pause");
-        },
-        resume() {
-          events.push("resume");
         },
         async initialize() {
           return {};
@@ -246,15 +240,16 @@ describe("Zoom pauses ACP child (injected spawn, no fake production ACP)", () =>
     });
     const ada = await store.create("Ada");
     await store.pickHarness(ada.id, "codex");
-    assert.equal(store.hasAcpChild(ada.id), true);
     store.zoom(ada.id);
-    assert.ok(events.includes("pause"));
-    await assert.rejects(() => store.send(ada.id, "hello"), (err: Error & { status?: number }) => {
-      assert.equal(err.status, 409);
-      return /zoom/i.test(err.message);
-    });
+    const zoomed = store.get(ada.id);
+    assert.equal(zoomed?.zoom, true);
+    assert.equal(zoomed?.write, false);
+    assert.equal(events.includes("pause"), false);
+    const sent = await store.send(ada.id, "hello");
+    assert.equal(sent.write, true);
+    assert.equal(sent.zoom, true);
     store.unzoom(ada.id);
-    assert.ok(events.includes("resume"));
+    assert.equal(events.includes("resume"), false);
     store.close();
   });
 });

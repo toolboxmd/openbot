@@ -105,13 +105,13 @@ async function emptyPwa(): Promise<string> {
 }
 
 async function startTalk(spawnAcp: ReturnType<typeof gatedFakeAcp>["spawnAcp"]): Promise<RunningBox> {
-  const workspaceDir = await mkdtemp(join(tmpdir(), "openbot-ws-"));
+  const homeDir = await mkdtemp(join(tmpdir(), "openbot-ws-"));
   return startBox({
     password: PASSWORD,
     pwaDir: await emptyPwa(),
     host: "127.0.0.1",
     port: 0,
-    workspaceDir,
+    homeDir,
     listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
     spawnAcp,
   });

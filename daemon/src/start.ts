@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pickScreenPorts } from "./computer.ts";
+import { defaultHomeDir, defaultWorkspaceDir } from "./home.ts";
 import { superviseTalk, type SupervisedChild } from "./supervise.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -11,6 +12,9 @@ if (!process.env.OPENBOT_PASSWORD) {
   console.error("OPENBOT_PASSWORD is required");
   process.exit(1);
 }
+
+process.env.OPENBOT_HOME ??= defaultHomeDir();
+process.env.OPENBOT_WORKSPACE ??= defaultWorkspaceDir(process.env.OPENBOT_HOME);
 
 function composeUp(service: string, env: NodeJS.ProcessEnv): Promise<void> {
   return new Promise((resolve, reject) => {

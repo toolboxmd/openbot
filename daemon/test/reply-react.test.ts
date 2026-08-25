@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
@@ -116,13 +116,13 @@ async function emptyPwa(): Promise<string> {
   return pwaDir;
 }
 
-async function startTalk(spawnAcp: ReturnType<typeof gatedFakeAcp>["spawnAcp"], workspaceDir: string): Promise<RunningBox> {
+async function startTalk(spawnAcp: ReturnType<typeof gatedFakeAcp>["spawnAcp"], homeDir: string): Promise<RunningBox> {
   return startBox({
     password: PASSWORD,
     pwaDir: await emptyPwa(),
     host: "127.0.0.1",
     port: 0,
-    workspaceDir,
+    homeDir,
     listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
     spawnAcp,
   });
@@ -175,17 +175,18 @@ async function releaseTurn(gate: Gate): Promise<void> {
 }
 
 async function openTalk() {
-  const workspaceDir = await mkdtemp(join(tmpdir(), "openbot-ws-"));
+  const homeDir = await mkdtemp(join(tmpdir(), "openbot-ws-"));
   const fake = gatedFakeAcp();
-  const box = await startTalk(fake.spawnAcp, workspaceDir);
+  const box = await startTalk(fake.spawnAcp, homeDir);
   const cookie = await login(box.url);
   const id = await createTalkBot(box.url, cookie);
-  return { box, fake, cookie, id, workspaceDir };
+  return { box, fake, cookie, id, homeDir };
 }
 
 describe("Talk HTTP reply and react", () => {
-  test("replyTo nests on the user bubble, keeps receipts, and survives GET plus bots.json", async () => {
-    const { box, fake, cookie, id, workspaceDir } = await openTalk();
+  test("replyTo nests on the user bubble, keeps receipts, and survives GET plus Talk restart", async () => {
+    const opened = await openTalk();
+    let { box, fake, cookie, id, homeDir } = opened;
     try {
       const first = fake.arm();
       const posted = await fetch(`${box.url}/api/bots/${id}/messages`, {
@@ -246,18 +247,20 @@ describe("Talk HTTP reply and react", () => {
       assert.equal(still?.replyTo, target.id, "GET bot after refresh must keep replyTo");
       assert.equal(still?.receipt, "read");
 
-      const saved = JSON.parse(await readFile(join(workspaceDir, "bots.json"), "utf8")) as {
-        bots?: Array<{ messages?: PublicMessage[] }>;
-      };
-      const persisted = (saved.bots ?? []).flatMap((bot) => bot.messages ?? []).find((m) => m.id === userReply.id);
-      assert.equal(persisted?.replyTo, target.id, "bots.json must persist replyTo with the Bot");
+      await box.close();
+      box = await startTalk(fake.spawnAcp, homeDir);
+      const cookie2 = await login(box.url);
+      const restored = await getBot(box.url, cookie2, id);
+      const persisted = (restored.messages ?? []).find((m) => m.id === userReply.id);
+      assert.equal(persisted?.replyTo, target.id, "Talk restart must persist replyTo with the Channel");
     } finally {
       await box.close();
     }
   });
 
   test("emoji tapback toggles on the bubble, is not a new message, and persists", async () => {
-    const { box, fake, cookie, id, workspaceDir } = await openTalk();
+    const opened = await openTalk();
+    let { box, fake, cookie, id, homeDir } = opened;
     try {
       const first = fake.arm();
       const posted = await fetch(`${box.url}/api/bots/${id}/messages`, {
@@ -294,11 +297,14 @@ describe("Talk HTTP reply and react", () => {
         "GET bot after refresh must keep the tapback",
       );
 
-      const saved = JSON.parse(await readFile(join(workspaceDir, "bots.json"), "utf8")) as {
-        bots?: Array<{ messages?: PublicMessage[] }>;
-      };
-      const persisted = (saved.bots ?? []).flatMap((bot) => bot.messages ?? []).find((m) => m.id === target.id);
-      assert.deepEqual(persisted?.reactions, [{ emoji: "❤️", by: "user" }]);
+      await box.close();
+      box = await startTalk(fake.spawnAcp, homeDir);
+      cookie = await login(box.url);
+      const restored = await getBot(box.url, cookie, id);
+      assert.deepEqual(
+        (restored.messages ?? []).find((m) => m.id === target.id)?.reactions,
+        [{ emoji: "❤️", by: "user" }],
+      );
 
       const thumbs = await fetch(`${box.url}/api/bots/${id}/messages/${target.id}/reactions`, {
         method: "POST",

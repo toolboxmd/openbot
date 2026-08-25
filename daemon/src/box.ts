@@ -1,9 +1,11 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import path from "node:path";
-import { BotStore, defaultWorkspaceDir, type BotStoreDeps } from "./bots.ts";
+import { BotStore, type BotStoreDeps } from "./bots.ts";
+import { defaultHomeDir, defaultWorkspaceDir } from "./home.ts";
 import { NoopComputerRuntime, type ComputerRuntime } from "./computer.ts";
 import { kasmUpdateWrite } from "./kasm.ts";
 
@@ -15,6 +17,7 @@ export type BoxOptions = {
   screenUpstream?: string;
   kasmUser?: string;
   kasmPassword?: string;
+  homeDir?: string;
   workspaceDir?: string;
   computer?: ComputerRuntime;
 } & Pick<BotStoreDeps, "spawnAcp" | "listHarnesses">;
@@ -390,11 +393,16 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
   const auth = kasmAuthorization(options);
   const computer: ComputerRuntime =
     options.computer ?? new NoopComputerRuntime(undefined, options.screenUpstream);
-  const store = new BotStore(options.workspaceDir ?? defaultWorkspaceDir(), {
+  const homeDir = path.resolve(options.homeDir ?? defaultHomeDir());
+  const workspaceDir = path.resolve(options.workspaceDir ?? defaultWorkspaceDir(homeDir));
+  fsSync.mkdirSync(workspaceDir, { recursive: true });
+  const store = new BotStore(homeDir, {
     computer,
     spawnAcp: options.spawnAcp,
     listHarnesses: options.listHarnesses,
+    workspaceDir,
   });
+  await store.reattachDisplays();
 
   function upstreamFor(botId: string | null): string | undefined {
     if (botId && computer.upstream(botId)) return computer.upstream(botId);
