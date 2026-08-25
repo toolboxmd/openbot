@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { isCancelled, shouldStartBubble } from "../src/acp.ts";
+import { AcpClient, isCancelled, shouldStartBubble } from "../src/acp.ts";
 import { capTalkBubble, talkPrompt } from "../src/bots.ts";
 
 test("talkPrompt prefixes Talk voice and keeps the user line", () => {
@@ -45,4 +45,9 @@ test("shouldStartBubble: a present id starts when it differs from the open one",
   assert.equal(shouldStartBubble(null, "item-1"), true);
   assert.equal(shouldStartBubble("item-1", "item-1"), false);
   assert.equal(shouldStartBubble("item-1", "item-2"), true);
+});
+
+test("AcpClient implements session/load even if AcpSession.loadSession is optional", () => {
+  assert.equal(typeof AcpClient.prototype.loadSession, "function");
+  assert.equal(typeof AcpClient.prototype.resumeSession, "function");
 });
