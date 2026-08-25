@@ -535,7 +535,7 @@ export class BotStore {
     const cwd = ensureBotWorkspace(this.workspaceDir, bot.id);
     let spec: SpawnSpec;
     try {
-      spec = spawnSpec(harness, { mode: bot.configMode, homeDir: this.home.homeDir });
+      spec = spawnSpec(harness, { mode: bot.configMode, homeDir: this.home.homeDir, cwd });
     } catch (err) {
       if (this.spawnAcpFn === spawnAcp) {
         bot.eyesMode = "needs-you";
@@ -545,7 +545,7 @@ export class BotStore {
       spec = {
         command: "injected-acp",
         args: [],
-        env: spawnSpecEnvFallback(bot.configMode, this.home.homeDir),
+        env: spawnSpecEnvFallback(bot.configMode, this.home.homeDir, cwd),
       };
     }
 
@@ -822,8 +822,8 @@ export function capTalkBubble(text: string): string {
   return `${cut.length >= Math.floor(limit * 0.6) ? cut : slice}…`;
 }
 
-function spawnSpecEnvFallback(mode: ConfigMode, homeDir: string): NodeJS.ProcessEnv {
-  return applyVendorHomeEnv({ ...process.env }, mode, homeDir);
+function spawnSpecEnvFallback(mode: ConfigMode, homeDir: string, botHome: string): NodeJS.ProcessEnv {
+  return applyVendorHomeEnv({ ...process.env }, mode, homeDir, botHome);
 }
 
 function nowIso(): string {
