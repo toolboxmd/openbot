@@ -93,6 +93,37 @@ async function pollIdle(url: string, cookie: string, botId: string, timeoutMs = 
   throw new Error("timed out waiting for the Turn to go idle");
 }
 
+async function createAda(url: string, cookie: string): Promise<string> {
+  const created = await fetch(`${url}/api/bots`, {
+    method: "POST",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify({ name: "Ada" }),
+  });
+  const createdBody = await created.text();
+  assert.equal(created.status, 201, `create Ada failed: ${created.status} ${createdBody}`);
+  const ada = JSON.parse(createdBody) as { id: string };
+  const picked = await fetch(`${url}/api/bots/${ada.id}`, {
+    method: "PATCH",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify({ harness: "codex" }),
+  });
+  const pickedBody = await picked.text();
+  assert.ok(picked.ok, `pick harness failed: ${picked.status} ${pickedBody}`);
+  return ada.id;
+}
+
+async function postText(url: string, cookie: string, botId: string, text: string): Promise<void> {
+  const posted = await fetch(`${url}/api/bots/${botId}/messages`, {
+    method: "POST",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  const postedBody = await posted.text();
+  if (!posted.ok) {
+    assert.fail(`POST messages failed: ${posted.status} ${postedBody}`);
+  }
+}
+
 async function openBox(homeDir: string): Promise<RunningBox> {
   return startBox({
     password: PASSWORD,
@@ -107,45 +138,23 @@ const describeLive = liveCodexAvailable() ? describe : describe.skip;
 
 describeLive("Live Codex Talk HTTP", () => {
   test(
-    "restart restores the Channel and a second real Codex Turn still replies",
+    "after restart Ada replies with the first code",
     { timeout: 300_000 },
     async () => {
       const homeDir = await mkdtemp(join(tmpdir(), "openbot-live-home-"));
       const phrase = `LIVE-ORBIT-${Date.now()}`;
-      const followUp = `LIVE-AGAIN-${Date.now()}`;
+      const firstTurn = `Remember this code: ${phrase}. Reply with a short ack.`;
+      const followUp = "Reply with only the first code, nothing else.";
       let box = await openBox(homeDir);
       try {
         const cookie = await login(box.url);
-        const created = await fetch(`${box.url}/api/bots`, {
-          method: "POST",
-          headers: { cookie, "content-type": "application/json" },
-          body: JSON.stringify({ name: "Ada" }),
-        });
-        const createdBody = await created.text();
-        assert.equal(created.status, 201, `create Ada failed: ${created.status} ${createdBody}`);
-        const ada = JSON.parse(createdBody) as { id: string };
-        const picked = await fetch(`${box.url}/api/bots/${ada.id}`, {
-          method: "PATCH",
-          headers: { cookie, "content-type": "application/json" },
-          body: JSON.stringify({ harness: "codex" }),
-        });
-        const pickedBody = await picked.text();
-        assert.ok(picked.ok, `pick harness failed: ${picked.status} ${pickedBody}`);
+        const adaId = await createAda(box.url, cookie);
+        await postText(box.url, cookie, adaId, firstTurn);
 
-        const posted = await fetch(`${box.url}/api/bots/${ada.id}/messages`, {
-          method: "POST",
-          headers: { cookie, "content-type": "application/json" },
-          body: JSON.stringify({ text: phrase }),
-        });
-        const postedBody = await posted.text();
-        if (!posted.ok) {
-          assert.fail(`POST messages failed: ${posted.status} ${postedBody}`);
-        }
-
-        const first = await pollAssistant(box.url, cookie, ada.id, 1);
-        assert.ok(first.some((message) => message.role === "user" && message.text === phrase));
+        const first = await pollAssistant(box.url, cookie, adaId, 1);
+        assert.ok(first.some((message) => message.role === "user" && message.text.includes(phrase)));
         assert.ok(first.some((message) => message.role === "assistant" && message.text));
-        await pollIdle(box.url, cookie, ada.id);
+        await pollIdle(box.url, cookie, adaId);
 
         assert.equal(existsSync(join(homeDir, "talk.sqlite")), true);
         assert.equal(existsSync(join(defaultWorkspaceDir(homeDir), "talk.sqlite")), false);
@@ -154,9 +163,9 @@ describeLive("Live Codex Talk HTTP", () => {
         await box.close();
         box = await openBox(homeDir);
         const cookie2 = await login(box.url);
-        const restored = await getMessages(box.url, cookie2, ada.id);
+        const restored = await getMessages(box.url, cookie2, adaId);
         assert.ok(
-          restored.some((message) => message.role === "user" && message.text === phrase),
+          restored.some((message) => message.role === "user" && message.text.includes(phrase)),
           "user bubble must survive Talk restart",
         );
         assert.ok(
@@ -165,22 +174,59 @@ describeLive("Live Codex Talk HTTP", () => {
         );
         const assistantCount = restored.filter((message) => message.role === "assistant" && message.text).length;
 
-        const second = await fetch(`${box.url}/api/bots/${ada.id}/messages`, {
-          method: "POST",
-          headers: { cookie: cookie2, "content-type": "application/json" },
-          body: JSON.stringify({ text: followUp }),
-        });
-        const secondBody = await second.text();
-        if (!second.ok) {
-          assert.fail(`second POST messages failed: ${second.status} ${secondBody}`);
-        }
-        const after = await pollAssistant(box.url, cookie2, ada.id, assistantCount + 1);
+        await postText(box.url, cookie2, adaId, followUp);
+        const after = await pollAssistant(box.url, cookie2, adaId, assistantCount + 1);
         assert.ok(after.some((message) => message.role === "user" && message.text === followUp));
+        const fresh = after
+          .filter((message) => message.role === "assistant" && message.text)
+          .slice(assistantCount);
         assert.ok(
-          after.filter((message) => message.role === "assistant" && message.text).length >= assistantCount + 1,
-          "second Turn must produce a new assistant bubble",
+          fresh.some((message) => message.text.includes(phrase)),
+          `second live reply must use the first code ${phrase}; got ${JSON.stringify(fresh)}`,
         );
-        await pollIdle(box.url, cookie2, ada.id);
+        await pollIdle(box.url, cookie2, adaId);
+      } finally {
+        await box.close();
+      }
+    },
+  );
+
+  test(
+    "Zoom does not pause a live Codex Session",
+    { timeout: 300_000 },
+    async () => {
+      const homeDir = await mkdtemp(join(tmpdir(), "openbot-live-zoom-"));
+      const box = await openBox(homeDir);
+      try {
+        const cookie = await login(box.url);
+        const adaId = await createAda(box.url, cookie);
+        await postText(box.url, cookie, adaId, "Reply with the word go.");
+        const first = await pollAssistant(box.url, cookie, adaId, 1);
+        const assistantCount = first.filter((message) => message.role === "assistant" && message.text).length;
+        await pollIdle(box.url, cookie, adaId);
+
+        const zoom = await fetch(`${box.url}/api/computer/zoom`, {
+          method: "POST",
+          headers: { cookie, "content-type": "application/json" },
+          body: JSON.stringify({ botId: adaId, zoom: true }),
+        });
+        const zoomBody = await zoom.text();
+        assert.equal(zoom.status, 200, `zoom failed: ${zoom.status} ${zoomBody}`);
+        const zoomed = JSON.parse(zoomBody) as { zoom?: boolean };
+        assert.equal(zoomed.zoom, true);
+
+        await postText(box.url, cookie, adaId, "Reply with the word zoomed.");
+        const after = await pollAssistant(box.url, cookie, adaId, assistantCount + 1);
+        const fresh = after
+          .filter((message) => message.role === "assistant" && message.text)
+          .slice(assistantCount);
+        assert.ok(fresh.length >= 1, "Session must still reply while Zoom is on");
+        await pollIdle(box.url, cookie, adaId);
+
+        const listed = await fetch(`${box.url}/api/bots/${adaId}`, { headers: { cookie } });
+        const bot = (await listed.json()) as { zoom?: boolean; write?: boolean };
+        assert.equal(bot.zoom, true);
+        assert.equal(bot.write, false);
       } finally {
         await box.close();
       }
