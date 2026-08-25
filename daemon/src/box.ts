@@ -507,6 +507,72 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         return;
       }
 
+      if (url.pathname === "/api/channels" && method === "GET") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        sendJson(res, 200, { channels: store.listChannels() });
+        return;
+      }
+
+      if (url.pathname === "/api/channels" && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        let body: Record<string, unknown> = {};
+        try {
+          const raw = await readBody(req);
+          body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        if (body.kind !== "group") {
+          sendJson(res, 400, { error: "kind must be group" });
+          return;
+        }
+        try {
+          const channel = store.createGroup({ title: body.title, botIds: body.botIds });
+          sendJson(res, 201, channel);
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
+      const channelMessagesMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/messages$/);
+      if (channelMessagesMatch && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        const channelId = decodeURIComponent(channelMessagesMatch[1]);
+        const channel = store.getChannel(channelId);
+        if (!channel) {
+          sendJson(res, 404, { error: "Channel not found" });
+          return;
+        }
+        sendJson(res, 400, { error: "send is not available in a group Channel" });
+        return;
+      }
+
+      const channelMatch = url.pathname.match(/^\/api\/channels\/([^/]+)$/);
+      if (channelMatch && method === "GET") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        const channel = store.getChannel(decodeURIComponent(channelMatch[1]));
+        if (!channel) {
+          sendJson(res, 404, { error: "Channel not found" });
+          return;
+        }
+        sendJson(res, 200, channel);
+        return;
+      }
+
       const reactionMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/messages\/([^/]+)\/reactions$/);
       if (reactionMatch && method === "POST") {
         if (!hasSession(req, key)) {
