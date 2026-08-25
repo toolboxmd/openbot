@@ -82,7 +82,7 @@ describe("Computer Screen HTTP", () => {
       screenUpstream: upstream,
       kasmUser: KASM_USER,
       kasmPassword: KASM_PASSWORD,
-      workspaceDir: await mkdtemp(join(tmpdir(), "openbot-screen-ws-")),
+      homeDir: await mkdtemp(join(tmpdir(), "openbot-screen-home-")),
       computer,
     });
     const cookie = await login(box.url);
@@ -237,6 +237,7 @@ describe("Computer Screen with an unreachable upstream", () => {
       pwaDir: await emptyPwa(),
       host: "127.0.0.1",
       port: 0,
+      homeDir: await mkdtemp(join(tmpdir(), "openbot-unreach-home-")),
       computer: new MemoryComputerRuntime({
         cookiesDir,
         upstreams: ["http://127.0.0.1:1"],
