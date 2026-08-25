@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { applyVendorHomeEnv } from "./harness-home.ts";
 
 export const HARNESS_IDS = ["codex", "claude", "grok", "kimi"] as const;
 export type HarnessId = (typeof HARNESS_IDS)[number];
@@ -80,27 +81,19 @@ export type SpawnMode = "isolated" | "host";
 export type SpawnSpecOptions = {
   mode?: SpawnMode;
   homeDir?: string;
+  cwd?: string;
 };
 
 export function spawnSpec(id: HarnessId, opts: SpawnSpecOptions = {}): SpawnSpec {
   if (id !== "codex") {
     throw new Error("Talk spawn is Codex-only in this slice");
   }
-  const env: NodeJS.ProcessEnv = { ...process.env };
+  let env: NodeJS.ProcessEnv = { ...process.env };
   env.PATH = pathWithLocalBin(env.PATH ?? "");
   delete env.DISPLAY;
   if (opts.homeDir) {
     const mode = opts.mode ?? "isolated";
-    const homes: Record<string, string> = {
-      CODEX_HOME: path.join(opts.homeDir, "harness", "codex"),
-      CLAUDE_CONFIG_DIR: path.join(opts.homeDir, "harness", "claude"),
-      GROK_HOME: path.join(opts.homeDir, "harness", "grok"),
-      KIMI_CODE_HOME: path.join(opts.homeDir, "harness", "kimi"),
-    };
-    for (const [key, value] of Object.entries(homes)) {
-      if (mode === "isolated") env[key] = value;
-      else delete env[key];
-    }
+    env = applyVendorHomeEnv(env, mode, opts.homeDir, opts.cwd);
   }
   const codex = resolveBin("codex");
   if (!codex) {
