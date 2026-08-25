@@ -22,6 +22,27 @@ import {
   type TranscriptMessage,
 } from "./home.ts";
 import {
+  botWorkspaceDir,
+  ensureBotWorkspace,
+  ensureHarnessHome,
+  extractPermissionPath,
+  isConfigMode,
+  isHostGrantAccess,
+  isHostGrantDuration,
+  isInsideWorkspace,
+  pickAllowOption,
+  pickRejectOption,
+  readAgentsFile,
+  requestedAccessFromKind,
+  thisBotAgentsPath,
+  writeAgentsFile,
+  allBotsAgentsPath,
+  applyVendorHomeEnv,
+  type ConfigMode,
+  type HostGrantAccess,
+  type HostGrantDuration,
+} from "./harness-home.ts";
+import {
   isAuthError,
   isCancelled,
   spawnAcp,
@@ -36,16 +57,23 @@ export type { MessageReaction, MessageReceipt } from "./home.ts";
 
 export type PublicMessage = TranscriptMessage;
 
+export type PublicHostGrant = {
+  path: string;
+  requested: "read" | "read-write";
+};
+
 export type PublicPermission = {
   title: string;
   description?: string;
   options: Array<{ optionId: string; name: string; kind?: string }>;
+  hostGrant?: PublicHostGrant;
 };
 
 export type PublicBot = {
   id: string;
   name: string;
   harness: HarnessId | null;
+  configMode: ConfigMode;
   eyes: { color: string; shape: FaceShape; mode: EyesMode };
   write: boolean;
   zoom: boolean;
@@ -79,18 +107,21 @@ export type AcpSession = {
   respondPermission(rpcId: PermissionPrompt["rpcId"], optionId: string): void;
 };
 
+type BotPermission = PermissionPrompt & PublicPermission;
+
 type Bot = {
   id: string;
   name: string;
   color: string;
   shape: FaceShape;
   harness: HarnessId | null;
+  configMode: ConfigMode;
   write: boolean;
   zoom: boolean;
   display: DisplayHandle | null;
   eyesMode: EyesMode;
   needsYou: { reason: "login"; hint: string } | null;
-  permission: (PermissionPrompt & PublicPermission) | null;
+  permission: BotPermission | null;
   openAssistantId: string | null;
   activeUserId: string | null;
   turnSeq: number;
@@ -104,9 +135,11 @@ export type BotStoreDeps = {
   workspaceDir?: string;
 };
 
-function publicPermission(p: PermissionPrompt | null): PublicPermission | null {
+function publicPermission(p: BotPermission | null): PublicPermission | null {
   if (!p) return null;
-  return { title: p.title, description: p.description, options: p.options };
+  const out: PublicPermission = { title: p.title, description: p.description, options: p.options };
+  if (p.hostGrant) out.hostGrant = p.hostGrant;
+  return out;
 }
 
 export class BotStore {
@@ -117,6 +150,8 @@ export class BotStore {
   private readonly spawnAcpFn: (spec: SpawnSpec, cwd: string, handlers?: AcpHandlers) => AcpSession;
   private readonly listHarnessesFn: () => HarnessInfo[];
   private zoomedId: string | null = null;
+  private readonly spawnEnvs = new Map<string, NodeJS.ProcessEnv>();
+  private readonly spawnCwds = new Map<string, string>();
 
   constructor(homeDir: string, deps: BotStoreDeps = {}) {
     this.home = new HomeStore(homeDir);
@@ -125,6 +160,7 @@ export class BotStore {
     this.spawnAcpFn = deps.spawnAcp ?? spawnAcp;
     this.listHarnessesFn = deps.listHarnesses ?? listHarnessesOnPath;
     fs.mkdirSync(this.workspaceDir, { recursive: true });
+    ensureHarnessHome(this.home.homeDir, this.workspaceDir);
     this.load();
   }
 
@@ -220,10 +256,12 @@ export class BotStore {
       color: pickColor(trimmed),
       shape: pickShape(trimmed, taken),
       harness: null,
+      configMode: "isolated",
       createdAt: nowIso(),
     };
     const display = await this.computer.allocate(id);
     this.home.createBot(stored, crypto.randomUUID());
+    ensureBotWorkspace(this.workspaceDir, id);
     const bot = this.runtimeBot(stored, display);
     this.bots.set(id, bot);
     return this.toPublic(bot, true);
@@ -267,6 +305,59 @@ export class BotStore {
     bot.needsYou = null;
     bot.eyesMode = "idle";
     return this.toPublic(bot, true);
+  }
+
+  async setConfigMode(id: string, configMode: string): Promise<PublicBot> {
+    const bot = this.require(id);
+    if (!isConfigMode(configMode)) throw Object.assign(new Error("unknown config mode"), { status: 400 });
+    if (bot.configMode === configMode) return this.toPublic(bot, true);
+    this.home.setConfigMode(bot.id, configMode);
+    bot.client?.close();
+    bot.client = null;
+    bot.configMode = configMode;
+    bot.write = false;
+    bot.permission = null;
+    bot.needsYou = null;
+    bot.eyesMode = "idle";
+    return this.toPublic(bot, true);
+  }
+
+  readAllBotsAgents(): string {
+    return readAgentsFile(allBotsAgentsPath(this.workspaceDir));
+  }
+
+  writeAllBotsAgents(text: string): string {
+    writeAgentsFile(allBotsAgentsPath(this.workspaceDir), text);
+    return text;
+  }
+
+  readThisBotAgents(id: string): string {
+    this.require(id);
+    ensureBotWorkspace(this.workspaceDir, id);
+    return readAgentsFile(thisBotAgentsPath(this.workspaceDir, id));
+  }
+
+  writeThisBotAgents(id: string, text: string): string {
+    this.require(id);
+    ensureBotWorkspace(this.workspaceDir, id);
+    writeAgentsFile(thisBotAgentsPath(this.workspaceDir, id), text);
+    return text;
+  }
+
+  botCwd(id: string): string {
+    return botWorkspaceDir(this.workspaceDir, id);
+  }
+
+  lastSpawnEnv(id: string): NodeJS.ProcessEnv | null {
+    return this.spawnEnvs.get(id) ?? null;
+  }
+
+  lastSpawnCwd(id: string): string | null {
+    return this.spawnCwds.get(id) ?? null;
+  }
+
+  listHostGrants() {
+    return this.home.listHostGrants();
   }
 
   async send(id: string, text: string, replyTo?: string): Promise<PublicBot> {
@@ -369,8 +460,32 @@ export class BotStore {
     return this.toPublic(bot, true);
   }
 
+  answerHostGrant(id: string, access: string, duration: string): PublicBot {
+    const bot = this.require(id);
+    if (!bot.permission?.hostGrant || !bot.client) {
+      throw Object.assign(new Error("no Host grant prompt"), { status: 409 });
+    }
+    if (!isHostGrantAccess(access)) throw Object.assign(new Error("access is required"), { status: 400 });
+    if (!isHostGrantDuration(duration)) throw Object.assign(new Error("duration is required"), { status: 400 });
+    const requestPath = bot.permission.hostGrant.path;
+    const rpcId = bot.permission.rpcId;
+    const options = bot.permission.options;
+    const optionId =
+      access === "deny" ? pickRejectOption(options) : pickAllowOption(options);
+    if (!optionId) throw Object.assign(new Error("no matching permission option"), { status: 409 });
+    if (duration !== "once") {
+      this.home.addHostGrant({ path: requestPath, access, duration });
+    }
+    bot.permission = null;
+    bot.eyesMode = bot.write ? "write" : "idle";
+    bot.client.respondPermission(rpcId, optionId);
+    this.appendHostGrantCard(bot, requestPath, access, duration);
+    return this.toPublic(bot, true);
+  }
+
   private load(): void {
     for (const stored of this.home.listBots()) {
+      ensureBotWorkspace(this.workspaceDir, stored.id);
       this.bots.set(stored.id, this.runtimeBot(stored, null));
     }
   }
@@ -382,6 +497,7 @@ export class BotStore {
       color: stored.color,
       shape: stored.shape,
       harness: stored.harness,
+      configMode: stored.configMode ?? "isolated",
       write: false,
       zoom: false,
       display,
@@ -416,25 +532,30 @@ export class BotStore {
     const harness = bot.harness;
     if (!harness) throw Object.assign(new Error("pick a Harness first"), { status: 400 });
 
+    const cwd = ensureBotWorkspace(this.workspaceDir, bot.id);
     let spec: SpawnSpec;
     try {
-      spec = spawnSpec(harness);
+      spec = spawnSpec(harness, { mode: bot.configMode, homeDir: this.home.homeDir });
     } catch (err) {
       if (this.spawnAcpFn === spawnAcp) {
         bot.eyesMode = "needs-you";
         bot.needsYou = { reason: "login", hint: loginHint(harness) };
         throw Object.assign(err instanceof Error ? err : new Error(loginHint(harness)), { status: 409 });
       }
-      spec = { command: "injected-acp", args: [], env: { ...process.env } };
+      spec = {
+        command: "injected-acp",
+        args: [],
+        env: spawnSpecEnvFallback(bot.configMode, this.home.homeDir),
+      };
     }
 
     const channelId = this.channelId(bot.id);
     let client: AcpSession | undefined;
     try {
-      client = this.spawnAcpFn(spec, this.workspaceDir, {
+      client = this.spawnAcpFn(spec, cwd, {
         onPermission: (prompt) => {
-          bot.permission = prompt;
-          bot.eyesMode = "needs-you";
+          if (!client) return;
+          this.handlePermission(bot, client, prompt);
         },
         onAssistant: (text, delta) => this.applyAssistant(bot, channelId, text, delta),
         onPromptWritten: () => this.setUserReceipt(bot, channelId, "delivered"),
@@ -443,6 +564,8 @@ export class BotStore {
       await client.initialize();
       const restored = await this.restoreOrCreateSession(bot, client, channelId);
       bot.client = client;
+      this.spawnEnvs.set(bot.id, spec.env);
+      this.spawnCwds.set(bot.id, cwd);
       bot.eyesMode = "idle";
       bot.needsYou = null;
       return { client, skipHistory: restored };
@@ -486,7 +609,7 @@ export class BotStore {
         }
       }
     }
-    const created = await client.newSession(this.workspaceDir);
+    const created = await client.newSession(this.botCwd(bot.id));
     if (typeof created !== "string" || !created) {
       throw new Error("session/new did not return a sessionId");
     }
@@ -552,6 +675,60 @@ export class BotStore {
     this.pushAssistant(bot, channelId, text);
   }
 
+  private handlePermission(bot: Bot, client: AcpSession, prompt: PermissionPrompt): void {
+    const cwd = this.botCwd(bot.id);
+    const requestPath = extractPermissionPath(prompt, cwd);
+    const requested = requestedAccessFromKind(prompt.toolKind);
+    if (requestPath && isInsideWorkspace(requestPath, this.workspaceDir)) {
+      const allow = pickAllowOption(prompt.options);
+      if (allow) {
+        client.respondPermission(prompt.rpcId, allow);
+        return;
+      }
+    }
+    if (requestPath && !isInsideWorkspace(requestPath, this.workspaceDir)) {
+      const grant = this.home.matchHostGrant(requestPath, requested);
+      if (grant) {
+        if (grant.access === "deny") {
+          const reject = pickRejectOption(prompt.options);
+          if (reject) client.respondPermission(prompt.rpcId, reject);
+        } else {
+          const allow = pickAllowOption(prompt.options);
+          if (allow) client.respondPermission(prompt.rpcId, allow);
+        }
+        if (grant.duration === "once") this.home.consumeHostGrant(grant.id);
+        return;
+      }
+      bot.permission = {
+        ...prompt,
+        hostGrant: { path: requestPath, requested: requested === "read" ? "read" : "read-write" },
+      };
+      bot.eyesMode = "needs-you";
+      return;
+    }
+    bot.permission = prompt;
+    bot.eyesMode = "needs-you";
+  }
+
+  private appendHostGrantCard(
+    bot: Bot,
+    requestPath: string,
+    access: HostGrantAccess,
+    duration: HostGrantDuration,
+  ): void {
+    const accessLabel = access === "read-write" ? "Read and write" : access === "read" ? "Read" : "Deny";
+    const durationLabel =
+      duration === "session" ? "this Session" : duration === "until-revoked" ? "until revoked" : "once";
+    this.home.appendMessage(this.channelId(bot.id), {
+      id: crypto.randomUUID(),
+      role: "user",
+      kind: "host-grant",
+      text: `${accessLabel} · ${durationLabel}\n${requestPath}`,
+      createdAt: nowIso(),
+      senderId: HUMAN_MEMBER_ID,
+    });
+  }
+
   private toPublicChannel(channel: StoredChannel): PublicChannel {
     const bots = this.home.listBots();
     const byId = new Map(bots.map((bot) => [bot.id, bot]));
@@ -584,6 +761,7 @@ export class BotStore {
       id: bot.id,
       name: bot.name,
       harness: bot.harness,
+      configMode: bot.configMode,
       eyes: { color: bot.color, shape: bot.shape, mode },
       write: bot.write,
       zoom: bot.zoom,
@@ -642,6 +820,10 @@ export function capTalkBubble(text: string): string {
   const slice = text.slice(0, limit);
   const cut = slice.replace(/\s+\S*$/, "");
   return `${cut.length >= Math.floor(limit * 0.6) ? cut : slice}…`;
+}
+
+function spawnSpecEnvFallback(mode: ConfigMode, homeDir: string): NodeJS.ProcessEnv {
+  return applyVendorHomeEnv({ ...process.env }, mode, homeDir);
 }
 
 function nowIso(): string {
