@@ -38,6 +38,8 @@ export type Bot = {
     text: string;
     createdAt?: string;
     receipt?: "sent" | "delivered" | "read";
+    replyTo?: string;
+    reactions?: Array<{ emoji: string; by: "user" }>;
   }>;
 };
 
@@ -96,16 +98,33 @@ export async function pickHarness(botId: string, harness: string): Promise<Bot> 
   return (await res.json()) as Bot;
 }
 
-export async function sendMessage(botId: string, text: string): Promise<Bot> {
+export async function sendMessage(botId: string, text: string, replyTo?: string): Promise<Bot> {
   const res = await fetch(`/api/bots/${encodeURIComponent(botId)}/messages`, {
     method: "POST",
     credentials: "same-origin",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify(replyTo ? { text, replyTo } : { text }),
   });
   if (!res.ok) {
     const body = (await res.json().catch(() => ({}))) as { error?: string };
     throw new Error(body.error ?? "Could not send.");
+  }
+  return (await res.json()) as Bot;
+}
+
+export async function toggleReaction(botId: string, messageId: string, emoji: string): Promise<Bot> {
+  const res = await fetch(
+    `/api/bots/${encodeURIComponent(botId)}/messages/${encodeURIComponent(messageId)}/reactions`,
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ emoji }),
+    },
+  );
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Could not react.");
   }
   return (await res.json()) as Bot;
 }

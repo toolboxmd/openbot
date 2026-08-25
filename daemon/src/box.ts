@@ -499,6 +499,34 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         return;
       }
 
+      const reactionMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/messages\/([^/]+)\/reactions$/);
+      if (reactionMatch && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        let body: Record<string, unknown> = {};
+        try {
+          const raw = await readBody(req);
+          body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        try {
+          const emoji = typeof body.emoji === "string" ? body.emoji : "";
+          const bot = store.toggleReaction(
+            decodeURIComponent(reactionMatch[1]),
+            decodeURIComponent(reactionMatch[2]),
+            emoji,
+          );
+          sendJson(res, 200, bot);
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
       const messagesMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/messages$/);
       if (messagesMatch) {
         if (!hasSession(req, key)) {
@@ -526,7 +554,8 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
           }
           try {
             const text = typeof body.text === "string" ? body.text : "";
-            const bot = await store.send(botId, text);
+            const replyTo = typeof body.replyTo === "string" ? body.replyTo : undefined;
+            const bot = await store.send(botId, text, replyTo);
             sendJson(res, 200, bot);
           } catch (err) {
             sendStoreError(res, err);

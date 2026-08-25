@@ -1,6 +1,6 @@
-import { FormEvent, Fragment, useEffect, useState } from "react";
+import { FormEvent, Fragment, useEffect, useState, type ReactNode } from "react";
 import { motion } from "framer-motion";
-import { ArrowUp, Maximize2, Monitor, Plus } from "lucide-react";
+import { ArrowUp, Maximize2, Monitor, MoreHorizontal, Plus, Reply, Smile, X } from "lucide-react";
 import { ComputerScreen } from "@/components/Computer";
 import { Eyes } from "@/components/Eyes";
 import { Button } from "@/components/ui/button";
@@ -18,6 +18,7 @@ import {
   listHarnesses,
   pickHarness,
   sendMessage,
+  toggleReaction,
   type Bot,
   type Harness,
 } from "@/lib/session";
@@ -109,6 +110,23 @@ function isWorkingMode(mode: FaceMode | undefined): boolean {
   return mode === "write" || mode === "work";
 }
 
+const TAPBACKS = ["❤️", "👍", "😂"] as const;
+
+function previewText(text: string, max = 72): string {
+  const one = text.replace(/\s+/g, " ").trim();
+  if (one.length <= max) return one;
+  return `${one.slice(0, max - 1)}…`;
+}
+
+function rootsOf(messages: ChatMessage[]): ChatMessage[] {
+  const ids = new Set(messages.map((m) => m.id));
+  return messages.filter((m) => !m.replyTo || !ids.has(m.replyTo));
+}
+
+function childrenOf(messages: ChatMessage[], id: string): ChatMessage[] {
+  return messages.filter((m) => m.replyTo === id);
+}
+
 function TypingDots() {
   return (
     <span data-testid="typing-dots" aria-label="typing" className="inline-flex items-center gap-[5px] px-0.5 py-1">
@@ -123,6 +141,77 @@ function TypingDots() {
   );
 }
 
+function HoverActions({
+  user,
+  open,
+  onReply,
+  onReact,
+  picker,
+}: {
+  user: boolean;
+  open: boolean;
+  onReply: () => void;
+  onReact: () => void;
+  picker: ReactNode;
+}) {
+  const reactBtn = (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button type="button" size="icon-sm" variant="ghost" aria-label="React" onClick={onReact}>
+          <Smile />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>React</TooltipContent>
+    </Tooltip>
+  );
+  const replyBtn = (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button type="button" size="icon-sm" variant="ghost" aria-label="Reply" onClick={onReply}>
+          <Reply />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>Reply</TooltipContent>
+    </Tooltip>
+  );
+  const moreBtn = (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button type="button" size="icon-sm" variant="ghost" aria-label="More" disabled>
+          <MoreHorizontal />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>More</TooltipContent>
+    </Tooltip>
+  );
+  return (
+    <div
+      data-testid="bubble-hover-actions"
+      onClick={(event) => event.stopPropagation()}
+      className={cn(
+        "relative flex shrink-0 items-center rounded-full border border-border bg-background/95 shadow-sm",
+        "opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100",
+        open && "opacity-100",
+      )}
+    >
+      {user ? (
+        <>
+          {moreBtn}
+          {replyBtn}
+          {reactBtn}
+        </>
+      ) : (
+        <>
+          {reactBtn}
+          {replyBtn}
+          {moreBtn}
+        </>
+      )}
+      {picker}
+    </div>
+  );
+}
+
 export function Messenger() {
   const [draft, setDraft] = useState("");
   const [nameDraft, setNameDraft] = useState("");
@@ -134,6 +223,8 @@ export function Messenger() {
   const [computerOpen, setComputerOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
+  const [reactingId, setReactingId] = useState<string | null>(null);
 
   async function refresh(id = activeId) {
     const [listed, available] = await Promise.all([listBots(), listHarnesses()]);
@@ -172,6 +263,19 @@ export function Messenger() {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  useEffect(() => {
+    setReplyTo(null);
+    setReactingId(null);
+  }, [activeId]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setReactingId(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   useEffect(() => {
@@ -226,13 +330,16 @@ export function Messenger() {
     event.preventDefault();
     if (!activeId || draft.trim().length === 0) return;
     const text = draft.trim();
+    const targetId = replyTo?.id;
     setDraft("");
     setBusy(true);
     setError(null);
     try {
-      const bot = await sendMessage(activeId, text);
+      const bot = await sendMessage(activeId, text, targetId);
       setActive(bot);
+      setReplyTo(null);
     } catch (err) {
+      setDraft(text);
       const message = err instanceof Error ? err.message : "Could not send.";
       if (!isCancelledMessage(message)) setError(message);
     } finally {
@@ -251,7 +358,122 @@ export function Messenger() {
     }
   }
 
+  async function onReact(messageId: string, emoji: string) {
+    if (!activeId) return;
+    try {
+      const bot = await toggleReaction(activeId, messageId, emoji);
+      setActive(bot);
+      setReactingId(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not react.");
+    }
+  }
+
+  function renderBubble(message: ChatMessage, prev: ChatMessage | undefined, nested: boolean) {
+    const user = message.role === "user";
+    const index = visible.findIndex((row) => row.id === message.id);
+    const grouped = Boolean(prev && prev.role === message.role && sameMinute(prev.createdAt, message.createdAt));
+    const time = grouped || nested ? null : timeLabel(message.createdAt);
+    const receipt = user && showReceipt(visible, index) ? receiptLabel(message.receipt) : null;
+    const kids = childrenOf(visible, message.id);
+    const open = reactingId === message.id;
+    const mine = (message.reactions ?? []).map((item) => item.emoji);
+    const picker = open ? (
+      <div
+        data-testid="emoji-picker"
+        className={cn(
+          "absolute top-full z-20 mt-1 flex gap-1 rounded-full border border-border bg-background px-1.5 py-1 shadow-md",
+          user ? "right-0" : "left-0",
+        )}
+      >
+        {TAPBACKS.map((emoji) => (
+          <button
+            key={emoji}
+            type="button"
+            aria-label={`React ${emoji}`}
+            aria-pressed={mine.includes(emoji)}
+            onClick={() => void onReact(message.id, emoji)}
+            className={cn(
+              "flex size-8 items-center justify-center rounded-full text-base hover:bg-accent",
+              mine.includes(emoji) && "bg-accent",
+            )}
+          >
+            {emoji}
+          </button>
+        ))}
+      </div>
+    ) : null;
+    return (
+      <li
+        key={message.id}
+        data-reply-to={message.replyTo}
+        className={cn(
+          "group flex flex-col gap-1",
+          nested ? "max-w-full" : "max-w-[85%]",
+          user ? "self-end items-end" : "self-start items-start",
+        )}
+      >
+        {time ? (
+          <time className="px-1 text-[11px] text-muted-foreground" dateTime={message.createdAt}>
+            {time}
+          </time>
+        ) : null}
+        <div className={cn("flex items-end gap-1", user ? "flex-row-reverse" : "flex-row")}>
+          <div className={cn("relative", message.reactions && message.reactions.length > 0 && "mb-2 pb-1")}>
+            <div
+              className={cn(
+                "rounded-2xl px-4 py-2 text-sm whitespace-pre-wrap break-words",
+                user ? "bg-primary text-primary-foreground" : "bg-secondary text-secondary-foreground",
+                nested && "text-[13px]",
+              )}
+            >
+              {autolink(message.text)}
+            </div>
+            {message.reactions && message.reactions.length > 0 ? (
+              <div
+                data-testid="reaction-badge"
+                className={cn(
+                  "absolute -bottom-2 flex gap-0.5 rounded-full border border-border bg-background px-1.5 py-0.5 text-[13px] leading-none shadow-sm",
+                  user ? "left-1" : "right-1",
+                )}
+              >
+                {message.reactions.map((item) => (
+                  <span key={`${item.emoji}:${item.by}`}>{item.emoji}</span>
+                ))}
+              </div>
+            ) : null}
+          </div>
+          <HoverActions
+            user={user}
+            open={open}
+            onReply={() => {
+              setReplyTo(message);
+              setReactingId(null);
+            }}
+            onReact={() => setReactingId(open ? null : message.id)}
+            picker={picker}
+          />
+        </div>
+        {receipt ? <span className="px-1 text-[11px] text-muted-foreground">{receipt}</span> : null}
+        {kids.length > 0 ? (
+          <ul
+            data-testid="reply-thread"
+            className={cn(
+              "mt-2 flex w-[calc(100%+0.5rem)] flex-col gap-2 border-border",
+              user ? "mr-1 items-end border-r pr-3" : "ml-1 items-start border-l pl-3",
+            )}
+          >
+            {kids.map((child, i) => (
+              <Fragment key={child.id}>{renderBubble(child, i > 0 ? kids[i - 1] : message, true)}</Fragment>
+            ))}
+          </ul>
+        ) : null}
+      </li>
+    );
+  }
+
   const messages = active?.messages ?? [];
+  const visible = messages.filter((message) => message.text.length > 0);
   const writing = isWorkingMode(active?.eyes.mode);
   const sidebarMode = (bot: Bot): FaceMode =>
     isWorkingMode(bot.eyes.mode) ? "idle" : (bot.eyes.mode as FaceMode);
@@ -366,51 +588,20 @@ export function Messenger() {
         {active && messages.length > 0 ? (
           <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-6 py-4">
             <ul className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-3">
-              {messages
-                .filter((message) => message.text.length > 0)
-                .map((message, index, visible) => {
-                  const day = dayLabel(message.createdAt);
-                  const prevDay = index > 0 ? dayLabel(visible[index - 1]?.createdAt) : null;
-                  const showDay = Boolean(day && day !== prevDay);
-                  const user = message.role === "user";
-                  const prev = index > 0 ? visible[index - 1] : undefined;
-                  const grouped =
-                    Boolean(prev && prev.role === message.role && sameMinute(prev.createdAt, message.createdAt));
-                  const time = grouped ? null : timeLabel(message.createdAt);
-                  const receipt = user && showReceipt(visible, index) ? receiptLabel(message.receipt) : null;
-                  return (
-                    <Fragment key={message.id}>
-                      {showDay ? (
-                        <li className="self-center py-2 text-[11px] font-medium text-muted-foreground">{day}</li>
-                      ) : null}
-                      <li
-                        className={cn(
-                          "flex max-w-[85%] flex-col gap-1",
-                          user ? "self-end items-end" : "self-start items-start",
-                        )}
-                      >
-                        {time ? (
-                          <time className="px-1 text-[11px] text-muted-foreground" dateTime={message.createdAt}>
-                            {time}
-                          </time>
-                        ) : null}
-                        <div
-                          className={cn(
-                            "rounded-2xl px-4 py-2 text-sm whitespace-pre-wrap break-words",
-                            user
-                              ? "bg-primary text-primary-foreground"
-                              : "bg-secondary text-secondary-foreground",
-                          )}
-                        >
-                          {autolink(message.text)}
-                        </div>
-                        {receipt ? (
-                          <span className="px-1 text-[11px] text-muted-foreground">{receipt}</span>
-                        ) : null}
-                      </li>
-                    </Fragment>
-                  );
-                })}
+              {rootsOf(visible).map((message, index, roots) => {
+                const day = dayLabel(message.createdAt);
+                const prevDay = index > 0 ? dayLabel(roots[index - 1]?.createdAt) : null;
+                const showDay = Boolean(day && day !== prevDay);
+                const prev = index > 0 ? roots[index - 1] : undefined;
+                return (
+                  <Fragment key={message.id}>
+                    {showDay ? (
+                      <li className="self-center py-2 text-[11px] font-medium text-muted-foreground">{day}</li>
+                    ) : null}
+                    {renderBubble(message, prev, false)}
+                  </Fragment>
+                );
+              })}
               {writing ? (
                 <li
                   data-testid="working-indicator"
@@ -488,7 +679,32 @@ export function Messenger() {
           </p>
         ) : null}
         <form onSubmit={onSubmit} className="px-4 pb-5 pt-2">
-          <div className="mx-auto flex max-w-2xl items-end gap-2 rounded-[28px] bg-secondary p-2 pl-5">
+          <div className="mx-auto flex max-w-2xl flex-col gap-2">
+            {replyTo ? (
+              <div
+                data-testid="reply-preview"
+                className="flex items-center gap-2 rounded-2xl bg-secondary px-4 py-2 text-sm"
+              >
+                <Reply className="size-3.5 shrink-0 text-muted-foreground" />
+                <p className="min-w-0 flex-1 truncate text-muted-foreground">
+                  <span className="font-medium text-foreground">
+                    {replyTo.role === "user" ? "You" : (active?.name ?? "Bot")}
+                  </span>
+                  {": "}
+                  {previewText(replyTo.text)}
+                </p>
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  aria-label="Cancel reply"
+                  onClick={() => setReplyTo(null)}
+                >
+                  <X />
+                </Button>
+              </div>
+            ) : null}
+            <div className="flex items-end gap-2 rounded-[28px] bg-secondary p-2 pl-5">
             <Textarea
               name="draft"
               rows={1}
@@ -500,7 +716,9 @@ export function Messenger() {
                   event.currentTarget.form?.requestSubmit();
                 }
               }}
-              placeholder={active ? "Message a Bot…" : "Create a Bot first…"}
+              placeholder={
+                !active ? "Create a Bot first…" : replyTo ? "Reply…" : "Message a Bot…"
+              }
               disabled={!active}
               className="min-h-10 resize-none"
             />
@@ -518,6 +736,7 @@ export function Messenger() {
               </TooltipTrigger>
               <TooltipContent>Send</TooltipContent>
             </Tooltip>
+            </div>
           </div>
         </form>
       </section>
