@@ -15,7 +15,7 @@ The database uses integer, additive schema migrations. It stores Bots, Channels,
 
 A Channel owns its Transcript. A Bot owns its Harness. Creating a Bot also creates its direct Channel with two members: you and that Bot. Replies, reactions, and Sent, Delivered, and Read state belong to messages in the Channel.
 
-A Session is one Bot using its Harness in one Channel. A Bot may run several Sessions at once. When Talk cannot load Harness state, it starts `session/new` and injects the last 20 user Turns from the Channel, clipped to 64,000 characters, plus any reply target and the new message. Speaker names are text, not JSON. Receipts and reactions are omitted. Persisted ACP session loading is a later slice.
+A Session is one Bot using its Harness in one Channel. A Bot may run several Sessions at once. Talk persists the ACP session id on `bot_channel_state` per Bot per Channel. After Talk restart with the same Harness, it calls `session/load` (or `session/resume` if the Harness has no load) and does not inject Channel history. If load fails, or the Harness changed, it starts `session/new` and injects the last 20 user Turns from the Channel, clipped to 64,000 characters, plus any reply target and the new message. Speaker names are text, not JSON. Receipts and reactions are omitted. Cross-Harness `session/load` is never used.
 
 Zoom grants Screen write access but does not pause or SIGSTOP Sessions. If the user and Bot need the same pointer, the user asks the Bot to stop.
 

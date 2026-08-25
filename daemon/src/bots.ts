@@ -55,7 +55,9 @@ export type PublicBot = {
 export type AcpSession = {
   close(): void;
   initialize(): Promise<unknown>;
-  newSession(cwd: string): Promise<unknown>;
+  newSession(cwd: string): Promise<string>;
+  loadSession?(sessionId: string): Promise<unknown>;
+  resumeSession?(sessionId: string): Promise<unknown>;
   prompt(text: string): Promise<string>;
   cancel(): void;
   respondPermission(rpcId: PermissionPrompt["rpcId"], optionId: string): void;
@@ -241,8 +243,9 @@ export class BotStore {
     const channelId = this.channelId(bot.id);
     const prior = this.home.listMessages(channelId);
     const replyTarget = this.resolveReplyTarget(prior, replyTo);
-    const history = bot.client ? "" : channelHistory(prior, bot.name);
-    const client = await this.ensureClient(bot);
+    const attached = await this.ensureClient(bot);
+    const history = attached.skipHistory ? "" : channelHistory(prior, bot.name);
+    const client = attached.client;
 
     if (bot.write) {
       try {
@@ -370,8 +373,8 @@ export class BotStore {
     return this.home.listMessages(this.channelId(botId));
   }
 
-  private async ensureClient(bot: Bot): Promise<AcpSession> {
-    if (bot.client) return bot.client;
+  private async ensureClient(bot: Bot): Promise<{ client: AcpSession; skipHistory: boolean }> {
+    if (bot.client) return { client: bot.client, skipHistory: true };
     const harness = bot.harness;
     if (!harness) throw Object.assign(new Error("pick a Harness first"), { status: 400 });
 
@@ -400,11 +403,11 @@ export class BotStore {
         onPromptFlushed: () => this.setUserReceipt(bot, channelId, "read"),
       });
       await client.initialize();
-      await client.newSession(this.workspaceDir);
+      const restored = await this.restoreOrCreateSession(bot, client, channelId);
       bot.client = client;
       bot.eyesMode = "idle";
       bot.needsYou = null;
-      return client;
+      return { client, skipHistory: restored };
     } catch (err) {
       client?.close();
       bot.client = null;
@@ -418,6 +421,39 @@ export class BotStore {
             : loginHint(harness);
       throw Object.assign(new Error(message), { status: 409 });
     }
+  }
+
+  private async restoreOrCreateSession(bot: Bot, client: AcpSession, channelId: string): Promise<boolean> {
+    const storedId = this.home.getSessionId(bot.id, channelId);
+    const channelHarness = this.home.getChannelHarness(bot.id, channelId);
+    const sameHarness = Boolean(bot.harness && channelHarness === bot.harness);
+    if (storedId && sameHarness) {
+      if (typeof client.loadSession === "function") {
+        try {
+          const loaded = await client.loadSession(storedId);
+          const id = typeof loaded === "string" && loaded ? loaded : storedId;
+          this.home.setSessionId(bot.id, channelId, id);
+          return true;
+        } catch {
+          // Fall back to session/new plus Channel inject.
+        }
+      } else if (typeof client.resumeSession === "function") {
+        try {
+          const resumed = await client.resumeSession(storedId);
+          const id = typeof resumed === "string" && resumed ? resumed : storedId;
+          this.home.setSessionId(bot.id, channelId, id);
+          return true;
+        } catch {
+          // Fall back to session/new plus Channel inject.
+        }
+      }
+    }
+    const created = await client.newSession(this.workspaceDir);
+    if (typeof created !== "string" || !created) {
+      throw new Error("session/new did not return a sessionId");
+    }
+    this.home.setSessionId(bot.id, channelId, created);
+    return false;
   }
 
   private resolveReplyTarget(messages: PublicMessage[], replyTo: string | undefined): PublicMessage | null {

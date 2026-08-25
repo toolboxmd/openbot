@@ -255,6 +255,33 @@ export class AcpClient {
     return id;
   }
 
+  async loadSession(sessionId: string): Promise<string> {
+    return this.attachSession("session/load", sessionId);
+  }
+
+  async resumeSession(sessionId: string): Promise<string> {
+    return this.attachSession("session/resume", sessionId);
+  }
+
+  private async attachSession(method: "session/load" | "session/resume", sessionId: string): Promise<string> {
+    this.generation += 1;
+    this.streaming = false;
+    this.turnText = "";
+    this.messageText = "";
+    this.openMessageId = null;
+    const result = (await this.request(method, {
+      sessionId,
+      cwd: this.cwd,
+      mcpServers: [],
+    })) as { sessionId?: string; session_id?: string } | null | undefined;
+    const id = result?.sessionId ?? result?.session_id ?? sessionId;
+    if (typeof id !== "string" || !id) {
+      throw new Error(`${method} did not return a sessionId`);
+    }
+    this.sessionId = id;
+    return id;
+  }
+
   async prompt(text: string): Promise<string> {
     if (!this.sessionId) throw new Error("no ACP session");
     this.activeGen = ++this.generation;

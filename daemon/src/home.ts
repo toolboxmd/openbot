@@ -188,6 +188,30 @@ export class HomeStore {
     });
   }
 
+  getSessionId(botId: string, channelId: string): string | null {
+    const row = this.db
+      .prepare("SELECT session_id FROM bot_channel_state WHERE bot_id = ? AND channel_id = ?")
+      .get(botId, channelId) as SqlRow | undefined;
+    return typeof row?.session_id === "string" && row.session_id ? row.session_id : null;
+  }
+
+  getChannelHarness(botId: string, channelId: string): string | null {
+    const row = this.db
+      .prepare("SELECT harness_id FROM bot_channel_state WHERE bot_id = ? AND channel_id = ?")
+      .get(botId, channelId) as SqlRow | undefined;
+    return typeof row?.harness_id === "string" && row.harness_id ? row.harness_id : null;
+  }
+
+  setSessionId(botId: string, channelId: string, sessionId: string | null): void {
+    if (this.closed) return;
+    const changed = this.db
+      .prepare("UPDATE bot_channel_state SET session_id = ? WHERE bot_id = ? AND channel_id = ?")
+      .run(sessionId, botId, channelId);
+    if (changed.changes !== 1) {
+      throw Object.assign(new Error("Bot Channel state not found"), { status: 404 });
+    }
+  }
+
   appendMessage(channelId: string, message: NewMessage): void {
     if (this.closed) return;
     this.transaction(() => {
