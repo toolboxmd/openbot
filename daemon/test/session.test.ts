@@ -36,6 +36,7 @@ describe("box HTTP session", () => {
       pwaDir,
       host: "127.0.0.1",
       port: 0,
+      homeDir: await mkdtemp(join(tmpdir(), "openbot-session-home-")),
     });
   });
 
