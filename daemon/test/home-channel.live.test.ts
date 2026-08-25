@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -134,6 +135,38 @@ async function openBox(homeDir: string): Promise<RunningBox> {
   });
 }
 
+
+function readSessionId(homeDir: string): string | null {
+  const db = new DatabaseSync(join(homeDir, "talk.sqlite"), { readOnly: true });
+  try {
+    const row = db.prepare("SELECT session_id FROM bot_channel_state LIMIT 1").get() as
+      | { session_id?: unknown }
+      | undefined;
+    return typeof row?.session_id === "string" && row.session_id ? row.session_id : null;
+  } finally {
+    db.close();
+  }
+}
+
+function writeSessionId(homeDir: string, sessionId: string): void {
+  const db = new DatabaseSync(join(homeDir, "talk.sqlite"));
+  try {
+    const changed = db.prepare("UPDATE bot_channel_state SET session_id = ?").run(sessionId);
+    if (changed.changes !== 1) throw new Error("failed to write session_id");
+  } finally {
+    db.close();
+  }
+}
+
+
+function assistantText(messages: PublicMessage[], afterCount = 0): string {
+  return messages
+    .filter((message) => message.role === "assistant" && message.text)
+    .slice(afterCount)
+    .map((message) => message.text)
+    .join("\n");
+}
+
 const describeLive = liveCodexAvailable() ? describe : describe.skip;
 
 describeLive("Live Codex Talk HTTP", () => {
@@ -143,8 +176,8 @@ describeLive("Live Codex Talk HTTP", () => {
     async () => {
       const homeDir = await mkdtemp(join(tmpdir(), "openbot-live-home-"));
       const phrase = `LIVE-ORBIT-${Date.now()}`;
-      const firstTurn = `Remember this code: ${phrase}. Reply with a short ack.`;
-      const followUp = "Reply with only the first code, nothing else.";
+      const firstTurn = `Remember this exact secret code and do not shorten it: ${phrase}. Reply with a short ack.`;
+      const followUp = "What was the exact secret code? Reply with only that exact LIVE-ORBIT string, including the number.";
       let box = await openBox(homeDir);
       try {
         const cookie = await login(box.url);
@@ -159,9 +192,13 @@ describeLive("Live Codex Talk HTTP", () => {
         assert.equal(existsSync(join(homeDir, "talk.sqlite")), true);
         assert.equal(existsSync(join(defaultWorkspaceDir(homeDir), "talk.sqlite")), false);
         assert.equal(existsSync(join(homeDir, "bots.json")), false);
+        const sessionBefore = readSessionId(homeDir);
+        assert.ok(sessionBefore, "ACP session id must be stored in talk.sqlite before Talk close");
 
         await box.close();
         box = await openBox(homeDir);
+        const sessionRestart = readSessionId(homeDir);
+        assert.equal(sessionRestart, sessionBefore, "session_id must survive Talk restart");
         const cookie2 = await login(box.url);
         const restored = await getMessages(box.url, cookie2, adaId);
         assert.ok(
@@ -175,16 +212,69 @@ describeLive("Live Codex Talk HTTP", () => {
         const assistantCount = restored.filter((message) => message.role === "assistant" && message.text).length;
 
         await postText(box.url, cookie2, adaId, followUp);
-        const after = await pollAssistant(box.url, cookie2, adaId, assistantCount + 1);
-        assert.ok(after.some((message) => message.role === "user" && message.text === followUp));
-        const fresh = after
-          .filter((message) => message.role === "assistant" && message.text)
-          .slice(assistantCount);
-        assert.ok(
-          fresh.some((message) => message.text.includes(phrase)),
-          `second live reply must use the first code ${phrase}; got ${JSON.stringify(fresh)}`,
-        );
         await pollIdle(box.url, cookie2, adaId);
+        const after = await getMessages(box.url, cookie2, adaId);
+        assert.ok(after.some((message) => message.role === "user" && message.text === followUp));
+        const combined = assistantText(after, assistantCount);
+        assert.ok(
+          combined.includes(phrase),
+          `second live reply must use the first code ${phrase}; got ${JSON.stringify(combined)}`,
+        );
+        const sessionAfter = readSessionId(homeDir);
+        const livePath = sessionAfter === sessionBefore ? "session/load" : "session/new+inject";
+        console.log(
+          `Live Codex after restart: ${livePath}; session_id before=${sessionBefore} after=${sessionAfter}`,
+        );
+        if (livePath === "session/load") {
+          assert.equal(sessionAfter, sessionBefore);
+        } else {
+          assert.ok(sessionAfter, "fallback session/new must persist a new session id");
+          assert.notEqual(sessionAfter, sessionBefore);
+        }
+      } finally {
+        await box.close();
+      }
+    },
+  );
+
+  test(
+    "broken stored session id falls back to inject",
+    { timeout: 300_000 },
+    async () => {
+      const homeDir = await mkdtemp(join(tmpdir(), "openbot-live-corrupt-"));
+      const phrase = `LIVE-ORBIT-${Date.now()}`;
+      const firstTurn = `Remember this exact secret code and do not shorten it: ${phrase}. Reply with a short ack.`;
+      const followUp = "What was the exact secret code? Reply with only that exact LIVE-ORBIT string, including the number.";
+      let box = await openBox(homeDir);
+      try {
+        const cookie = await login(box.url);
+        const adaId = await createAda(box.url, cookie);
+        await postText(box.url, cookie, adaId, firstTurn);
+        await pollAssistant(box.url, cookie, adaId, 1);
+        await pollIdle(box.url, cookie, adaId);
+        const realId = readSessionId(homeDir);
+        assert.ok(realId, "ACP session id must be stored before corrupt");
+
+        await box.close();
+        writeSessionId(homeDir, "bogus-session-id");
+        assert.equal(readSessionId(homeDir), "bogus-session-id");
+
+        box = await openBox(homeDir);
+        const cookie2 = await login(box.url);
+        const restored = await getMessages(box.url, cookie2, adaId);
+        const assistantCount = restored.filter((message) => message.role === "assistant" && message.text).length;
+        await postText(box.url, cookie2, adaId, followUp);
+        await pollIdle(box.url, cookie2, adaId);
+        const after = await getMessages(box.url, cookie2, adaId);
+        const combined = assistantText(after, assistantCount);
+        assert.ok(
+          combined.includes(phrase),
+          `inject fallback must still use the first code ${phrase}; got ${JSON.stringify(combined)}`,
+        );
+        const sessionAfter = readSessionId(homeDir);
+        assert.ok(sessionAfter);
+        assert.notEqual(sessionAfter, "bogus-session-id");
+        console.log(`Live Codex corrupt-id fallback: session/new+inject; new session_id=${sessionAfter}`);
       } finally {
         await box.close();
       }
