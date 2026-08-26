@@ -130,6 +130,14 @@ describe("Isolated Harness Home layout", () => {
     assert.match(openbot, /docker exec/);
     assert.match(openbot, /Screen/);
     assert.match(openbot, /OPENBOT_SCREEN_CONTAINER/);
+    assert.match(openbot, /PinchTab/);
+    assert.match(openbot, /get_text/);
+    assert.match(openbot, /snapshot/);
+    assert.match(openbot, /screenshot/);
+    assert.match(openbot, /untrusted/);
+    assert.match(openbot, /Open computer/);
+    assert.match(openbot, /fail closed/);
+    assert.match(openbot, /Playwright/);
     assert.doesNotMatch(openbot, /optional hint/i);
 
     const isolatedConfig = readFileSync(join(codex, "config.toml"), "utf8");
@@ -157,6 +165,9 @@ allow_login_shell = true
     const openbot = readFileSync(sharedOpenbot, "utf8");
     assert.match(openbot, /This Session is Isolated/);
     assert.match(openbot, /docker exec/);
+    assert.match(openbot, /PinchTab/);
+    assert.match(openbot, /get_text/);
+    assert.match(openbot, /Open computer/);
     const isolatedConfig = readFileSync(codexConfig, "utf8");
     assert.match(isolatedConfig, /sandbox_mode = "danger-full-access"/);
     assert.match(isolatedConfig, /allow_login_shell = false/);

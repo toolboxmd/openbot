@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,6 +16,7 @@ if (!process.env.OPENBOT_PASSWORD) {
 
 process.env.OPENBOT_HOME ??= defaultHomeDir();
 process.env.OPENBOT_WORKSPACE ??= defaultWorkspaceDir(process.env.OPENBOT_HOME);
+process.env.PINCHTAB_TOKEN ??= crypto.randomBytes(24).toString("hex");
 
 function composeUp(service: string, env: NodeJS.ProcessEnv): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -78,8 +80,15 @@ function onSignal(handler: (signal: NodeJS.Signals) => void): () => void {
   };
 }
 
+let screenPorts: number[] = [];
+
 async function pickPorts(): Promise<number[]> {
-  return pickScreenPorts(8);
+  screenPorts = await pickScreenPorts(8);
+  return screenPorts;
+}
+
+async function pickPinchTabPorts(): Promise<number[]> {
+  return pickScreenPorts(8, screenPorts);
 }
 
 try {
@@ -90,6 +99,7 @@ try {
     now: () => Date.now(),
     onSignal,
     pickPorts,
+    pickPinchTabPorts,
     log: (message) => console.error(message),
   });
 } catch (err) {

@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startBox } from "./box.ts";
 import { defaultHomeDir, defaultWorkspaceDir } from "./home.ts";
-import { DockerComputerRuntime, defaultCookieJar, parseScreenPorts } from "./computer.ts";
+import { DockerComputerRuntime, defaultCookieJar, parsePinchTabPorts, parseScreenPorts } from "./computer.ts";
 
 const password = process.env.OPENBOT_PASSWORD;
 if (!password) {
@@ -27,9 +27,12 @@ fs.mkdirSync(workspaceDir, { recursive: true });
 fs.mkdirSync(cookiesDir, { recursive: true });
 
 const hostPorts = parseScreenPorts(process.env.SCREEN_PORTS);
+const pinchTabHostPorts = parsePinchTabPorts(process.env.PINCHTAB_PORTS);
 const computer = new DockerComputerRuntime({
   containerName: process.env.OPENBOT_SCREEN_CONTAINER ?? "openbot-screen",
   hostPorts,
+  pinchTabHostPorts,
+  pinchTabToken: process.env.PINCHTAB_TOKEN,
   cookiesDir,
   workspaceDir,
   password,

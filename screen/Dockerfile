@@ -66,6 +66,14 @@ RUN set -eux; \
     command -v google-chrome-stable; \
     google-chrome-stable --version
 
+# linux-amd64 PinchTab for the in-Screen bridge. Talk MCP runs on the host.
+ARG PINCHTAB_VERSION=v0.15.2
+RUN set -eux; \
+    curl -fsSL -o /usr/local/bin/pinchtab \
+      "https://github.com/pinchtab/pinchtab/releases/download/${PINCHTAB_VERSION}/pinchtab-linux-amd64"; \
+    chmod +x /usr/local/bin/pinchtab; \
+    pinchtab --version
+
 RUN arch="${TARGETARCH:-amd64}"; \
     case "$arch" in \
       amd64|x86_64) deb_arch=amd64 ;; \
@@ -103,4 +111,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 6901 6902 6903 6904 6905 6906 6907 6908
+EXPOSE 9867 9868 9869 9870 9871 9872 9873 9874
 CMD ["/entrypoint.sh"]

@@ -18,6 +18,7 @@ export type PermissionPrompt = {
   rawInput?: Record<string, unknown> | null;
   toolKind?: string;
   meta?: unknown;
+  raw?: unknown;
 };
 
 export type AssistantDelta = {
@@ -186,6 +187,7 @@ export class AcpClient {
         rawInput: params.toolCall?.rawInput ?? null,
         toolKind: params.toolCall?.kind,
         meta: params._meta,
+        raw: params,
       });
       return;
     }
@@ -259,7 +261,7 @@ export class AcpClient {
   async newSession(cwd: string): Promise<string> {
     const result = (await this.request("session/new", {
       cwd,
-      mcpServers: [],
+      mcpServers: this.spec.mcpServers ?? [],
     })) as { sessionId?: string; session_id?: string };
     const id = result?.sessionId ?? result?.session_id;
     if (typeof id !== "string" || !id) {
@@ -286,7 +288,7 @@ export class AcpClient {
     const result = (await this.request(method, {
       sessionId,
       cwd: this.cwd,
-      mcpServers: [],
+      mcpServers: this.spec.mcpServers ?? [],
     })) as { sessionId?: string; session_id?: string } | null | undefined;
     const id = result?.sessionId ?? result?.session_id ?? sessionId;
     if (typeof id !== "string" || !id) {

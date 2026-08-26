@@ -50,8 +50,10 @@ if command -v xfconf-query >/dev/null 2>&1; then
   done
 fi
 # Unique headed profile per display. Shared cookies are copied in/out of
-# /computer/cookies by entrypoint. No CDP, no shared Chrome process, no PinchTab.
+# /computer/cookies by entrypoint. CDP is localhost-only in this container so
+# PinchTab can attach to this Chrome. Do not publish CDP.
 CHROME_BIN=""
+CDP_PORT=$((9221 + n))
 if command -v google-chrome-stable >/dev/null 2>&1; then
   CHROME_BIN=google-chrome-stable
 elif command -v google-chrome >/dev/null 2>&1; then
@@ -62,9 +64,13 @@ if [ -z "$CHROME_BIN" ]; then
 else
   "$CHROME_BIN" \
     --user-data-dir="$PROFILE" \
+    --remote-debugging-port="$CDP_PORT" \
+    --remote-debugging-address=127.0.0.1 \
+    --remote-allow-origins=* \
     --no-first-run --disable-gpu --no-sandbox --test-type --disable-dev-shm-usage \
     --disable-session-crashed-bubble --hide-crash-restore-bubble --disable-infobars \
     --no-default-browser-check --window-size=1100,700 --window-position=90,40 \
     chrome://new-tab-page &
+  /usr/local/bin/openbot-display pinchtab "$n" || true
 fi
 wait

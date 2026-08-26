@@ -52,6 +52,7 @@ import {
   type PermissionPrompt,
 } from "./acp.ts";
 import { NoopComputerRuntime, type ComputerRuntime, type DisplayHandle } from "./computer.ts";
+import { PINCHTAB_MCP_NAME, pinchTabMcpServers, stripPinchTabFromPath } from "./pinchtab.ts";
 
 export { defaultHomeDir, defaultWorkspaceDir } from "./home.ts";
 export type { MessageReaction, MessageReceipt } from "./home.ts";
@@ -153,6 +154,7 @@ export class BotStore {
   private zoomedId: string | null = null;
   private readonly spawnEnvs = new Map<string, NodeJS.ProcessEnv>();
   private readonly spawnCwds = new Map<string, string>();
+  private readonly spawnSpecs = new Map<string, SpawnSpec>();
 
   constructor(homeDir: string, deps: BotStoreDeps = {}) {
     this.home = new HomeStore(homeDir);
@@ -357,6 +359,10 @@ export class BotStore {
     return this.spawnCwds.get(id) ?? null;
   }
 
+  lastSpawnSpec(id: string): SpawnSpec | null {
+    return this.spawnSpecs.get(id) ?? null;
+  }
+
   listHostGrants() {
     return this.home.listHostGrants();
   }
@@ -555,6 +561,7 @@ export class BotStore {
         env: spawnSpecEnvFallback(bot.configMode, this.home.homeDir, cwd, bot.id, this.computer.containerName()),
       };
     }
+    spec.mcpServers = await pinchTabMcpServers(this.computer, bot.id);
 
     const channelId = this.channelId(bot.id);
     let client: AcpSession | undefined;
@@ -573,6 +580,7 @@ export class BotStore {
       bot.client = client;
       this.spawnEnvs.set(bot.id, spec.env);
       this.spawnCwds.set(bot.id, cwd);
+      this.spawnSpecs.set(bot.id, spec);
       bot.eyesMode = "idle";
       bot.needsYou = null;
       return { client, skipHistory: restored };
@@ -685,6 +693,16 @@ export class BotStore {
   private handlePermission(bot: Bot, client: AcpSession, prompt: PermissionPrompt): void {
     const cwd = this.botCwd(bot.id);
     const requestPath = extractPermissionPath(prompt, cwd);
+    const pinchTabMcp = (this.spawnSpecs.get(bot.id)?.mcpServers ?? []).some(
+      (server) => server.name === PINCHTAB_MCP_NAME,
+    );
+    if (isPinchTabPermission(prompt) || (pinchTabMcp && !requestPath)) {
+      const allow = pickAllowOption(prompt.options);
+      if (allow) {
+        client.respondPermission(prompt.rpcId, allow);
+        return;
+      }
+    }
     const requested = requestedAccessFromKind(prompt.toolKind);
     const inJail =
       (requestPath && isInsideWorkspace(requestPath, this.workspaceDir)) ||
@@ -784,6 +802,19 @@ export class BotStore {
   }
 }
 
+function isPinchTabPermission(prompt: PermissionPrompt): boolean {
+  const blob = `${prompt.title ?? ""}\n${prompt.description ?? ""}\n${prompt.toolKind ?? ""}\n${safePermissionJson(prompt.rawInput)}\n${safePermissionJson(prompt.meta)}\n${safePermissionJson(prompt.raw)}`;
+  return /pinchtab|mcp__pinchtab/i.test(blob);
+}
+
+function safePermissionJson(value: unknown): string {
+  try {
+    return JSON.stringify(value ?? "");
+  } catch {
+    return "";
+  }
+}
+
 function isLikelyLogin(err: unknown): boolean {
   return isAuthError(err) || /login|auth|not signed/i.test(String((err as Error)?.message ?? err));
 }
@@ -839,7 +870,13 @@ function spawnSpecEnvFallback(
   botId: string,
   screenContainer: string,
 ): NodeJS.ProcessEnv {
-  return applyVendorHomeEnv({ ...process.env }, mode, homeDir, botHome, { botId, screenContainer });
+  const env = applyVendorHomeEnv({ ...process.env }, mode, homeDir, botHome, { botId, screenContainer });
+  env.PATH = stripPinchTabFromPath(env.PATH ?? "");
+  delete env.DISPLAY;
+  delete env.PINCHTAB_TOKEN;
+  delete env.OPENBOT_PINCHTAB;
+  delete env.OPENBOT_PINCHTAB_SERVER;
+  return env;
 }
 
 function nowIso(): string {

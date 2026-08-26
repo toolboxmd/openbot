@@ -28,7 +28,7 @@ One origin. The host daemon is Talk, the reverse proxy, and the PWA.
 - daemon: Password, session cookie, static PWA, Computer API, Screen proxy, Bots, Codex ACP
 - one Screen container: Debian bookworm, XFCE, KasmVNC, Chrome; extra Bots are extra displays in that container
 - Kasm basic auth is injected by the proxy. WebRTC is off. Preview is view-only; zoom grants write.
-- Talk: host Codex ACP. Picker detects other CLIs. This slice only spawns Codex. No PinchTab. No Takeover button. No docker-stop Sleep.
+- Talk: host Codex ACP. Picker detects other CLIs. This slice only spawns Codex. PinchTab MCP is Talk-injected on Screen Chrome (allowlisted browse loop plus screenshot). No Takeover button. No docker-stop Sleep.
 
 ## Tests
 
