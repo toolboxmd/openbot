@@ -31,34 +31,129 @@
   --color-sidebar-accent: var(--sidebar-accent);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
   --color-sidebar-border: var(--sidebar-border);
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-surface-muted: var(--surface-muted);
+  --color-bubble-incoming: var(--bubble-incoming);
+  --color-bubble-incoming-foreground: var(--bubble-incoming-text);
+  --color-bubble-outgoing: var(--bubble-outgoing);
+  --color-bubble-outgoing-foreground: var(--bubble-outgoing-text);
+  --color-link: var(--link);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  --font-sans: var(--font-family-sans);
+  --font-mono: var(--font-family-mono);
+}
+
+:root,
+[data-theme="light"] {
+  --canvas: #ffffff;
+  --foreground: #111111;
+  --surface: #ffffff;
+  --surface-muted: #f4f4f5;
+  --sidebar: #f7f7f8;
+  --sidebar-selected: #ececee;
+  --border: #e6e6e8;
+  --input: #e8e8ea;
+  --bubble-incoming: #f1f1f3;
+  --bubble-incoming-text: #111111;
+  --bubble-outgoing: #111111;
+  --bubble-outgoing-text: #ffffff;
+  --muted-foreground: #737373;
+  --link: #2563eb;
+  --focus: #2563eb;
+  --danger: #dc2626;
+  --success: #15803d;
+  --warning: #b45309;
+  --info: #2563eb;
+  --scrim: rgba(0, 0, 0, 0.45);
+}
+
+[data-theme="dark"] {
+  --canvas: #0f0f10;
+  --foreground: #f5f5f5;
+  --surface: #171719;
+  --surface-muted: #242427;
+  --sidebar: #151517;
+  --sidebar-selected: #29292d;
+  --border: #303034;
+  --input: #35353a;
+  --bubble-incoming: #262629;
+  --bubble-incoming-text: #f5f5f5;
+  --bubble-outgoing: #f4f4f5;
+  --bubble-outgoing-text: #111111;
+  --muted-foreground: #a1a1aa;
+  --link: #60a5fa;
+  --focus: #60a5fa;
+  --danger: #f87171;
+  --success: #4ade80;
+  --warning: #fbbf24;
+  --info: #60a5fa;
+  --scrim: rgba(0, 0, 0, 0.68);
 }
 
 :root {
-  --radius: 1rem;
-  --background: #ffffff;
-  --foreground: #111111;
-  --card: #ffffff;
-  --card-foreground: #111111;
-  --popover: #ffffff;
-  --popover-foreground: #111111;
-  --primary: #111111;
-  --primary-foreground: #ffffff;
-  --secondary: #f4f4f5;
-  --secondary-foreground: #111111;
-  --muted: #f4f4f5;
-  --muted-foreground: #737373;
-  --accent: #f4f4f5;
-  --accent-foreground: #111111;
-  --destructive: #dc2626;
-  --border: #ececec;
-  --input: #e8e8ea;
-  --ring: #111111;
-  --sidebar: #f7f7f8;
-  --sidebar-foreground: #111111;
-  --sidebar-accent: #ececee;
-  --sidebar-accent-foreground: #111111;
-  --sidebar-border: #ececec;
+  --font-family-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  --font-family-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+  --text-caption: 0.6875rem;
+  --text-meta: 0.75rem;
+  --text-body: 0.875rem;
+  --text-body-large: 1rem;
+  --text-title: 1.25rem;
+  --text-hero: 1.75rem;
+  --leading-tight: 1.25;
+  --leading-body: 1.45;
+  --leading-relaxed: 1.6;
+  --radius-control: 0.625rem;
+  --radius-card: 1rem;
+  --radius-bubble: 1.125rem;
+  --radius-dialog: 1.25rem;
+  --radius-composer: 1.75rem;
+  --radius-pill: 9999px;
+  --icon-small: 1rem;
+  --icon-default: 1.125rem;
+  --icon-large: 1.5rem;
+  --icon-stroke: 1.75;
+  --pointer-min: 2rem;
+  --touch-min: 2.75rem;
+  --desktop-min: 48rem;
+  --sidebar-width: 17.5rem;
+  --computer-pane-width: 20rem;
+  --header-height: 3.5rem;
+  --transcript-max-width: 45rem;
+  --composer-max-width: 45rem;
+  --dialog-max-width: 46rem;
+  --phone-edge: 0.75rem;
+  --motion-fast: 120ms;
+  --motion-normal: 180ms;
+  --motion-entrance: 240ms;
+  --motion-easing: cubic-bezier(0.22, 1, 0.36, 1);
+  --shadow-popover: 0 10px 30px rgba(0, 0, 0, 0.12);
+  --shadow-dialog: 0 24px 70px rgba(0, 0, 0, 0.2);
+  --radius: var(--radius-control);
+  --background: var(--canvas);
+  --card: var(--surface);
+  --card-foreground: var(--foreground);
+  --popover: var(--surface);
+  --popover-foreground: var(--foreground);
+  --primary: var(--bubble-outgoing);
+  --primary-foreground: var(--bubble-outgoing-text);
+  --secondary: var(--surface-muted);
+  --secondary-foreground: var(--foreground);
+  --muted: var(--surface-muted);
+  --accent: var(--sidebar-selected);
+  --accent-foreground: var(--foreground);
+  --destructive: var(--danger);
+  --ring: var(--focus);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-accent: var(--sidebar-selected);
+  --sidebar-accent-foreground: var(--foreground);
+  --sidebar-border: var(--border);
 }
 
 @layer base {
@@ -74,11 +169,51 @@
 
   body {
     @apply bg-background text-foreground font-sans antialiased;
+    font-size: var(--text-body);
+    line-height: var(--leading-body);
   }
 
   button {
     cursor: pointer;
   }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--info) 24%, transparent);
+  }
+}
+
+@keyframes openbot-overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes openbot-dialog-in {
+  from {
+    opacity: 0;
+    translate: -50% -48%;
+    scale: 0.985;
+  }
+  to {
+    opacity: 1;
+    translate: -50% -50%;
+    scale: 1;
+  }
+}
+
+[data-slot="dialog-overlay"][data-state="open"] {
+  animation: openbot-overlay-in var(--motion-normal) var(--motion-easing);
+}
+
+[data-slot="dialog-content"][data-state="open"] {
+  animation: openbot-dialog-in var(--motion-entrance) var(--motion-easing);
 }
 
 @keyframes openbot-typing {
@@ -99,8 +234,32 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+
   .openbot-typing-dot {
     animation: none;
     opacity: 0.65;
+  }
+}
+
+@media (max-width: 47.999rem) {
+  @keyframes openbot-dialog-in {
+    from {
+      opacity: 0;
+      translate: 0 0.5rem;
+      scale: 1;
+    }
+    to {
+      opacity: 1;
+      translate: 0 0;
+      scale: 1;
+    }
   }
 }

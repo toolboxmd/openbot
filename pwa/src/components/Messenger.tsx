@@ -1,6 +1,7 @@
 import { FormEvent, Fragment, useEffect, useState, type ReactNode } from "react";
 import { motion } from "framer-motion";
 import { ArrowUp, Maximize2, Monitor, MoreHorizontal, Plus, Reply, Smile, Users, X } from "lucide-react";
+import { AppSettings } from "@/components/AppSettings";
 import { ComputerScreen } from "@/components/Computer";
 import { Eyes } from "@/components/Eyes";
 import { StackedEyes } from "@/components/StackedEyes";
@@ -517,7 +518,9 @@ export function Messenger() {
             <div
               className={cn(
                 "rounded-2xl px-4 py-2 text-sm whitespace-pre-wrap break-words",
-                user ? "bg-primary text-primary-foreground" : "bg-secondary text-secondary-foreground",
+                user
+                  ? "bg-bubble-outgoing text-bubble-outgoing-foreground"
+                  : "bg-bubble-incoming text-bubble-incoming-foreground",
                 nested && "text-[13px]",
               )}
             >
@@ -737,6 +740,9 @@ export function Messenger() {
           ) : (
             <p className="px-3 py-4 text-sm text-muted-foreground">No Bots yet.</p>
           )}
+        </div>
+        <div className="border-t border-sidebar-border p-3">
+          <AppSettings />
         </div>
       </aside>
       <Separator orientation="vertical" />

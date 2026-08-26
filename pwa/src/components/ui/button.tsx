@@ -4,7 +4,7 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "@/lib/utils";
 
 const buttonVariants = cva(
-  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-full text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
+  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-full text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-[var(--icon-default)] [&_svg]:shrink-0 [&_svg]:[stroke-width:var(--icon-stroke)]",
   {
     variants: {
       variant: {
@@ -15,10 +15,10 @@ const buttonVariants = cva(
       },
       size: {
         default: "h-10 px-5",
-        sm: "h-8 px-3 text-xs",
-        lg: "h-11 px-6",
+        sm: "h-8 px-3 text-xs [&_svg]:size-[var(--icon-small)]",
+        lg: "h-11 px-6 [&_svg]:size-[var(--icon-large)]",
         icon: "size-10 shrink-0 aspect-square",
-        "icon-sm": "size-8 shrink-0 aspect-square",
+        "icon-sm": "size-8 shrink-0 aspect-square [&_svg]:size-[var(--icon-small)]",
       },
     },
     defaultVariants: {
