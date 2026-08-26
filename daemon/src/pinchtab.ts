@@ -160,13 +160,13 @@ export function pinchTabBridgeConfig(token: string, port: number): Record<string
       token,
     },
     browsers: { default: "chrome" },
-    instanceDefaults: { mode: "headed" },
+    instanceDefaults: { mode: "headed", captureAllowActivation: true },
     security: {
       allowEvaluate: false,
       allowCookies: false,
       allowedDomains: ["*"],
       attach: {
-        enabled: true,
+        enabled: false,
         allowHosts: ["127.0.0.1", "localhost", "::1"],
         allowSchemes: ["ws", "wss", "http", "https"],
       },

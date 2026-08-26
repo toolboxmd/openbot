@@ -22,6 +22,7 @@ import {
 } from "../src/pinchtab.ts";
 import {
   focusPinchTab,
+  prepareBrowseCall,
   shouldBringTabFront,
   tabIdFromToolResult,
 } from "../src/pinchtab-mcp.mjs";
@@ -235,6 +236,8 @@ describe("PinchTab allowlist", () => {
     assert.equal(security.idpi.scanContent, true);
     assert.equal(security.idpi.wrapContent, true);
     assert.equal((cfg.autoSolver as { enabled: boolean }).enabled, false);
+    assert.equal((cfg.instanceDefaults as { captureAllowActivation?: boolean }).captureAllowActivation, true);
+    assert.equal((cfg.security as { attach: { enabled: boolean } }).attach.enabled, false);
   });
 });
 
@@ -570,11 +573,14 @@ describe("Computer cookie jar copy", () => {
     assert.doesNotMatch(body, /pkill -f "--user-data-dir/);
   });
 
-  test("Screen Chrome loads the extension that strips PinchTab port titles", () => {
-    const body = readFileSync(xstartup, "utf8");
-    assert.match(body, /--load-extension=\/etc\/openbot\/strip-pinchtab-title/);
-    const strip = readFileSync(join(here, "../../screen/chrome-ext/strip-pinchtab-title/strip.js"), "utf8");
-    assert.match(strip, /\\\[PinchTab :\\d\+/);
+  test("PinchTab bridge launches headed Chrome and does not CDP-attach", () => {
+    const body = readFileSync(displaySh, "utf8");
+    assert.doesNotMatch(body, /--cdp-attach/);
+    assert.match(body, /captureAllowActivation": true/);
+    const start = readFileSync(xstartup, "utf8");
+    assert.doesNotMatch(start, /--load-extension/);
+    assert.doesNotMatch(start, /chrome:\/\/new-tab-page/);
+    assert.match(start, /openbot-display pinchtab/);
   });
 });
 
@@ -587,6 +593,45 @@ describe("PinchTab tab focus", () => {
     );
     assert.equal(shouldBringTabFront("pinchtab_navigate"), true);
     assert.equal(shouldBringTabFront("pinchtab_snapshot"), false);
+  });
+
+  test("prepareBrowseCall focuses the tab before returning args", async () => {
+    const order: string[] = [];
+    const stub = await new Promise<{ url: string; close: () => Promise<void> }>((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        order.push(`${req.method} ${req.url}`);
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk) => chunks.push(chunk));
+        req.on("end", () => {
+          if ((req.url ?? "").startsWith("/tabs")) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ tabs: [{ id: "tab-live", type: "page", url: "https://example.com" }] }));
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end("{}");
+        });
+      });
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address();
+        if (!addr || typeof addr === "string") {
+          reject(new Error("prepare stub failed"));
+          return;
+        }
+        resolve({
+          url: `http://127.0.0.1:${addr.port}`,
+          close: () => new Promise((done) => server.close(() => done())),
+        });
+      });
+    });
+    try {
+      const args = await prepareBrowseCall("pinchtab_click", {}, stub.url, "tok");
+      assert.equal(args.tabId, "tab-live");
+      assert.deepEqual(order[0], "GET /tabs");
+      assert.deepEqual(order[1], "POST /tab");
+    } finally {
+      await stub.close();
+    }
   });
 
   test("focusPinchTab POSTs action=focus", async () => {

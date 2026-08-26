@@ -49,27 +49,10 @@ if command -v xfconf-query >/dev/null 2>&1; then
     xfconf-query -c xfce4-desktop -p "$prop" -s 0 >/dev/null 2>&1 || true
   done
 fi
-# CDP is container-local; do not publish.
-CHROME_BIN=""
-CDP_PORT=$((9221 + n))
-if command -v google-chrome-stable >/dev/null 2>&1; then
-  CHROME_BIN=google-chrome-stable
-elif command -v google-chrome >/dev/null 2>&1; then
-  CHROME_BIN=google-chrome
-fi
-if [ -z "$CHROME_BIN" ]; then
+# PinchTab launches headed Chrome. CDP attach injects [PinchTab :port] into document.title.
+if ! command -v google-chrome-stable >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1; then
   echo "google-chrome not found on PATH; Chromium is not a fallback" >&2
 else
-  "$CHROME_BIN" \
-    --user-data-dir="$PROFILE" \
-    --remote-debugging-port="$CDP_PORT" \
-    --remote-debugging-address=127.0.0.1 \
-    --remote-allow-origins=* \
-    --no-first-run --disable-gpu --no-sandbox --password-store=basic --test-type --disable-dev-shm-usage \
-    --disable-session-crashed-bubble --hide-crash-restore-bubble --disable-infobars \
-    --no-default-browser-check --window-size=1100,700 --window-position=90,40 \
-    --load-extension=/etc/openbot/strip-pinchtab-title \
-    chrome://new-tab-page &
   /usr/local/bin/openbot-display pinchtab "$n" || true
 fi
 wait

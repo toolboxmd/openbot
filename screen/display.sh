@@ -121,12 +121,15 @@ cookies_out() {
 
 pinchtab_config() {
   local n="$1"
-  local port token dir cfg
+  local port token dir cfg profile base name
   port="$(pinchtab_port "$n")"
   token="${PINCHTAB_TOKEN:-}"
   dir="${HOME_DIR}/.pinchtab-d${n}"
   cfg="${dir}/config.json"
-  mkdir -p "$dir"
+  profile="$(profile_dir "$n")"
+  base="$(dirname "$profile")"
+  name="$(basename "$profile")"
+  mkdir -p "$dir" "$profile"
   cat >"$cfg" <<EOF
 {
   "server": {
@@ -136,13 +139,24 @@ pinchtab_config() {
     "stateDir": "${dir}"
   },
   "browsers": { "default": "chrome" },
-  "instanceDefaults": { "mode": "headed" },
+  "browser": {
+    "binary": "/usr/bin/google-chrome-stable",
+    "extraFlags": "--disable-gpu --disable-dev-shm-usage --password-store=basic --test-type --no-first-run --no-default-browser-check --window-size=1100,700 --window-position=90,40"
+  },
+  "profiles": {
+    "baseDir": "${base}",
+    "defaultProfile": "${name}"
+  },
+  "instanceDefaults": {
+    "mode": "headed",
+    "captureAllowActivation": true
+  },
   "security": {
     "allowEvaluate": false,
     "allowCookies": false,
     "allowedDomains": ["*"],
     "attach": {
-      "enabled": true,
+      "enabled": false,
       "allowHosts": ["127.0.0.1", "localhost", "::1"],
       "allowSchemes": ["ws", "wss", "http", "https"]
     },
@@ -186,22 +200,18 @@ pinchtab_start() {
     echo "openbot-display: pinchtab not installed; PinchTab stays down" >&2
     return 0
   fi
-  cdp="$(cdp_port "$n")"
   pt="$(pinchtab_port "$n")"
-  if ! wait_cdp "$cdp"; then
-    echo "openbot-display: Chrome CDP :${cdp} did not come up; PinchTab stays down" >&2
-    return 0
-  fi
   cfg="$(pinchtab_config "$n")"
   log="${HOME_DIR}/.pinchtab-d${n}/bridge.log"
   mkdir -p "$(dirname "$log")"
+  # Bridge launches headed Chrome. CDP attach is what writes [PinchTab :port] into the tab title.
   # New session so VNC/xstartup signals do not stop the bridge.
-  # Restart if PinchTab exits; Talk fail-closed if it stays down.
   setsid sh -c "
+    export DISPLAY=:${n}
+    export CHROME_USER_DATA_DIR='$(profile_dir "$n")'
     while true; do
       PINCHTAB_CONFIG='$cfg' PINCHTAB_TOKEN='$PINCHTAB_TOKEN' \
         /usr/local/bin/pinchtab bridge \
-          --cdp-attach 'http://127.0.0.1:${cdp}' \
           --bind 0.0.0.0 \
           --port '$pt' \
           --browser chrome

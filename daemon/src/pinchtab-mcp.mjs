@@ -86,6 +86,23 @@ export async function focusPinchTab(server, token, tabId) {
   }
 }
 
+export async function prepareBrowseCall(name, args, server, token) {
+  const next = { ...(args && typeof args === "object" ? args : {}) };
+  const existing =
+    typeof next.tabId === "string" && next.tabId
+      ? next.tabId
+      : typeof next.tab_id === "string" && next.tab_id
+        ? next.tab_id
+        : "";
+  let tabId = existing;
+  if (!tabId) tabId = await reuseExistingTabId(server, token);
+  if (tabId) {
+    await focusPinchTab(server, token, tabId);
+    if (!next.tabId && !next.tab_id) next.tabId = tabId;
+  }
+  return next;
+}
+
 class RpcReader {
   constructor() {
     this.buf = Buffer.alloc(0);
@@ -188,8 +205,13 @@ export function runPinchTabAllowlistProxy(
   const fromClient = new RpcReader();
   const fromChild = new RpcReader();
   const listIds = new Set();
-  const frontIds = new Set();
+  const navigateIds = new Set();
   let clientFraming = "ndjson";
+  let sendChain = Promise.resolve();
+
+  const enqueueSend = (fn) => {
+    sendChain = sendChain.then(fn).catch(() => undefined);
+  };
 
   const writeOut = (obj, framing) => {
     stdout.write(encode(obj, framing));
@@ -219,18 +241,16 @@ export function runPinchTabAllowlistProxy(
           }
           continue;
         }
-        if (obj.id !== undefined && obj.id !== null && shouldBringTabFront(name)) {
-          frontIds.add(obj.id);
-        }
-        if (normalizePinchTabToolName(name) === "navigate") {
-          const args = toolArguments(obj.params);
-          if (!args.tabId && !args.tab_id) {
-            void reuseExistingTabId(server, token).then((tabId) => {
-              const next = tabId ? { ...obj, params: { ...obj.params, arguments: { ...args, tabId } } } : obj;
-              if (child.stdin) child.stdin.write(encode(next, framing));
-            });
-            continue;
+        if (shouldBringTabFront(name)) {
+          if (obj.id !== undefined && obj.id !== null && normalizePinchTabToolName(name) === "navigate") {
+            navigateIds.add(obj.id);
           }
+          enqueueSend(async () => {
+            const args = await prepareBrowseCall(name, toolArguments(obj.params), server, token);
+            const next = { ...obj, params: { ...obj.params, arguments: args } };
+            if (child.stdin) child.stdin.write(encode(next, framing));
+          });
+          continue;
         }
       }
       if (obj.method === "tools/list" && obj.id !== undefined && obj.id !== null) {
@@ -255,8 +275,8 @@ export function runPinchTabAllowlistProxy(
         continue;
       }
       writeOut(obj, framing);
-      if (obj.id !== undefined && obj.id !== null && frontIds.has(obj.id) && obj.result !== undefined) {
-        frontIds.delete(obj.id);
+      if (obj.id !== undefined && obj.id !== null && navigateIds.has(obj.id) && obj.result !== undefined) {
+        navigateIds.delete(obj.id);
         const tabId = tabIdFromToolResult(obj.result);
         if (tabId) void focusPinchTab(server, token, tabId);
       }

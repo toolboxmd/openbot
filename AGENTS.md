@@ -17,5 +17,5 @@ A fake Harness is for Talk machinery (Home sqlite, inject text, receipts, interr
 
 ## Recent Changes
 
-- 2026-08-26: Isolated v1 auto-allows commands and PinchTab. Host grant stays host paths only. Screen Chrome drops the PinchTab port title and focuses the agent's tab.
+- 2026-08-26: PinchTab owns headed Screen Chrome (no CDP-attach title). Talk focuses the tab before click/type/fill. Isolated v1 auto-allows commands.
 - 2026-08-26: PinchTab Talk MCP. One bridge per Screen Chrome. Talk allowlists stock `pinchtab mcp --server`. Fail closed. Cookie jar stays Screen copy.
