@@ -466,6 +466,42 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         return;
       }
 
+      if (url.pathname === "/api/agents" && method === "GET") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        sendJson(res, 200, { text: store.readAllBotsAgents() });
+        return;
+      }
+
+      if (url.pathname === "/api/agents" && method === "PUT") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        let body: Record<string, unknown> = {};
+        try {
+          const raw = await readBody(req);
+          body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        const text = typeof body.text === "string" ? body.text : "";
+        sendJson(res, 200, { text: store.writeAllBotsAgents(text) });
+        return;
+      }
+
+      if (url.pathname === "/api/host-grants" && method === "GET") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        sendJson(res, 200, { grants: store.listHostGrants() });
+        return;
+      }
+
       if (url.pathname === "/api/harnesses" && method === "GET") {
         if (!hasSession(req, key)) {
           sendJson(res, 401, { error: "unauthenticated" });
@@ -653,13 +689,54 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
           return;
         }
         try {
-          const optionId = typeof body.optionId === "string" ? body.optionId : "";
-          const bot = store.answerPermission(decodeURIComponent(permMatch[1]), optionId);
-          sendJson(res, 200, bot);
+          const botId = decodeURIComponent(permMatch[1]);
+          if (typeof body.access === "string") {
+            const duration = typeof body.duration === "string" ? body.duration : "session";
+            const bot = store.answerHostGrant(botId, body.access, duration);
+            sendJson(res, 200, bot);
+          } else {
+            const optionId = typeof body.optionId === "string" ? body.optionId : "";
+            const bot = store.answerPermission(botId, optionId);
+            sendJson(res, 200, bot);
+          }
         } catch (err) {
           sendStoreError(res, err);
         }
         return;
+      }
+
+      const botAgentsMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/agents$/);
+      if (botAgentsMatch) {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        const botId = decodeURIComponent(botAgentsMatch[1]);
+        if (method === "GET") {
+          try {
+            sendJson(res, 200, { text: store.readThisBotAgents(botId) });
+          } catch (err) {
+            sendStoreError(res, err);
+          }
+          return;
+        }
+        if (method === "PUT") {
+          let body: Record<string, unknown> = {};
+          try {
+            const raw = await readBody(req);
+            body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+          } catch {
+            sendJson(res, 400, { error: "invalid json" });
+            return;
+          }
+          try {
+            const text = typeof body.text === "string" ? body.text : "";
+            sendJson(res, 200, { text: store.writeThisBotAgents(botId, text) });
+          } catch (err) {
+            sendStoreError(res, err);
+          }
+          return;
+        }
       }
 
       const harnessMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/harness$/);
@@ -712,8 +789,17 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
             return;
           }
           try {
-            const harness = typeof body.harness === "string" ? body.harness : "";
-            const bot = await store.pickHarness(botId, harness);
+            let bot = store.get(botId);
+            if (!bot) {
+              sendJson(res, 404, { error: "Bot not found" });
+              return;
+            }
+            if (typeof body.configMode === "string") {
+              bot = await store.setConfigMode(botId, body.configMode);
+            }
+            if (typeof body.harness === "string" && body.harness) {
+              bot = await store.pickHarness(botId, body.harness);
+            }
             sendJson(res, 200, bot);
           } catch (err) {
             sendStoreError(res, err);

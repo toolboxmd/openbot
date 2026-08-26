@@ -5,8 +5,16 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { SHAPES, type FaceShape } from "./face.ts";
 import { isHarnessId, type HarnessId } from "./harness.ts";
+import {
+  isHostGrantAccess,
+  isHostGrantDuration,
+  pathCoveredByGrant,
+  type ConfigMode,
+  type HostGrantAccess,
+  type HostGrantDuration,
+} from "./harness-home.ts";
 
-export const HOME_SCHEMA_VERSION = 1;
+export const HOME_SCHEMA_VERSION = 2;
 export const HUMAN_MEMBER_ID = "you";
 
 export type MessageReceipt = "sent" | "delivered" | "read";
@@ -16,11 +24,14 @@ export type MessageReaction = {
   by: "user";
 };
 
+export type TranscriptKind = "text" | "host-grant";
+
 export type TranscriptMessage = {
   id: string;
   role: "user" | "assistant";
   text: string;
   createdAt: string;
+  kind?: TranscriptKind;
   receipt?: MessageReceipt;
   replyTo?: string;
   reactions?: MessageReaction[];
@@ -32,6 +43,16 @@ export type StoredBot = {
   color: string;
   shape: FaceShape;
   harness: HarnessId | null;
+  configMode?: ConfigMode;
+  createdAt: string;
+};
+
+export type StoredHostGrant = {
+  id: string;
+  path: string;
+  access: HostGrantAccess;
+  duration: HostGrantDuration;
+  consumed: boolean;
   createdAt: string;
 };
 
@@ -72,6 +93,7 @@ export class HomeStore {
   readonly databasePath: string;
   private readonly db: DatabaseSync;
   private closed = false;
+  private readonly sessionGrants: StoredHostGrant[] = [];
 
   constructor(homeDir = defaultHomeDir()) {
     this.homeDir = path.resolve(homeDir);
@@ -99,7 +121,7 @@ export class HomeStore {
 
   listBots(): StoredBot[] {
     return this.db
-      .prepare("SELECT id, name, color, shape, harness, created_at FROM bots ORDER BY rowid")
+      .prepare("SELECT id, name, color, shape, harness, config_mode, created_at FROM bots ORDER BY rowid")
       .all()
       .flatMap((row) => reviveBot(row as SqlRow));
   }
@@ -117,7 +139,7 @@ export class HomeStore {
   listMessages(channelId: string): TranscriptMessage[] {
     return this.db
       .prepare(
-        `SELECT id, sender_kind, text, created_at, reply_to
+        `SELECT id, kind, sender_kind, text, created_at, reply_to
          FROM messages WHERE channel_id = ? ORDER BY sequence`,
       )
       .all(channelId)
@@ -127,7 +149,7 @@ export class HomeStore {
   getMessage(channelId: string, messageId: string): TranscriptMessage | null {
     const row = this.db
       .prepare(
-        `SELECT id, sender_kind, text, created_at, reply_to
+        `SELECT id, kind, sender_kind, text, created_at, reply_to
          FROM messages WHERE channel_id = ? AND id = ?`,
       )
       .get(channelId, messageId) as SqlRow | undefined;
@@ -213,9 +235,9 @@ export class HomeStore {
     this.transaction(() => {
       this.db
         .prepare(
-          "INSERT INTO bots (id, name, color, shape, harness, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+          "INSERT INTO bots (id, name, color, shape, harness, config_mode, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
-        .run(bot.id, bot.name, bot.color, bot.shape, bot.harness, bot.createdAt);
+        .run(bot.id, bot.name, bot.color, bot.shape, bot.harness, bot.configMode ?? "isolated", bot.createdAt);
       this.db
         .prepare("INSERT INTO channels (id, kind, title, created_at) VALUES (?, ?, ?, ?)")
         .run(channel.id, channel.kind, channel.title, channel.createdAt);
@@ -232,6 +254,73 @@ export class HomeStore {
         .run(bot.id, channel.id, bot.harness);
     });
     return channel;
+  }
+
+  setConfigMode(botId: string, configMode: ConfigMode): void {
+    if (this.closed) return;
+    this.transaction(() => {
+      const changed = this.db.prepare("UPDATE bots SET config_mode = ? WHERE id = ?").run(configMode, botId);
+      if (changed.changes !== 1) throw Object.assign(new Error("Bot not found"), { status: 404 });
+      this.db.prepare("UPDATE bot_channel_state SET session_id = NULL WHERE bot_id = ?").run(botId);
+    });
+  }
+
+  addHostGrant(input: {
+    path: string;
+    access: HostGrantAccess;
+    duration: HostGrantDuration;
+  }): StoredHostGrant {
+    const grant: StoredHostGrant = {
+      id: crypto.randomUUID(),
+      path: path.resolve(input.path),
+      access: input.access,
+      duration: input.duration,
+      consumed: false,
+      createdAt: new Date().toISOString(),
+    };
+    if (input.duration === "session") {
+      this.sessionGrants.push(grant);
+      return grant;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO host_grants (id, path, access, duration, consumed, created_at)
+         VALUES (?, ?, ?, ?, 0, ?)`,
+      )
+      .run(grant.id, grant.path, grant.access, grant.duration, grant.createdAt);
+    return grant;
+  }
+
+  matchHostGrant(requestPath: string, requested: HostGrantAccess): StoredHostGrant | null {
+    const resolved = path.resolve(requestPath);
+    const live = [...this.sessionGrants, ...this.listPersistedGrants()].filter((grant) => !grant.consumed);
+    for (const grant of live) {
+      if (!pathCoveredByGrant(resolved, grant.path)) continue;
+      if (grant.access === "deny") return grant;
+      if (grant.access === "read-write") return grant;
+      if (grant.access === "read" && requested === "read") return grant;
+    }
+    return null;
+  }
+
+  consumeHostGrant(id: string): void {
+    const session = this.sessionGrants.find((grant) => grant.id === id);
+    if (session) {
+      session.consumed = true;
+      return;
+    }
+    this.db.prepare("UPDATE host_grants SET consumed = 1 WHERE id = ?").run(id);
+  }
+
+  listHostGrants(): StoredHostGrant[] {
+    return [...this.sessionGrants, ...this.listPersistedGrants()].filter((grant) => !grant.consumed);
+  }
+
+  private listPersistedGrants(): StoredHostGrant[] {
+    return this.db
+      .prepare("SELECT id, path, access, duration, consumed, created_at FROM host_grants ORDER BY created_at")
+      .all()
+      .flatMap((row) => reviveGrant(row as SqlRow));
   }
 
   setHarness(botId: string, harness: HarnessId): void {
@@ -276,11 +365,12 @@ export class HomeStore {
         .prepare(
           `INSERT INTO messages
             (id, channel_id, kind, sender_kind, sender_id, text, created_at, reply_to)
-           VALUES (?, ?, 'text', ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           message.id,
           channelId,
+          message.kind ?? "text",
           message.role === "user" ? "user" : "bot",
           message.senderId,
           message.text,
@@ -349,13 +439,15 @@ export class HomeStore {
     if (version === HOME_SCHEMA_VERSION) return;
 
     this.transaction(() => {
-      this.db.exec(`
+      if (version === 0) {
+        this.db.exec(`
         CREATE TABLE bots (
           id TEXT PRIMARY KEY,
           name TEXT NOT NULL,
           color TEXT NOT NULL,
           shape TEXT NOT NULL,
           harness TEXT,
+          config_mode TEXT NOT NULL DEFAULT 'isolated',
           created_at TEXT NOT NULL
         );
 
@@ -423,8 +515,29 @@ export class HomeStore {
           PRIMARY KEY (bot_id, channel_id)
         );
 
-        PRAGMA user_version = 1;
-      `);
+        CREATE TABLE host_grants (
+          id TEXT PRIMARY KEY,
+          path TEXT NOT NULL,
+          access TEXT NOT NULL,
+          duration TEXT NOT NULL,
+          consumed INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL
+        );
+        `);
+      } else if (version === 1) {
+        this.db.exec(`
+          ALTER TABLE bots ADD COLUMN config_mode TEXT NOT NULL DEFAULT 'isolated';
+          CREATE TABLE IF NOT EXISTS host_grants (
+            id TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            access TEXT NOT NULL,
+            duration TEXT NOT NULL,
+            consumed INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+          );
+        `);
+      }
+      this.db.exec(`PRAGMA user_version = ${HOME_SCHEMA_VERSION};`);
     });
   }
 
@@ -470,6 +583,7 @@ export class HomeStore {
       text: row.text,
       createdAt: row.created_at,
     };
+    if (row.kind === "host-grant") message.kind = "host-grant";
     if (isReceipt(receiptRow?.state)) message.receipt = receiptRow.state;
     if (typeof row.reply_to === "string" && row.reply_to) message.replyTo = row.reply_to;
     if (reactions.length) message.reactions = reactions;
@@ -505,6 +619,7 @@ function reviveBot(row: SqlRow): StoredBot[] {
     return [];
   }
   const harness = typeof row.harness === "string" && isHarnessId(row.harness) ? row.harness : null;
+  const configMode: ConfigMode = row.config_mode === "host" ? "host" : "isolated";
   return [
     {
       id: row.id,
@@ -512,6 +627,29 @@ function reviveBot(row: SqlRow): StoredBot[] {
       color: row.color,
       shape: row.shape as FaceShape,
       harness,
+      configMode,
+      createdAt: row.created_at,
+    },
+  ];
+}
+
+function reviveGrant(row: SqlRow): StoredHostGrant[] {
+  if (
+    typeof row.id !== "string" ||
+    typeof row.path !== "string" ||
+    typeof row.created_at !== "string" ||
+    !isHostGrantAccess(row.access) ||
+    !isHostGrantDuration(row.duration)
+  ) {
+    return [];
+  }
+  return [
+    {
+      id: row.id,
+      path: row.path,
+      access: row.access,
+      duration: row.duration,
+      consumed: row.consumed === 1 || row.consumed === true,
       createdAt: row.created_at,
     },
   ];

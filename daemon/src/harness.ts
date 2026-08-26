@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { applyVendorHomeEnv } from "./harness-home.ts";
 
 export const HARNESS_IDS = ["codex", "claude", "grok", "kimi"] as const;
 export type HarnessId = (typeof HARNESS_IDS)[number];
@@ -75,13 +76,30 @@ export function isHarnessId(value: string): value is HarnessId {
  * The adapter is https://github.com/agentclientprotocol/codex-acp and wraps
  * the host `codex` via CODEX_PATH. Do not use Grok websocket agent serve.
  */
-export function spawnSpec(id: HarnessId): SpawnSpec {
+export type SpawnMode = "isolated" | "host";
+
+export type SpawnSpecOptions = {
+  mode?: SpawnMode;
+  homeDir?: string;
+  cwd?: string;
+  botId?: string;
+  screenContainer?: string;
+};
+
+export function spawnSpec(id: HarnessId, opts: SpawnSpecOptions = {}): SpawnSpec {
   if (id !== "codex") {
     throw new Error("Talk spawn is Codex-only in this slice");
   }
-  const env: NodeJS.ProcessEnv = { ...process.env };
+  let env: NodeJS.ProcessEnv = { ...process.env };
   env.PATH = pathWithLocalBin(env.PATH ?? "");
   delete env.DISPLAY;
+  if (opts.homeDir) {
+    const mode = opts.mode ?? "isolated";
+    env = applyVendorHomeEnv(env, mode, opts.homeDir, opts.cwd, {
+      botId: opts.botId,
+      screenContainer: opts.screenContainer,
+    });
+  }
   const codex = resolveBin("codex");
   if (!codex) {
     throw new Error("codex is not on PATH");

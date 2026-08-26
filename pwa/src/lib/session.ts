@@ -24,6 +24,7 @@ export type Bot = {
   id: string;
   name: string;
   harness: string | null;
+  configMode?: "isolated" | "host";
   eyes: { color: string; shape: string; mode: EyesMode };
   write: boolean;
   zoom?: boolean;
@@ -32,6 +33,7 @@ export type Bot = {
     title: string;
     description?: string;
     options: Array<{ optionId: string; name: string; kind?: string }>;
+    hostGrant?: { path: string; requested?: "read" | "read-write" };
   } | null;
   needsYou: { reason: "login"; hint: string } | null;
   messages?: Array<{
@@ -42,6 +44,7 @@ export type Bot = {
     receipt?: "sent" | "delivered" | "read";
     replyTo?: string;
     reactions?: Array<{ emoji: string; by: "user" }>;
+    kind?: "text" | "host-grant";
   }>;
 };
 
@@ -174,6 +177,75 @@ export async function answerPermission(botId: string, optionId: string): Promise
     throw new Error("Could not answer permission.");
   }
   return (await res.json()) as Bot;
+}
+
+export async function answerHostGrant(
+  botId: string,
+  access: string,
+  duration: string,
+): Promise<Bot> {
+  const res = await fetch(`/api/bots/${encodeURIComponent(botId)}/permissions`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ access, duration }),
+  });
+  if (!res.ok) {
+    throw new Error("Could not answer Host grant.");
+  }
+  return (await res.json()) as Bot;
+}
+
+export async function setConfigMode(botId: string, configMode: "isolated" | "host"): Promise<Bot> {
+  const res = await fetch(`/api/bots/${encodeURIComponent(botId)}`, {
+    method: "PATCH",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ configMode }),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Could not set Isolated or Host.");
+  }
+  return (await res.json()) as Bot;
+}
+
+export async function getAllBotsAgents(): Promise<string> {
+  const res = await fetch("/api/agents", { credentials: "same-origin" });
+  if (!res.ok) throw new Error("Could not load All Bots.");
+  const body = (await res.json()) as { text?: string };
+  return body.text ?? "";
+}
+
+export async function putAllBotsAgents(text: string): Promise<string> {
+  const res = await fetch("/api/agents", {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw new Error("Could not save All Bots.");
+  const body = (await res.json()) as { text?: string };
+  return body.text ?? text;
+}
+
+export async function getThisBotAgents(botId: string): Promise<string> {
+  const res = await fetch(`/api/bots/${encodeURIComponent(botId)}/agents`, { credentials: "same-origin" });
+  if (!res.ok) throw new Error("Could not load This Bot.");
+  const body = (await res.json()) as { text?: string };
+  return body.text ?? "";
+}
+
+export async function putThisBotAgents(botId: string, text: string): Promise<string> {
+  const res = await fetch(`/api/bots/${encodeURIComponent(botId)}/agents`, {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw new Error("Could not save This Bot.");
+  const body = (await res.json()) as { text?: string };
+  return body.text ?? text;
 }
 
 export type Computer = {

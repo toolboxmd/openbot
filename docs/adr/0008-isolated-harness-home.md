@@ -9,7 +9,7 @@ ADR 0005 put the Harness on the host OS and reused `~/.codex` (and friends) for 
 ADR 0007 made Workspace the single ACP cwd for every Bot. Then a This-Bot AGENTS.md cannot be a real project file. Vendors walk cwd to the git root. They do not care where the CLI binary lives.
 
 ## Decision
-Isolated is the Computer default, override per Bot. Talk sets `CODEX_HOME` / `CLAUDE_CONFIG_DIR` / `GROK_HOME` / `KIMI_CODE_HOME` to Harness Home on the Computer. Host mode unsets those and uses the user's real vendor home.
+Isolated is the Computer default, override per Bot. Talk sets `CODEX_HOME` / `CLAUDE_CONFIG_DIR` / `GROK_HOME` / `KIMI_CODE_HOME` to Harness Home on the Computer. Host mode unsets those and uses the user's real vendor home. Isolated spawn sets Unix `HOME` to `Workspace/bots/<id>/` (This Bot's directory, same as Session cwd). Host does not set `HOME`. Vendor env is still Harness Home. This is not a fake `/home/name`, not Workspace root, and not `harness/unix-home`.
 
 Harness Home is one vendor dir plus Computer `shared/`. Skills, plugins, hook scripts, and `OPENBOT.md` live in `shared/` and symlink into each Isolated home. `config.toml` / Claude `settings.json` stay native files in the vendor dir. Auth is a host-login symlink or API key so the user is not asked twice. Do not symlink sessions or logs.
 
@@ -20,4 +20,4 @@ The Workspace jail is the shared drop plus every Bot directory. Every Bot may re
 This supersedes ADR 0007's "there is no per-Bot cwd" and ADR 0005's implication that the only vendor home is `~/.codex`.
 
 ## Consequences
-A Bot in Isolated does not inherit the user's global Codex/Claude/Grok/Kimi config. A Bot in Host does. Both still see Workspace AGENTS.md because cwd is under Workspace. Ada's rules and Ben's rules can differ. Empty Workspace still loads `OPENBOT.md` when Isolated.
+A Bot in Isolated does not inherit the user's global Codex/Claude/Grok/Kimi config. A Bot in Host does. Both still see Workspace AGENTS.md because cwd is under Workspace. Ada's rules and Ben's rules can differ. Empty Workspace still loads `OPENBOT.md` when Isolated. Codex USER skills follow Unix HOME, so Isolated ~ closes `$HOME/.agents` on the host. Ada's Isolated ~ is not Ben's.
