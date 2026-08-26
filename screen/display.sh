@@ -121,8 +121,9 @@ cookies_out() {
 
 pinchtab_config() {
   local n="$1"
-  local port token dir cfg profile base name
+  local port token dir cfg profile base name cdp
   port="$(pinchtab_port "$n")"
+  cdp="$(cdp_port "$n")"
   token="${PINCHTAB_TOKEN:-}"
   dir="${HOME_DIR}/.pinchtab-d${n}"
   cfg="${dir}/config.json"
@@ -141,7 +142,7 @@ pinchtab_config() {
   "browsers": { "default": "chrome" },
   "browser": {
     "binary": "/usr/bin/google-chrome-stable",
-    "extraFlags": "--disable-gpu --disable-dev-shm-usage --password-store=basic --test-type --no-first-run --no-default-browser-check --window-size=1100,700 --window-position=90,40"
+    "remoteDebuggingPort": ${cdp}
   },
   "profiles": {
     "baseDir": "${base}",
@@ -173,11 +174,12 @@ EOF
   echo "$cfg"
 }
 
-wait_cdp() {
+wait_bridge() {
   local port="$1"
   local i
   for i in $(seq 1 60); do
-    if curl -fsS "http://127.0.0.1:${port}/json/version" >/dev/null 2>&1; then
+    if curl -fsS -H "Authorization: Bearer ${PINCHTAB_TOKEN}" \
+         "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -185,9 +187,18 @@ wait_cdp() {
   return 1
 }
 
+# Launch headed Chrome now. Bridge stays up with no window until this or the first navigate.
+ensure_chrome() {
+  local port="$1"
+  curl -fsS -X POST \
+    -H "Authorization: Bearer ${PINCHTAB_TOKEN}" \
+    -H "content-type: application/json" \
+    "http://127.0.0.1:${port}/ensure-browser" >/dev/null 2>&1
+}
+
 pinchtab_start() {
   local n="$1"
-  local cdp pt cfg log
+  local pt cfg log
   if [ -z "${PINCHTAB_TOKEN:-}" ] && [ -f /etc/openbot/pinchtab.token ]; then
     PINCHTAB_TOKEN="$(cat /etc/openbot/pinchtab.token)"
     export PINCHTAB_TOKEN
@@ -204,7 +215,7 @@ pinchtab_start() {
   cfg="$(pinchtab_config "$n")"
   log="${HOME_DIR}/.pinchtab-d${n}/bridge.log"
   mkdir -p "$(dirname "$log")"
-  # Bridge launches headed Chrome. CDP attach is what writes [PinchTab :port] into the tab title.
+  # Bridge launches headed Chrome. CDP attach injects [PinchTab :port] into document.title; this path does not attach.
   # New session so VNC/xstartup signals do not stop the bridge.
   setsid sh -c "
     export DISPLAY=:${n}
@@ -218,6 +229,13 @@ pinchtab_start() {
       sleep 1
     done
   " >>"$log" 2>&1 < /dev/null &
+  if ! wait_bridge "$pt"; then
+    echo "openbot-display: PinchTab bridge :${pt} did not become healthy" >&2
+    return 0
+  fi
+  if ! ensure_chrome "$pt"; then
+    echo "openbot-display: PinchTab did not launch headed Chrome on :${pt}" >&2
+  fi
 }
 
 stop_chrome() {

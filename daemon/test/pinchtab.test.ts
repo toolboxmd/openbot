@@ -19,6 +19,7 @@ import {
   pinchTabMcpServers,
   pinchTabToolAllowed,
   stripPinchTabFromPath,
+  waitForPinchTabBridge,
 } from "../src/pinchtab.ts";
 import {
   focusPinchTab,
@@ -576,7 +577,11 @@ describe("Computer cookie jar copy", () => {
   test("PinchTab bridge launches headed Chrome and does not CDP-attach", () => {
     const body = readFileSync(displaySh, "utf8");
     assert.doesNotMatch(body, /--cdp-attach/);
+    assert.doesNotMatch(body, /extraFlags/);
+    assert.doesNotMatch(body, /window-size/);
     assert.match(body, /captureAllowActivation": true/);
+    assert.match(body, /remoteDebuggingPort/);
+    assert.match(body, /ensure-browser/);
     const start = readFileSync(xstartup, "utf8");
     assert.doesNotMatch(start, /--load-extension/);
     assert.doesNotMatch(start, /chrome:\/\/new-tab-page/);
@@ -593,6 +598,35 @@ describe("PinchTab tab focus", () => {
     );
     assert.equal(shouldBringTabFront("pinchtab_navigate"), true);
     assert.equal(shouldBringTabFront("pinchtab_snapshot"), false);
+  });
+
+  test("waitForPinchTabBridge POSTs /ensure-browser after health", async () => {
+    const seen: string[] = [];
+    const stub = await new Promise<{ url: string; close: () => Promise<void> }>((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        seen.push(`${req.method} ${req.url}`);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(req.url === "/ensure-browser" ? JSON.stringify({ status: "browser_ready" }) : JSON.stringify({ status: "ok" }));
+      });
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address();
+        if (!addr || typeof addr === "string") {
+          reject(new Error("ensure stub failed"));
+          return;
+        }
+        resolve({
+          url: `http://127.0.0.1:${addr.port}`,
+          close: () => new Promise((done) => server.close(() => done())),
+        });
+      });
+    });
+    try {
+      assert.equal(await waitForPinchTabBridge(stub.url, "tok", 2000), true);
+      assert.equal(seen[0], "GET /health");
+      assert.equal(seen.includes("POST /ensure-browser"), true);
+    } finally {
+      await stub.close();
+    }
   });
 
   test("prepareBrowseCall focuses the tab before returning args", async () => {

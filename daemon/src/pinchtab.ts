@@ -180,7 +180,13 @@ export function pinchTabBridgeConfig(token: string, port: number): Record<string
   };
 }
 
-function probe(url: string, pathname: string, token: string, timeoutMs: number): Promise<number | null> {
+function probe(
+  url: string,
+  pathname: string,
+  token: string,
+  timeoutMs: number,
+  method = "GET",
+): Promise<number | null> {
   return new Promise((resolve) => {
     let dest: URL;
     try {
@@ -192,7 +198,7 @@ function probe(url: string, pathname: string, token: string, timeoutMs: number):
     const req = http.request(
       dest,
       {
-        method: "GET",
+        method,
         headers: {
           authorization: `Bearer ${token}`,
           connection: "close",
@@ -221,6 +227,13 @@ export async function pinchTabHealthy(url: string, token: string, timeoutMs = 15
   return tabs !== null && tabs >= 200 && tabs < 300;
 }
 
+/** PinchTab only opens headed Chrome on /ensure-browser or the first navigate. */
+export async function ensurePinchTabBrowser(url: string, token: string, timeoutMs = 20_000): Promise<boolean> {
+  if (!url || !token) return false;
+  const status = await probe(url, "/ensure-browser", token, timeoutMs, "POST");
+  return status !== null && status >= 200 && status < 300;
+}
+
 export async function waitForPinchTabBridge(
   url: string,
   token: string,
@@ -228,10 +241,15 @@ export async function waitForPinchTabBridge(
 ): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (await pinchTabHealthy(url, token, 800)) return true;
+    if (await pinchTabHealthy(url, token, 800)) {
+      await ensurePinchTabBrowser(url, token);
+      return true;
+    }
     await new Promise((resolve) => setTimeout(resolve, 400));
   }
-  return pinchTabHealthy(url, token, 800);
+  if (!(await pinchTabHealthy(url, token, 800))) return false;
+  await ensurePinchTabBrowser(url, token);
+  return true;
 }
 
 export async function pinchTabMcpServers(

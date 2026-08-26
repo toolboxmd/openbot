@@ -49,7 +49,7 @@ if command -v xfconf-query >/dev/null 2>&1; then
     xfconf-query -c xfce4-desktop -p "$prop" -s 0 >/dev/null 2>&1 || true
   done
 fi
-# PinchTab launches headed Chrome. CDP attach injects [PinchTab :port] into document.title.
+# PinchTab launches headed Chrome. CDP attach would write [PinchTab :port] into document.title.
 if ! command -v google-chrome-stable >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1; then
   echo "google-chrome not found on PATH; Chromium is not a fallback" >&2
 else

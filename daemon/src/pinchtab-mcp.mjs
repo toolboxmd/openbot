@@ -79,7 +79,7 @@ export async function focusPinchTab(server, token, tabId) {
         ...(token ? { authorization: `Bearer ${token}` } : {}),
       },
       body: JSON.stringify({ action: "focus", tabId }),
-      signal: AbortSignal.timeout(1500),
+      signal: AbortSignal.timeout(5000),
     });
   } catch {
     /* Screen Chrome stays as-is */
@@ -274,12 +274,16 @@ export function runPinchTabAllowlistProxy(
         writeOut({ ...obj, result: filterListResult(obj.result) }, framing);
         continue;
       }
-      writeOut(obj, framing);
       if (obj.id !== undefined && obj.id !== null && navigateIds.has(obj.id) && obj.result !== undefined) {
         navigateIds.delete(obj.id);
-        const tabId = tabIdFromToolResult(obj.result);
-        if (tabId) void focusPinchTab(server, token, tabId);
+        enqueueSend(async () => {
+          const tabId = tabIdFromToolResult(obj.result);
+          if (tabId) await focusPinchTab(server, token, tabId);
+          writeOut(obj, framing);
+        });
+        continue;
       }
+      writeOut(obj, framing);
     }
   });
 
