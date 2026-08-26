@@ -58,42 +58,64 @@ cookie_files() {
   echo Cookies Cookies-journal Cookies-wal Cookies-shm
 }
 
+# Chrome 115+ stores cookies in Default/Network/Cookies. Default/Cookies is leftover.
+copy_cookie_files() {
+  local src="$1"
+  local dest="$2"
+  local f
+  mkdir -p "$dest"
+  for f in $(cookie_files); do
+    if [ -f "$src/$f" ]; then
+      cp -a "$src/$f" "$dest/$f" || true
+    fi
+  done
+}
+
+promote_legacy_cookies() {
+  local dest="$1"
+  if [ ! -f "$dest/Network/Cookies" ] && [ -f "$dest/Cookies" ]; then
+    mkdir -p "$dest/Network"
+    copy_cookie_files "$dest" "$dest/Network"
+  fi
+}
+
+checkpoint_cookie_db() {
+  local db="$1"
+  if [ -f "$db" ] && command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 "$db" "PRAGMA wal_checkpoint(FULL);" >/dev/null 2>&1 || true
+  fi
+}
+
 # Chrome encrypts cookie values with os_crypt in Local State. Copy that with the jar.
 cookies_in() {
   local n="$1"
-  local profile f
+  local profile
   profile="$(profile_dir "$n")"
   mkdir -p "$profile/Default/Network"
   if [ -f "$COOKIE_JAR/Local State" ]; then
     cp -a "$COOKIE_JAR/Local State" "$profile/Local State" || true
   fi
-  for f in $(cookie_files); do
-    if [ -f "$COOKIE_JAR/$f" ]; then
-      cp -a "$COOKIE_JAR/$f" "$profile/Default/$f" || true
-    fi
-  done
-  if [ -d "$COOKIE_JAR/Network" ]; then
-    cp -a "$COOKIE_JAR/Network/." "$profile/Default/Network/" || true
+  copy_cookie_files "$COOKIE_JAR/Network" "$profile/Default/Network"
+  copy_cookie_files "$COOKIE_JAR" "$profile/Default"
+  if [ ! -f "$profile/Default/Network/Cookies" ] && [ -f "$COOKIE_JAR/Cookies" ]; then
+    copy_cookie_files "$COOKIE_JAR" "$profile/Default/Network"
   fi
   chown -R "$USER_NAME:$USER_NAME" "$profile" || true
 }
 
 cookies_out() {
   local n="$1"
-  local profile f
+  local profile
   profile="$(profile_dir "$n")"
   mkdir -p "$COOKIE_JAR/Network"
+  checkpoint_cookie_db "$profile/Default/Network/Cookies"
+  checkpoint_cookie_db "$profile/Default/Cookies"
   if [ -f "$profile/Local State" ]; then
     cp -a "$profile/Local State" "$COOKIE_JAR/Local State" || true
   fi
-  for f in $(cookie_files); do
-    if [ -f "$profile/Default/$f" ]; then
-      cp -a "$profile/Default/$f" "$COOKIE_JAR/$f" || true
-    fi
-  done
-  if [ -d "$profile/Default/Network" ]; then
-    cp -a "$profile/Default/Network/." "$COOKIE_JAR/Network/" || true
-  fi
+  copy_cookie_files "$profile/Default/Network" "$COOKIE_JAR/Network"
+  copy_cookie_files "$profile/Default" "$COOKIE_JAR"
+  promote_legacy_cookies "$COOKIE_JAR"
   chmod -R a+rX "$COOKIE_JAR" || true
 }
 

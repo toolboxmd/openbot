@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       dbus-x11 \
       fonts-dejavu-core \
       procps \
+      sqlite3 \
       ssl-cert \
       thunar \
       wget \

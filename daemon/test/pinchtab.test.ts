@@ -458,6 +458,8 @@ describe("Computer cookie jar copy", () => {
     mkdirSync(join(home, ".config", "google-chrome", "Default", "Network"), { recursive: true });
     mkdirSync(jar, { recursive: true });
     writeFileSync(join(jar, "Cookies"), "jar-in");
+    mkdirSync(join(jar, "Network"), { recursive: true });
+    writeFileSync(join(jar, "Network", "Cookies"), "net-in");
     writeFileSync(join(jar, "Local State"), '{"os_crypt":{"encrypted_key":"in"}}');
     const env = {
       ...process.env,
@@ -469,6 +471,10 @@ describe("Computer cookie jar copy", () => {
     const inCode = await new Promise<number>((resolve) => inn.on("close", (code) => resolve(code ?? 1)));
     assert.equal(inCode, 0);
     assert.equal(readFileSync(join(home, ".config", "google-chrome", "Default", "Cookies"), "utf8"), "jar-in");
+    assert.equal(
+      readFileSync(join(home, ".config", "google-chrome", "Default", "Network", "Cookies"), "utf8"),
+      "net-in",
+    );
     assert.equal(
       readFileSync(join(home, ".config", "google-chrome", "Local State"), "utf8"),
       '{"os_crypt":{"encrypted_key":"in"}}',
@@ -509,6 +515,34 @@ describe("Computer cookie jar copy", () => {
     assert.equal(readFileSync(join(jar, "Cookies"), "utf8"), "stop-out");
     assert.equal(readFileSync(join(jar, "Cookies-wal"), "utf8"), "stop-wal");
     assert.equal(readFileSync(join(jar, "Local State"), "utf8"), '{"os_crypt":{"encrypted_key":"stop"}}');
+    assert.equal(readFileSync(join(jar, "Network", "Cookies"), "utf8"), "stop-out");
+  });
+
+  test("cookies-in promotes legacy Cookies into Default/Network/Cookies", async () => {
+    const root = await tempDir("openbot-pt-promote-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    mkdirSync(join(home, ".config", "google-chrome", "Default"), { recursive: true });
+    mkdirSync(jar, { recursive: true });
+    writeFileSync(join(jar, "Cookies"), "legacy-jar");
+    writeFileSync(join(jar, "Cookies-wal"), "legacy-wal");
+    const env = {
+      ...process.env,
+      OPENBOT_SCREEN_HOME: home,
+      COOKIE_JAR: jar,
+      VNC_USER: "openbot",
+    };
+    const inn = spawn("bash", [displaySh, "cookies-in", "1"], { env, stdio: "inherit" });
+    const code = await new Promise<number>((resolve) => inn.on("close", (status) => resolve(status ?? 1)));
+    assert.equal(code, 0);
+    assert.equal(
+      readFileSync(join(home, ".config", "google-chrome", "Default", "Network", "Cookies"), "utf8"),
+      "legacy-jar",
+    );
+    assert.equal(
+      readFileSync(join(home, ".config", "google-chrome", "Default", "Network", "Cookies-wal"), "utf8"),
+      "legacy-wal",
+    );
   });
 
   test("display.sh stop_chrome does not pass --user-data-dir as a pgrep flag", () => {

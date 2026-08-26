@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { startBox, type RunningBox } from "../src/box.ts";
@@ -330,6 +331,67 @@ function startCookieServer(
 }
 
 const COOKIE_HOST = "openbot-cookies.test";
+const ADA_CHROME_PROFILE = "/home/openbot/.config/google-chrome";
+
+function cookieHostsFromDb(dbPath: string): string[] {
+  if (!existsSync(dbPath)) return [];
+  try {
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const rows = db.prepare("select distinct host_key from cookies").all() as Array<{ host_key?: string }>;
+      return rows.map((row) => String(row.host_key ?? "")).filter(Boolean);
+    } finally {
+      db.close();
+    }
+  } catch {
+    return [];
+  }
+}
+
+function listChromeCookieFiles(containerName: string, profile: string): string {
+  const listing = spawnSync(
+    "docker",
+    ["exec", containerName, "ls", "-la", `${profile}/Default`, `${profile}/Default/Network`],
+    { encoding: "utf8" },
+  );
+  return `${listing.stdout}\n${listing.stderr}`;
+}
+
+function dockerCp(containerName: string, src: string, dest: string): void {
+  spawnSync("docker", ["cp", `${containerName}:${src}`, dest], { encoding: "utf8" });
+}
+
+function copyChromeCookieDbs(containerName: string, profile: string, dest: string): string[] {
+  rmSync(dest, { recursive: true, force: true });
+  const networkDest = join(dest, "Network");
+  const legacyDest = join(dest, "Legacy");
+  mkdirSync(networkDest, { recursive: true });
+  mkdirSync(legacyDest, { recursive: true });
+  dockerCp(containerName, `${profile}/Default/Network/.`, `${networkDest}/`);
+  for (const name of ["Cookies", "Cookies-journal", "Cookies-wal", "Cookies-shm"]) {
+    dockerCp(containerName, `${profile}/Default/${name}`, join(legacyDest, name));
+  }
+  return [...cookieHostsFromDb(join(networkDest, "Cookies")), ...cookieHostsFromDb(join(legacyDest, "Cookies"))];
+}
+
+async function waitForNetworkCookieHost(
+  containerName: string,
+  profile: string,
+  dest: string,
+  host: string,
+  timeoutMs = 20_000,
+): Promise<string[]> {
+  const start = Date.now();
+  let hosts: string[] = [];
+  while (Date.now() - start < timeoutMs) {
+    hosts = copyChromeCookieDbs(containerName, profile, dest);
+    if (hosts.some((item) => item.includes(host))) return hosts;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(
+    `Ada Chrome cookie DBs missing ${host} hosts=${hosts.join(",")} files=${listChromeCookieFiles(containerName, profile)}`,
+  );
+}
 
 describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
   let box: RunningBox;
@@ -337,6 +399,7 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
   let adaId = "";
   let homeDir = "";
   let workspaceDir = "";
+  let cookiesDir = "";
   let token = "";
   let kasmPort = 0;
   let pinchTabPorts: number[] = [];
@@ -353,7 +416,7 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
     mkdirSync(join(homedir(), ".openbot-pt-live"), { recursive: true });
     homeDir = await mkdtemp(join(homedir(), ".openbot-pt-live", "home-"));
     workspaceDir = defaultWorkspaceDir(homeDir);
-    const cookiesDir = join(homeDir, "cookies");
+    cookiesDir = join(homeDir, "cookies");
     mkdirSync(workspaceDir, { recursive: true });
     mkdirSync(cookiesDir, { recursive: true });
     const cookieHttp = await startCookieServer(cookieSecret);
@@ -525,24 +588,19 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
     const adaText = assistantText(adaIdle.messages ?? []);
     assert.doesNotMatch(allText(adaIdle.messages ?? []), new RegExp(cookieSecret));
     assert.match(adaText, /LOGIN-PAGE-OK/);
-    const adaCookies = spawnSync(
-      "docker",
-      [
-        "exec",
-        container,
-        "python3",
-        "-c",
-        "import sqlite3; c=sqlite3.connect('/home/openbot/.config/google-chrome/Default/Cookies'); print([r[0] for r in c.execute('select host_key from cookies')])",
-      ],
-      { encoding: "utf8" },
-    );
-    assert.match(
-      adaCookies.stdout,
-      /openbot-cookies\.test/,
-      `Ada Chrome did not persist the login cookie hosts=${adaCookies.stdout} err=${adaCookies.stderr}`,
+    const probeDir = join(cookiesDir, "probe-ada-network");
+    const adaHosts = await waitForNetworkCookieHost(container, ADA_CHROME_PROFILE, probeDir, COOKIE_HOST);
+    assert.ok(
+      adaHosts.some((host) => host.includes(COOKIE_HOST)),
+      `Ada Default/Network/Cookies hosts=${adaHosts.join(",")} files=${listChromeCookieFiles(container, ADA_CHROME_PROFILE)}`,
     );
     const stopped = spawnSync("docker", ["exec", container, DISPLAY_BIN, "stop", "1"], { encoding: "utf8" });
     assert.equal(stopped.status, 0, stopped.stderr);
+    const jarHosts = cookieHostsFromDb(join(cookiesDir, "Network", "Cookies"));
+    assert.ok(
+      jarHosts.some((host) => host.includes(COOKIE_HOST)),
+      `jar Network/Cookies missing ${COOKIE_HOST} hosts=${jarHosts.join(",")} files=${listChromeCookieFiles(container, ADA_CHROME_PROFILE)}`,
+    );
     const benId = await createBot(box.url, cookie, "Ben");
     await waitHealth(`http://127.0.0.1:${pinchTabPorts[1]}`, token);
     await writeFile(
