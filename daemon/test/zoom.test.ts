@@ -265,19 +265,22 @@ describe("PWA has no Takeover button", () => {
     assert.doesNotMatch(computer, /Wake this Bot/);
   });
 
-  test("preview Open control is a real hit target and expanded iframe is writable", async () => {
+  test("collapsed shell omits Computer until a Bot pane is opened and the iframe is writable", async () => {
     const computer = await readFile(join(repoRoot, "pwa/src/components/Computer.tsx"), "utf8");
     const messenger = await readFile(join(repoRoot, "pwa/src/components/Messenger.tsx"), "utf8");
-    assert.match(messenger, /data-testid="open-computer"/);
-    assert.match(messenger, /data-testid="open-computer-preview"/);
-    assert.match(messenger, /data-testid=\{computerOpen \? "computer-expanded" : "computer-preview"\}/);
-    assert.match(messenger, /aria-label="Open Computer"/);
+    const shell = await readFile(join(repoRoot, "pwa/src/components/MessengerShell.tsx"), "utf8");
+    assert.match(messenger, /computerPaneIsOpen\(preferences, activeId\)/);
+    assert.match(messenger, /data-testid=\{computerOpen\s*\?\s*"close-computer"\s*:\s*"open-computer"\}/);
+    assert.match(messenger, /data-testid="computer-expanded"/);
     assert.match(
       messenger,
-      /data-testid="open-computer-preview"[\s\S]*?className="absolute inset-0 z-30 flex cursor-pointer items-center justify-center bg-transparent"/,
+      /<ComputerScreen[\s\S]*?expanded[\s\S]*?showChatButton=\{false\}/,
     );
+    assert.doesNotMatch(messenger, /computer-preview|open-computer-preview/);
+    assert.match(shell, /const computerVisible = computer !== null/);
+    assert.match(shell, /\{computerVisible \? \(/);
     assert.match(computer, /expanded \? "pointer-events-auto" : "pointer-events-none"/);
-    assert.match(computer, /setComputerZoom\(botId, expanded\)/);
+    assert.match(computer, /startComputerZoomSync\(botId, expanded, setComputerZoom/);
   });
 
   test("Computer iframe allows host clipboard into Screen", async () => {

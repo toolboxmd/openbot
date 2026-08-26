@@ -1,10 +1,12 @@
-import { FormEvent, Fragment, useEffect, useState, type ReactNode } from "react";
+import { FormEvent, Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import { motion } from "framer-motion";
-import { ArrowUp, Maximize2, Monitor, MoreHorizontal, Plus, Reply, Smile, Users, X } from "lucide-react";
+import { ArrowUp, Menu, MessageSquare, Monitor, MoreHorizontal, Plus, Reply, Smile, Users, X } from "lucide-react";
 import { AppSettings } from "@/components/AppSettings";
 import { ComputerScreen } from "@/components/Computer";
 import { Eyes } from "@/components/Eyes";
+import { MessengerShell, type MobileSurface } from "@/components/MessengerShell";
 import { StackedEyes } from "@/components/StackedEyes";
+import { useUiPreferences } from "@/components/UiPreferencesProvider";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
@@ -22,6 +24,7 @@ import {
 import { AgentsEditors } from "@/components/AgentsEditors";
 import { HostGrantCard } from "@/components/HostGrantCard";
 import { isHostGrantPermission } from "@/lib/harness-home";
+import { computerPaneIsOpen } from "@/lib/ui-preferences";
 import {
   answerHostGrant,
   answerPermission,
@@ -241,11 +244,17 @@ export function Messenger() {
   const [activeGroup, setActiveGroup] = useState<Channel | null>(null);
   const [groupTitleDraft, setGroupTitleDraft] = useState("");
   const [groupBotIds, setGroupBotIds] = useState<string[]>([]);
-  const [computerOpen, setComputerOpen] = useState(false);
+  const [mobileSurface, setMobileSurface] = useState<MobileSurface>("chat");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
   const [reactingId, setReactingId] = useState<string | null>(null);
+  const openChatsButtonRef = useRef<HTMLButtonElement | null>(null);
+  const closeChatsButtonRef = useRef<HTMLButtonElement | null>(null);
+  const computerButtonRef = useRef<HTMLButtonElement | null>(null);
+  const closeComputerButtonRef = useRef<HTMLButtonElement | null>(null);
+  const { preferences, updateComputerPane } = useUiPreferences();
+  const computerOpen = computerPaneIsOpen(preferences, activeId);
 
   async function refresh(id = activeId) {
     const [listed, available, channelList] = await Promise.all([listBots(), listHarnesses(), listChannels()]);
@@ -336,6 +345,7 @@ export function Messenger() {
       setActiveId(bot.id);
       setActive(bot);
       setActiveGroup(null);
+      setMobileSurface("chat");
       await refresh(bot.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not create Bot.");
@@ -360,6 +370,7 @@ export function Messenger() {
       setActiveId(null);
       setActive(null);
       setActiveGroup(channel);
+      setMobileSurface("chat");
       await refresh();
       const detail = await getChannel(channel.id);
       setActiveGroup(detail);
@@ -575,24 +586,81 @@ export function Messenger() {
   const sidebarMode = (bot: Bot): FaceMode =>
     isWorkingMode(bot.eyes.mode) ? "idle" : (bot.eyes.mode as FaceMode);
 
+  function focusOnNextFrame(ref: { current: HTMLElement | null }) {
+    window.requestAnimationFrame(() => ref.current?.focus());
+  }
+
+  function openChats() {
+    setMobileSurface("sidebar");
+    focusOnNextFrame(closeChatsButtonRef);
+  }
+
+  function closeChats() {
+    setMobileSurface("chat");
+    focusOnNextFrame(openChatsButtonRef);
+  }
+
+  function openBot(bot: Bot) {
+    setActiveId(bot.id);
+    setActiveGroup(null);
+    setMobileSurface("chat");
+    void getBot(bot.id).then(setActive);
+  }
+
+  function openGroup(channel: Channel) {
+    setActiveId(null);
+    setActive(null);
+    setMobileSurface("chat");
+    void getChannel(channel.id).then(setActiveGroup);
+  }
+
   function openComputer() {
-    setComputerOpen(true);
+    if (!activeId) return;
+    updateComputerPane(activeId, true);
+    focusOnNextFrame(closeComputerButtonRef);
+  }
+
+  function closeComputer() {
+    if (!activeId) return;
+    updateComputerPane(activeId, false);
+    setMobileSurface("chat");
+    focusOnNextFrame(computerButtonRef);
   }
 
   return (
-    <div data-testid="messenger" className="flex h-full min-h-0 bg-background">
-      <aside className="flex w-64 shrink-0 flex-col bg-sidebar text-sidebar-foreground">
-        <div className="flex items-center gap-3 px-4 py-4">
-          <Eyes size={32} className="aspect-square shrink-0" />
-          <div className="min-w-0">
-            <p className="truncate text-sm font-semibold">OpenBot</p>
-            <p className="flex items-center gap-1 text-xs text-muted-foreground">
-              <Monitor className="size-3" />
-              This Computer
-            </p>
+    <MessengerShell
+      mobileSurface={mobileSurface}
+      sidebar={
+        <>
+          <div className="flex h-[var(--header-height)] items-center justify-between gap-3 px-4">
+            <div className="flex min-w-0 items-center gap-3">
+              <Eyes size={32} className="aspect-square shrink-0" />
+              <div className="min-w-0">
+                <p className="truncate text-sm font-semibold">OpenBot</p>
+                <p className="flex items-center gap-1 text-xs text-muted-foreground">
+                  <Monitor className="size-3" />
+                  This Computer
+                </p>
+              </div>
+            </div>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  ref={closeChatsButtonRef}
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  aria-label="Close Chats"
+                  onClick={closeChats}
+                  className="min-h-[var(--touch-min)] min-w-[var(--touch-min)] min-[48rem]:hidden"
+                >
+                  <X />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Close Chats</TooltipContent>
+            </Tooltip>
           </div>
-        </div>
-        <Separator />
+          <Separator />
         <div className="flex-1 overflow-y-auto px-3 py-3">
           {creating === "bot" ? (
             <form onSubmit={onCreate} className="mb-3 space-y-2 px-1">
@@ -688,11 +756,7 @@ export function Messenger() {
                 <li key={bot.id}>
                   <button
                     type="button"
-                    onClick={() => {
-                      setActiveId(bot.id);
-                      setActiveGroup(null);
-                      void getBot(bot.id).then(setActive);
-                    }}
+                    onClick={() => openBot(bot)}
                     className={cn(
                       "flex w-full items-center gap-2 rounded-2xl px-3 py-2 text-left text-sm hover:bg-sidebar-accent",
                       activeId === bot.id && !activeGroup && "bg-sidebar-accent",
@@ -715,11 +779,7 @@ export function Messenger() {
                   <button
                     type="button"
                     data-testid="group-channel-row"
-                    onClick={() => {
-                      setActiveId(null);
-                      setActive(null);
-                      void getChannel(channel.id).then(setActiveGroup);
-                    }}
+                    onClick={() => openGroup(channel)}
                     className={cn(
                       "flex w-full items-center gap-2 rounded-2xl px-3 py-2 text-left text-sm hover:bg-sidebar-accent",
                       activeGroup?.id === channel.id && "bg-sidebar-accent",
@@ -744,19 +804,42 @@ export function Messenger() {
         <div className="border-t border-sidebar-border p-3">
           <AppSettings />
         </div>
-      </aside>
-      <Separator orientation="vertical" />
-      <section className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-14 items-center justify-between gap-3 px-6">
-          <h1 className="truncate text-sm font-medium">
-            {activeGroup ? groupDisplayTitle(activeGroup) : (active?.name ?? "Thread")}
-          </h1>
+        </>
+      }
+      chat={
+        <>
+        <header className="flex min-h-[var(--header-height)] flex-wrap items-center justify-between gap-x-2 gap-y-1 px-3 py-1 min-[48rem]:h-[var(--header-height)] min-[48rem]:flex-nowrap min-[48rem]:gap-3 min-[48rem]:px-6 min-[48rem]:py-0">
+          <div className="flex min-w-0 flex-1 items-center gap-1">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  ref={openChatsButtonRef}
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  aria-label="Open Chats"
+                  onClick={openChats}
+                  className="min-h-[var(--touch-min)] min-w-[var(--touch-min)] min-[48rem]:hidden"
+                >
+                  <Menu />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Open Chats</TooltipContent>
+            </Tooltip>
+            <h1 className="truncate text-sm font-medium">
+              {activeGroup ? groupDisplayTitle(activeGroup) : (active?.name ?? "Thread")}
+            </h1>
+          </div>
           {active && !activeGroup ? (
-            <div className="flex items-start gap-3">
-              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+            <div
+              role="group"
+              aria-label="Bot controls"
+              className="flex w-full min-w-0 items-center gap-2 overflow-x-auto pb-1 min-[48rem]:w-auto min-[48rem]:gap-3 min-[48rem]:pb-0"
+            >
+              <label className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
                 Harness
                 <select
-                  className="h-8 rounded-full border border-input bg-background px-3 text-sm text-foreground"
+                  className="h-8 rounded-full border border-input bg-background px-3 text-sm text-foreground max-[47.999rem]:h-[var(--touch-min)]"
                   value={active.harness ?? ""}
                   disabled={busy}
                   onChange={(event) => void onPick(event.target.value)}
@@ -770,11 +853,11 @@ export function Messenger() {
                   ))}
                 </select>
               </label>
-              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              <label className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
                 Config
                 <select
                   data-testid="config-mode"
-                  className="h-8 rounded-full border border-input bg-background px-3 text-sm text-foreground"
+                  className="h-8 rounded-full border border-input bg-background px-3 text-sm text-foreground max-[47.999rem]:h-[var(--touch-min)]"
                   value={active.configMode ?? "isolated"}
                   disabled={busy}
                   onChange={(event) => void onConfigMode(event.target.value === "host" ? "host" : "isolated")}
@@ -784,6 +867,19 @@ export function Messenger() {
                 </select>
               </label>
               <AgentsEditors botId={active.id} />
+              <Button
+                ref={computerButtonRef}
+                type="button"
+                size="sm"
+                variant="outline"
+                data-testid={computerOpen ? "close-computer" : "open-computer"}
+                aria-expanded={computerOpen}
+                onClick={computerOpen ? closeComputer : openComputer}
+                className="shrink-0 max-[47.999rem]:min-h-[var(--touch-min)]"
+              >
+                {computerOpen ? <MessageSquare /> : <Monitor />}
+                {computerOpen ? "Hide Computer" : "Computer"}
+              </Button>
             </div>
           ) : null}
         </header>
@@ -984,63 +1080,46 @@ export function Messenger() {
             </div>
           </div>
         </form>
-      </section>
-      <Separator orientation="vertical" />
-      <aside className="flex w-72 shrink-0 flex-col bg-sidebar text-sidebar-foreground">
-        <div className="flex h-14 items-center justify-between gap-2 px-4">
-          <div className="flex min-w-0 items-center gap-2">
-            <Monitor className="size-3.5 text-muted-foreground" />
-            <h2 className="text-sm font-medium">This Computer</h2>
-          </div>
-          {computerOpen ? null : (
-            <Button
-              type="button"
-              size="icon-sm"
-              variant="ghost"
-              data-testid="open-computer"
-              aria-label="Open Computer"
-              onClick={openComputer}
-            >
-              <Maximize2 />
-            </Button>
-          )}
-        </div>
-        <Separator />
-        <div className="p-3">
-          <div className={cn(!computerOpen && "relative aspect-video")}>
+        </>
+      }
+      computer={
+        computerOpen && activeId ? (
+          <>
+            <header className="flex h-[var(--header-height)] items-center justify-between gap-2 px-4">
+              <div className="flex min-w-0 items-center gap-2">
+                <Monitor className="size-[var(--icon-default)] text-muted-foreground" />
+                <h2 className="truncate text-sm font-medium">
+                  {active?.name ? `${active.name}'s Computer` : "Computer"}
+                </h2>
+              </div>
+              <Button
+                ref={closeComputerButtonRef}
+                type="button"
+                size="sm"
+                variant="ghost"
+                data-testid="close-computer-pane"
+                onClick={closeComputer}
+                className="min-h-[var(--touch-min)] shrink-0"
+              >
+                <MessageSquare />
+                Chat
+              </Button>
+            </header>
+            <Separator />
             <div
-              data-testid={computerOpen ? "computer-expanded" : "computer-preview"}
-              className={cn(
-                "overflow-hidden bg-black",
-                computerOpen ? "fixed inset-0 z-50" : "group relative isolate aspect-video rounded-2xl",
-              )}
+              data-testid="computer-expanded"
+              className="relative isolate min-h-0 flex-1 overflow-hidden bg-black"
             >
               <ComputerScreen
                 botId={activeId}
-                expanded={computerOpen}
-                onClose={() => setComputerOpen(false)}
+                expanded
+                onClose={closeComputer}
+                showChatButton={false}
               />
-              {computerOpen ? null : (
-                <button
-                  type="button"
-                  data-testid="open-computer-preview"
-                  aria-label="Open Computer"
-                  onClick={openComputer}
-                  className="absolute inset-0 z-30 flex cursor-pointer items-center justify-center bg-transparent"
-                >
-                  <span className="pointer-events-none absolute right-2 top-2 inline-flex size-7 items-center justify-center rounded-full bg-black/60 text-white shadow">
-                    <Maximize2 className="size-3.5" />
-                  </span>
-                  <span className="pointer-events-none inline-flex items-center gap-2 rounded-full bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground shadow-lg opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
-                    <Maximize2 className="size-4" />
-                    Open
-                  </span>
-                </button>
-              )}
             </div>
-          </div>
-        </div>
-      </aside>
-    </div>
+          </>
+        ) : null
+      }
+    />
   );
 }

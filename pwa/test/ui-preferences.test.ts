@@ -4,6 +4,7 @@ import { describe, test } from "node:test";
 import {
   DEFAULT_UI_PREFERENCES,
   UI_PREFERENCES_KEY,
+  computerPaneIsOpen,
   parseUiPreferences,
   readUiPreferences,
   resolveEffectiveTheme,
@@ -35,6 +36,16 @@ describe("PWA UI preferences", () => {
       theme: "dark",
       computerPaneByBot: { ada: true },
     });
+  });
+
+  test("remembers Computer visibility independently for each Bot", () => {
+    const adaOpen = setComputerPanePreference(DEFAULT_UI_PREFERENCES, "ada", true);
+    const benClosed = setComputerPanePreference(adaOpen, "ben", false);
+
+    assert.equal(computerPaneIsOpen(benClosed, "ada"), true);
+    assert.equal(computerPaneIsOpen(benClosed, "ben"), false);
+    assert.equal(computerPaneIsOpen(benClosed, "unknown"), false);
+    assert.deepEqual(parseUiPreferences(JSON.stringify(benClosed)), benClosed);
   });
 
   test("reads and writes one browser-local owner and fails closed when storage throws", () => {

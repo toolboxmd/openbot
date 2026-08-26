@@ -101,3 +101,8 @@ export function setComputerPanePreference(
     },
   };
 }
+
+export function computerPaneIsOpen(preferences: UiPreferences, botId: string | null): boolean {
+  if (!botId) return false;
+  return preferences.computerPaneByBot[botId] ?? false;
+}

@@ -1,4 +1,5 @@
 import { getComputer, setComputerZoom, type Computer } from "@/lib/session";
+import { startComputerZoomSync } from "@/lib/computer-zoom";
 import { Button } from "@/components/ui/button";
 import { MessageSquare } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -23,10 +24,12 @@ export function ComputerScreen({
   botId,
   expanded,
   onClose,
+  showChatButton = true,
 }: {
   botId: string | null;
   expanded: boolean;
   onClose: () => void;
+  showChatButton?: boolean;
 }) {
   const [computer, setComputer] = useState<Computer | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -55,15 +58,9 @@ export function ComputerScreen({
   }, [botId]);
 
   useEffect(() => {
-    let cancelled = false;
-    void setComputerZoom(botId, expanded)
-      .then((data) => {
-        if (!cancelled) setComputer(data);
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
+    return startComputerZoomSync(botId, expanded, setComputerZoom, (data) => {
+      setComputer(data);
+    });
   }, [botId, expanded]);
 
   useEffect(() => {
@@ -130,7 +127,7 @@ export function ComputerScreen({
         )}
         allow="clipboard-read; clipboard-write; fullscreen"
       />
-      {expanded ? (
+      {expanded && showChatButton ? (
         <Button
           type="button"
           size="lg"

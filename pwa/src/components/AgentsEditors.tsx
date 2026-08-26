@@ -39,6 +39,7 @@ export function AgentsEditors({ botId }: { botId: string }) {
           variant={open === "all" ? "default" : "ghost"}
           data-testid="all-bots-editor-toggle"
           onClick={() => setOpen(open === "all" ? null : "all")}
+          className="max-[47.999rem]:min-h-[var(--touch-min)]"
         >
           All Bots
         </Button>
@@ -48,6 +49,7 @@ export function AgentsEditors({ botId }: { botId: string }) {
           variant={open === "this" ? "default" : "ghost"}
           data-testid="this-bot-editor-toggle"
           onClick={() => setOpen(open === "this" ? null : "this")}
+          className="max-[47.999rem]:min-h-[var(--touch-min)]"
         >
           This Bot
         </Button>

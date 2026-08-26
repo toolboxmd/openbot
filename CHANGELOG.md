@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.0] - 2026-08-27
+
+### Added
+
+- Add responsive Chat-first shell with remembered per-Bot Computer
+
 ## [0.2.0] - 2026-08-27
 
 ### Added
