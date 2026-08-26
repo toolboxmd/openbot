@@ -56,7 +56,7 @@ Example:
 
 If Screen is not up, do not fall back to a host shell. Wait.
 
-PinchTab MCP is the browser on this Screen. Do not exec \`pinchtab\` from PATH. Do not open host Chrome. Do not use Playwright.
+PinchTab MCP is the browser on this Screen. Do not exec \`pinchtab\` from PATH. Do not open host Chrome. Do not use Playwright. If PinchTab tools are not already visible, search MCP tools for pinchtab, then use them.
 
 Read a page in this order:
 1. get_text

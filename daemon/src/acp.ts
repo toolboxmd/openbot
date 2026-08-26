@@ -1,6 +1,14 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import readline from "node:readline";
 import type { SpawnSpec } from "./harness.ts";
+
+const OPENBOT_VERSION = (
+  JSON.parse(readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8")) as {
+    version: string;
+  }
+).version;
 
 type RpcId = number | string;
 
@@ -251,8 +259,8 @@ export class AcpClient {
     const result = (await this.request("initialize", {
       protocolVersion: 1,
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
-      clientInfo: { name: "openbot", title: "OpenBot", version: "0.0.0" },
-      info: { name: "openbot", title: "OpenBot", version: "0.0.0" },
+      clientInfo: { name: "openbot", title: "OpenBot", version: OPENBOT_VERSION },
+      info: { name: "openbot", title: "OpenBot", version: OPENBOT_VERSION },
       capabilities: {},
     })) as { authMethods?: unknown[] };
     return { authMethods: Array.isArray(result?.authMethods) ? result.authMethods : [] };

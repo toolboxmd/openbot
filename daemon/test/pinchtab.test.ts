@@ -23,8 +23,7 @@ import {
 
 const here = dirname(fileURLToPath(import.meta.url));
 const displaySh = join(here, "../../screen/display.sh");
-const wrapper = join(here, "../src/pinchtab-mcp.ts");
-const tsx = join(here, "../../node_modules/.bin/tsx");
+const wrapper = join(here, "../src/pinchtab-mcp.mjs");
 
 async function tempDir(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), prefix));
@@ -75,12 +74,20 @@ function recordingFake() {
   };
 }
 
-function startHealth(token: string): Promise<{ url: string; close: () => Promise<void> }> {
+function startHealth(
+  token: string,
+  up: () => boolean = () => true,
+): Promise<{ url: string; close: () => Promise<void> }> {
   return new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
       if (req.headers.authorization !== `Bearer ${token}`) {
         res.writeHead(401);
         res.end("no");
+        return;
+      }
+      if (!up()) {
+        res.writeHead(503);
+        res.end("down");
         return;
       }
       if ((req.url ?? "").startsWith("/health") || (req.url ?? "").startsWith("/tabs")) {
@@ -116,6 +123,7 @@ const FAKE_TOOLS = [
   { name: "pinchtab_capture" },
   { name: "pinchtab_record" },
   { name: "pinchtab_network_route" },
+  { name: "pinchtab_wait_for_function" },
   { name: "pinchtab_click" },
   { name: "pinchtab_screenshot" },
   { name: "pinchtab_wait" },
@@ -186,7 +194,7 @@ describe("PinchTab allowlist", () => {
     const filtered = filterAllowlistedTools(FAKE_TOOLS);
     const names = filtered.map((tool) => tool.name);
     assert.deepEqual(
-      names.filter((name) => /cookies|eval|scrape|pdf|capture|record|network_route/i.test(name)),
+      names.filter((name) => /cookies|eval|scrape|pdf|capture|record|network_route|wait_for_function/i.test(name)),
       [],
     );
     assert.ok(names.includes("pinchtab_navigate"));
@@ -201,6 +209,9 @@ describe("PinchTab allowlist", () => {
     assert.equal(pinchTabToolAllowed("pinchtab_network_route"), false);
     assert.equal(pinchTabToolAllowed("pinchtab_keyboard"), true);
     assert.equal(pinchTabToolAllowed("back"), true);
+    assert.equal(pinchTabToolAllowed("pinchtab_wait_for_selector"), true);
+    assert.equal(pinchTabToolAllowed("pinchtab_wait_for_function"), false);
+    assert.equal(pinchTabToolAllowed("wait_for_function"), false);
   });
 
   test("bridge config is open web, IDPI on, eval off, autoSolver off", () => {
@@ -222,27 +233,33 @@ describe("PinchTab allowlist", () => {
 });
 
 describe("Isolated spawn PATH does not expose pinchtab", () => {
-  test("stripPinchTabFromPath drops dirs that contain pinchtab", async () => {
+  test("stripPinchTabFromPath prepends a deny shim and keeps docker dirs", async () => {
     const dir = await tempDir("openbot-pt-path-");
     const bin = join(dir, "pinchtab");
     writeFileSync(bin, "#!/bin/sh\necho leaked\n", { mode: 0o755 });
     chmodSync(bin, 0o755);
-    const stripped = stripPinchTabFromPath(`${dir}:/usr/bin:/bin`);
-    assert.equal(pathHasPinchTab(stripped), false);
-    assert.equal(stripped.includes(dir), false);
+    writeFileSync(join(dir, "docker"), "#!/bin/sh\necho docker\n", { mode: 0o755 });
+    chmodSync(join(dir, "docker"), 0o755);
+    const isolated = stripPinchTabFromPath(`${dir}:/usr/bin:/bin`);
+    assert.equal(pathHasPinchTab(isolated), false);
+    assert.equal(isolated.includes(dir), true);
+    const first = isolated.split(":").find(Boolean);
+    assert.ok(first?.includes("openbot-pinchtab-deny"));
   });
 
-  test("spawnSpec PATH has no pinchtab even when it is on the host PATH", async () => {
+  test("spawnSpec PATH keeps docker dirs and does not run host pinchtab", async () => {
     const dir = await tempDir("openbot-pt-spawn-");
     const bin = join(dir, "pinchtab");
     writeFileSync(bin, "#!/bin/sh\necho leaked\n", { mode: 0o755 });
     chmodSync(bin, 0o755);
+    writeFileSync(join(dir, "docker"), "#!/bin/sh\necho docker\n", { mode: 0o755 });
+    chmodSync(join(dir, "docker"), 0o755);
     const prev = process.env.PATH ?? "";
     process.env.PATH = `${dir}:${prev}`;
     try {
       const spec = spawnSpec("codex");
       assert.equal(pathHasPinchTab(spec.env.PATH ?? ""), false);
-      assert.equal((spec.env.PATH ?? "").includes(dir), false);
+      assert.equal((spec.env.PATH ?? "").includes(dir), true);
       assert.equal(spec.env.PINCHTAB_TOKEN, undefined);
     } finally {
       process.env.PATH = prev;
@@ -313,16 +330,20 @@ describe("session/new mcpServers attach only when Screen and bridge are Up", () 
       const servers = fake.spawned[0]?.spec.mcpServers ?? [];
       assert.equal(servers.length, 1);
       assert.equal(servers[0]?.name, "pinchtab");
-      assert.ok(servers[0]?.command.includes("node") || servers[0]?.command.endsWith("tsx"));
-      assert.ok(servers[0]?.args.some((arg) => arg.endsWith("pinchtab-mcp.ts")));
+      assert.ok(servers[0]?.command.includes("node"));
+      assert.ok(servers[0]?.args.some((arg) => arg.endsWith("pinchtab-mcp.mjs")));
+      assert.equal("startup_timeout_sec" in (servers[0] ?? {}), false);
+      assert.equal("required" in (servers[0] ?? {}), false);
+      assert.equal((servers[0]?._meta as { startup_timeout_sec?: number })?.startup_timeout_sec, 30);
+      assert.ok(servers[0]?.env.some((row) => row.name === "PATH" && row.value));
       const env = Object.fromEntries((servers[0]?.env ?? []).map((row) => [row.name, row.value]));
       assert.equal(env.OPENBOT_PINCHTAB, fakeBin);
       assert.equal(env.OPENBOT_PINCHTAB_SERVER, health.url);
       assert.equal(env.PINCHTAB_TOKEN, "bridge-token");
       assert.equal(pathHasPinchTab(fake.spawned[0]?.spec.env.PATH ?? ""), false);
       fake.fire({
-        rpcId: 7,
-        title: "Allow this tool?",
+        rpcId: 8,
+        title: "mcp__pinchtab__pinchtab_navigate",
         options: [
           { optionId: "allow_once", name: "Allow", kind: "allow_once" },
           { optionId: "decline", name: "Decline", kind: "reject_once" },
@@ -331,6 +352,51 @@ describe("session/new mcpServers attach only when Screen and bridge are Up", () 
       });
       assert.deepEqual(fake.answered, ["allow_once"]);
       assert.equal(store.get(ada.id)?.permission, null);
+      fake.fire({
+        rpcId: 7,
+        title: "Allow this tool?",
+        options: [
+          { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+          { optionId: "decline", name: "Decline", kind: "reject_once" },
+        ],
+        rawInput: { command: "ls" },
+      });
+      assert.deepEqual(fake.answered, ["allow_once"]);
+      assert.ok(store.get(ada.id)?.permission);
+      store.close();
+    } finally {
+      await health.close();
+    }
+  });
+
+  test("ACP respawns with PinchTab MCP when the bridge becomes healthy", async () => {
+    const homeDir = await tempDir("openbot-pt-retry-");
+    fakeBin = await writeFakePinchTab(await tempDir("openbot-pt-retry-bin-"));
+    process.env.OPENBOT_PINCHTAB = fakeBin;
+    let up = false;
+    const health = await startHealth("retry-token", () => up);
+    try {
+      const fake = recordingFake();
+      const store = new BotStore(homeDir, {
+        computer: new MemoryComputerRuntime({
+          cookiesDir: join(homeDir, "cookies"),
+          pinchTabUpstreams: [health.url],
+          pinchTabToken: "retry-token",
+        }),
+        listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+        spawnAcp: fake.spawnAcp,
+      });
+      const ada = await store.create("Ada");
+      await store.pickHarness(ada.id, "codex");
+      await store.send(ada.id, "hi");
+      await waitUntil(() => fake.spawned.length > 0, 8_000);
+      assert.deepEqual(fake.spawned[0]?.spec.mcpServers ?? [], []);
+      up = true;
+      await store.send(ada.id, "again");
+      await waitUntil(() => fake.spawned.length > 1, 8_000);
+      const servers = fake.spawned[1]?.spec.mcpServers ?? [];
+      assert.equal(servers.length, 1);
+      assert.equal(servers[0]?.name, "pinchtab");
       store.close();
     } finally {
       await health.close();
@@ -346,7 +412,7 @@ describe("session/new mcpServers attach only when Screen and bridge are Up", () 
 describe("PinchTab MCP allowlist proxy", () => {
   test("tools/list is allowlisted with screenshot last; blocked tools/call is rejected", async () => {
     const bin = await writeFakePinchTab(await tempDir("openbot-pt-proxy-"));
-    const child = spawn(tsx, [wrapper], {
+    const child = spawn(process.execPath, [wrapper], {
       env: {
         ...process.env,
         OPENBOT_PINCHTAB: bin,
@@ -364,10 +430,16 @@ describe("PinchTab MCP allowlist proxy", () => {
       assert.ok(tools.includes("pinchtab_navigate"));
       assert.ok(tools.includes("pinchtab_screenshot"));
       assert.equal(tools.at(-1), "pinchtab_screenshot");
-      assert.equal(tools.some((name) => /cookies|eval|scrape|pdf|capture|record|network_route/i.test(name)), false);
+      assert.equal(
+        tools.some((name) => /cookies|eval|scrape|pdf|capture|record|network_route|wait_for_function/i.test(name)),
+        false,
+      );
       rpc(child, 3, "tools/call", { name: "pinchtab_cookies", arguments: {} });
       const blocked = await readRpc(child, 3);
       assert.ok(blocked.error, "cookies must be rejected");
+      rpc(child, 5, "tools/call", { name: "pinchtab_wait_for_function", arguments: { expression: "1" } });
+      const evalBlocked = await readRpc(child, 5);
+      assert.ok(evalBlocked.error, "wait_for_function must be rejected");
       rpc(child, 4, "tools/call", { name: "pinchtab_navigate", arguments: { url: "https://example.com" } });
       const allowed = await readRpc(child, 4);
       const text = JSON.stringify(allowed.result ?? {});
@@ -386,6 +458,7 @@ describe("Computer cookie jar copy", () => {
     mkdirSync(join(home, ".config", "google-chrome", "Default", "Network"), { recursive: true });
     mkdirSync(jar, { recursive: true });
     writeFileSync(join(jar, "Cookies"), "jar-in");
+    writeFileSync(join(jar, "Local State"), '{"os_crypt":{"encrypted_key":"in"}}');
     const env = {
       ...process.env,
       OPENBOT_SCREEN_HOME: home,
@@ -396,8 +469,13 @@ describe("Computer cookie jar copy", () => {
     const inCode = await new Promise<number>((resolve) => inn.on("close", (code) => resolve(code ?? 1)));
     assert.equal(inCode, 0);
     assert.equal(readFileSync(join(home, ".config", "google-chrome", "Default", "Cookies"), "utf8"), "jar-in");
+    assert.equal(
+      readFileSync(join(home, ".config", "google-chrome", "Local State"), "utf8"),
+      '{"os_crypt":{"encrypted_key":"in"}}',
+    );
     writeFileSync(join(home, ".config", "google-chrome", "Default", "Cookies"), "jar-out");
     writeFileSync(join(home, ".config", "google-chrome", "Default", "Cookies-wal"), "wal-out");
+    writeFileSync(join(home, ".config", "google-chrome", "Local State"), '{"os_crypt":{"encrypted_key":"k"}}');
     writeFileSync(join(home, ".config", "google-chrome", "Default", "Network", "Cookies"), "net-out");
     writeFileSync(join(home, ".config", "google-chrome", "Default", "Network", "Cookies-wal"), "net-wal");
     const out = spawn("bash", [displaySh, "cookies-out", "1"], { env, stdio: "inherit" });
@@ -405,8 +483,40 @@ describe("Computer cookie jar copy", () => {
     assert.equal(outCode, 0);
     assert.equal(readFileSync(join(jar, "Cookies"), "utf8"), "jar-out");
     assert.equal(readFileSync(join(jar, "Cookies-wal"), "utf8"), "wal-out");
+    assert.equal(readFileSync(join(jar, "Local State"), "utf8"), '{"os_crypt":{"encrypted_key":"k"}}');
     assert.equal(readFileSync(join(jar, "Network", "Cookies"), "utf8"), "net-out");
     assert.equal(readFileSync(join(jar, "Network", "Cookies-wal"), "utf8"), "net-wal");
+  });
+
+  test("display.sh stop copies the jar when Chrome is already gone", async () => {
+    const root = await tempDir("openbot-pt-stop-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    mkdirSync(join(home, ".config", "google-chrome", "Default", "Network"), { recursive: true });
+    mkdirSync(jar, { recursive: true });
+    writeFileSync(join(home, ".config", "google-chrome", "Default", "Cookies"), "stop-out");
+    writeFileSync(join(home, ".config", "google-chrome", "Default", "Cookies-wal"), "stop-wal");
+    writeFileSync(join(home, ".config", "google-chrome", "Local State"), '{"os_crypt":{"encrypted_key":"stop"}}');
+    const env = {
+      ...process.env,
+      OPENBOT_SCREEN_HOME: home,
+      COOKIE_JAR: jar,
+      VNC_USER: "openbot",
+    };
+    const stopped = spawn("bash", [displaySh, "stop", "1"], { env, stdio: "inherit" });
+    const code = await new Promise<number>((resolve) => stopped.on("close", (status) => resolve(status ?? 1)));
+    assert.equal(code, 0);
+    assert.equal(readFileSync(join(jar, "Cookies"), "utf8"), "stop-out");
+    assert.equal(readFileSync(join(jar, "Cookies-wal"), "utf8"), "stop-wal");
+    assert.equal(readFileSync(join(jar, "Local State"), "utf8"), '{"os_crypt":{"encrypted_key":"stop"}}');
+  });
+
+  test("display.sh stop_chrome does not pass --user-data-dir as a pgrep flag", () => {
+    const body = readFileSync(displaySh, "utf8");
+    assert.match(body, /pkill -f -- /);
+    assert.match(body, /pgrep -af -- /);
+    assert.doesNotMatch(body, /pgrep -f "--user-data-dir/);
+    assert.doesNotMatch(body, /pkill -f "--user-data-dir/);
   });
 });
 

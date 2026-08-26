@@ -1,40 +1,26 @@
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ComputerRuntime } from "./computer.ts";
+import {
+  PINCHTAB_ALLOWLIST as ALLOWLIST_JS,
+  filterAllowlistedTools as filterJs,
+  pinchTabToolAllowed as allowedJs,
+} from "./pinchtab-allowlist.mjs";
 
 export const PINCHTAB_MCP_NAME = "pinchtab";
-
-/** Browse loop first, screenshot last. Match `navigate` and `pinchtab_navigate`. */
-export const PINCHTAB_ALLOWLIST = [
-  "navigate",
-  "snapshot",
-  "get_text",
-  "click",
-  "type",
-  "fill",
-  "select",
-  "key",
-  "scroll",
-  "wait",
-  "list_tabs",
-  "back",
-  "screenshot",
-] as const;
-
+export const PINCHTAB_ALLOWLIST = ALLOWLIST_JS as readonly string[];
 export type PinchTabAllowName = (typeof PINCHTAB_ALLOWLIST)[number];
 
-const BLOCKED_HINTS = [
-  "cookies",
-  "eval",
-  "scrape",
-  "pdf",
-  "capture",
-  "record",
-  "network_route",
-  "network-route",
-] as const;
+export function pinchTabToolAllowed(name: string): boolean {
+  return allowedJs(name);
+}
+
+export function filterAllowlistedTools<T extends { name?: string }>(tools: T[]): T[] {
+  return filterJs(tools) as T[];
+}
 
 export type AcpMcpEnvVar = { name: string; value: string };
 
@@ -43,57 +29,55 @@ export type AcpMcpServer = {
   command: string;
   args: string[];
   env: AcpMcpEnvVar[];
+  _meta?: Record<string, unknown>;
 };
 
-function normalizeToolName(name: string): string {
-  return name.trim().replace(/^pinchtab_/i, "").toLowerCase().replace(/-/g, "_");
-}
+/** Codex stdio MCP inherits these from the ACP child. Repeat them so the wrapper can spawn host pinchtab. */
+const MCP_INHERIT_ENV = [
+  "HOME",
+  "LOGNAME",
+  "PATH",
+  "SHELL",
+  "USER",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+  "TMPDIR",
+  "TZ",
+] as const;
 
-function isKeyTool(n: string): boolean {
-  return n === "key" || n === "press" || n.startsWith("key") || n.startsWith("keyboard");
-}
-
-export function pinchTabToolAllowed(name: string): boolean {
-  const n = normalizeToolName(name);
-  if (!n) return false;
-  if (BLOCKED_HINTS.some((hint) => n === hint.replace(/-/g, "_") || n.startsWith(`${hint.replace(/-/g, "_")}_`))) {
-    return false;
+function mcpInheritEnv(from: NodeJS.ProcessEnv): AcpMcpEnvVar[] {
+  const out: AcpMcpEnvVar[] = [];
+  for (const name of MCP_INHERIT_ENV) {
+    const value = from[name];
+    if (value) out.push({ name, value });
   }
-  for (const allowed of PINCHTAB_ALLOWLIST) {
-    if (n === allowed) return true;
-    if (allowed !== "screenshot" && n.startsWith(`${allowed}_`)) return true;
-  }
-  if (isKeyTool(n)) return true;
-  return false;
+  return out;
 }
 
-export function filterAllowlistedTools<T extends { name?: string }>(tools: T[]): T[] {
-  const allowed = tools.filter((tool) => pinchTabToolAllowed(String(tool.name ?? "")));
-  const rest: T[] = [];
-  const shots: T[] = [];
-  for (const tool of allowed) {
-    if (normalizeToolName(String(tool.name ?? "")) === "screenshot" || /screenshot/i.test(String(tool.name ?? ""))) {
-      shots.push(tool);
-    } else {
-      rest.push(tool);
+const SHIM_MARKER = "openbot-pinchtab-deny";
+
+export function pinchTabDenyShimDir(): string {
+  const dir = path.join(os.tmpdir(), SHIM_MARKER);
+  fs.mkdirSync(dir, { recursive: true });
+  const shim = path.join(dir, "pinchtab");
+  const body = `#!/bin/sh\necho "OpenBot: pinchtab is not available on Isolated PATH. Use PinchTab MCP." >&2\nexit 127\n`;
+  try {
+    if (!fs.existsSync(shim) || fs.readFileSync(shim, "utf8") !== body) {
+      fs.writeFileSync(shim, body, { encoding: "utf8", mode: 0o755 });
     }
+    fs.chmodSync(shim, 0o755);
+  } catch {
+    /* best effort */
   }
-  return [...rest, ...shots];
+  return dir;
 }
 
+/** Prepend a fail-closed pinchtab shim. Do not drop PATH dirs (docker/git/gh stay). */
 export function stripPinchTabFromPath(pathEnv: string): string {
-  return pathEnv
-    .split(path.delimiter)
-    .filter((dir) => {
-      if (!dir) return false;
-      try {
-        fs.accessSync(path.join(dir, "pinchtab"), fs.constants.X_OK);
-        return false;
-      } catch {
-        return true;
-      }
-    })
-    .join(path.delimiter);
+  const shim = pinchTabDenyShimDir();
+  const parts = pathEnv.split(path.delimiter).filter((dir) => dir && dir !== shim);
+  return [shim, ...parts].join(path.delimiter);
 }
 
 export function pathHasPinchTab(pathEnv: string): boolean {
@@ -101,7 +85,7 @@ export function pathHasPinchTab(pathEnv: string): boolean {
     if (!dir) continue;
     try {
       fs.accessSync(path.join(dir, "pinchtab"), fs.constants.X_OK);
-      return true;
+      return !dir.includes(SHIM_MARKER);
     } catch {
       continue;
     }
@@ -129,7 +113,7 @@ function resolveExecutable(bin: string, pathEnv: string): string | null {
     }
   }
   for (const dir of pathEnv.split(path.delimiter)) {
-    if (!dir) continue;
+    if (!dir || dir.includes(SHIM_MARKER)) continue;
     const candidate = path.join(dir, bin);
     try {
       fs.accessSync(candidate, fs.constants.X_OK);
@@ -141,7 +125,7 @@ function resolveExecutable(bin: string, pathEnv: string): string | null {
   return null;
 }
 
-/** Absolute host pinchtab. Never the Harness PATH after strip. */
+/** Absolute host pinchtab. Never the Harness PATH shim. */
 export function resolvePinchTabBin(pathEnv = process.env.PATH ?? ""): string | null {
   const override = process.env.OPENBOT_PINCHTAB;
   if (override) return resolveExecutable(override, pathEnv);
@@ -149,30 +133,18 @@ export function resolvePinchTabBin(pathEnv = process.env.PATH ?? ""): string | n
 }
 
 export function pinchTabMcpScript(): string {
-  return fileURLToPath(new URL("./pinchtab-mcp.ts", import.meta.url));
-}
-
-function resolveTsx(): string | null {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const local = path.resolve(here, "../../node_modules/.bin/tsx");
-  try {
-    fs.accessSync(local, fs.constants.X_OK);
-    return local;
-  } catch {
-    return resolveExecutable("tsx", pathWithLocalBin(process.env.PATH ?? ""));
-  }
+  return fileURLToPath(new URL("./pinchtab-mcp.mjs", import.meta.url));
 }
 
 export function pinchTabWrapperCommand(): { command: string; args: string[] } | null {
-  const tsx = resolveTsx();
   const script = pinchTabMcpScript();
-  if (!tsx) return null;
   try {
+    fs.accessSync(process.execPath, fs.constants.X_OK);
     fs.accessSync(script, fs.constants.R_OK);
   } catch {
     return null;
   }
-  return { command: tsx, args: [script] };
+  return { command: process.execPath, args: [script] };
 }
 
 export function pinchTabWrapperArgs(bin: string, server: string, token: string): string[] {
@@ -249,9 +221,23 @@ export async function pinchTabHealthy(url: string, token: string, timeoutMs = 15
   return tabs !== null && tabs >= 200 && tabs < 300;
 }
 
+export async function waitForPinchTabBridge(
+  url: string,
+  token: string,
+  timeoutMs = 60_000,
+): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await pinchTabHealthy(url, token, 800)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  return pinchTabHealthy(url, token, 800);
+}
+
 export async function pinchTabMcpServers(
   computer: ComputerRuntime,
   botId: string,
+  inheritEnv: NodeJS.ProcessEnv = process.env,
 ): Promise<AcpMcpServer[]> {
   const bridge = computer.pinchTab(botId);
   if (!bridge) return [];
@@ -259,12 +245,9 @@ export async function pinchTabMcpServers(
   if (!bin) return [];
   const wrapper = pinchTabWrapperCommand();
   if (!wrapper) return [];
-  let ok = false;
-  for (let i = 0; i < 5; i += 1) {
-    ok = await pinchTabHealthy(bridge.url, bridge.token);
-    if (ok) break;
-    await new Promise((resolve) => setTimeout(resolve, 400));
-  }
+  const display = computer.display(botId)?.display ?? 1;
+  const waitMs = display > 1 ? 60_000 : 3_000;
+  const ok = await waitForPinchTabBridge(bridge.url, bridge.token, waitMs);
   if (!ok) return [];
   return [
     {
@@ -272,10 +255,13 @@ export async function pinchTabMcpServers(
       command: wrapper.command,
       args: pinchTabWrapperArgs(bin, bridge.url, bridge.token),
       env: [
+        ...mcpInheritEnv(inheritEnv),
         { name: "OPENBOT_PINCHTAB", value: bin },
         { name: "OPENBOT_PINCHTAB_SERVER", value: bridge.url },
         { name: "PINCHTAB_TOKEN", value: bridge.token },
       ],
+      // ACP stdio MCP is name/command/args/env. Extra keys can drop the server.
+      _meta: { startup_timeout_sec: 30, required: true },
     },
   ];
 }

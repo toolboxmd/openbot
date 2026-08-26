@@ -1,24 +1,15 @@
 import { spawn } from "node:child_process";
-import { filterAllowlistedTools, pinchTabToolAllowed } from "./pinchtab.ts";
-
-type JsonRpc = {
-  jsonrpc?: string;
-  id?: number | string | null;
-  method?: string;
-  params?: unknown;
-  result?: unknown;
-  error?: unknown;
-};
-
-type Framing = "ndjson" | "lsp";
+import { filterAllowlistedTools, pinchTabToolAllowed } from "./pinchtab-allowlist.mjs";
 
 class RpcReader {
-  private buf = Buffer.alloc(0);
-  private mode: "unknown" | Framing = "unknown";
+  constructor() {
+    this.buf = Buffer.alloc(0);
+    this.mode = "unknown";
+  }
 
-  push(chunk: Buffer): Array<{ obj: JsonRpc; framing: Framing }> {
+  push(chunk) {
     this.buf = Buffer.concat([this.buf, chunk]);
-    const out: Array<{ obj: JsonRpc; framing: Framing }> = [];
+    const out = [];
     while (true) {
       const next = this.pull();
       if (!next) break;
@@ -27,11 +18,14 @@ class RpcReader {
     return out;
   }
 
-  private pull(): { obj: JsonRpc; framing: Framing } | null {
+  pull() {
     if (this.buf.length === 0) return null;
     if (this.mode === "unknown") {
       let i = 0;
-      while (i < this.buf.length && (this.buf[i] === 0x20 || this.buf[i] === 0x0d || this.buf[i] === 0x0a || this.buf[i] === 0x09)) {
+      while (
+        i < this.buf.length &&
+        (this.buf[i] === 0x20 || this.buf[i] === 0x0d || this.buf[i] === 0x0a || this.buf[i] === 0x09)
+      ) {
         i += 1;
       }
       if (i >= this.buf.length) return null;
@@ -43,9 +37,9 @@ class RpcReader {
       const line = this.buf.subarray(0, nl).toString("utf8").replace(/\r$/, "");
       this.buf = this.buf.subarray(nl + 1);
       if (!line.trim()) return this.pull();
-      return { obj: JSON.parse(line) as JsonRpc, framing: "ndjson" };
+      return { obj: JSON.parse(line), framing: "ndjson" };
     }
-    const headerEnd = indexOf(this.buf, "\r\n\r\n");
+    const headerEnd = this.buf.indexOf(Buffer.from("\r\n\r\n"));
     if (headerEnd === -1) return null;
     const header = this.buf.subarray(0, headerEnd).toString("utf8");
     const match = /Content-Length:\s*(\d+)/i.exec(header);
@@ -58,37 +52,30 @@ class RpcReader {
     if (this.buf.length < start + len) return null;
     const body = this.buf.subarray(start, start + len).toString("utf8");
     this.buf = this.buf.subarray(start + len);
-    return { obj: JSON.parse(body) as JsonRpc, framing: "lsp" };
+    return { obj: JSON.parse(body), framing: "lsp" };
   }
 }
 
-function indexOf(buf: Buffer, needle: string): number {
-  const n = Buffer.from(needle);
-  return buf.indexOf(n);
-}
-
-function encode(obj: unknown, framing: Framing): Buffer {
-  const body = Buffer.from(`${JSON.stringify(obj)}`, "utf8");
+function encode(obj, framing) {
+  const body = Buffer.from(JSON.stringify(obj), "utf8");
   if (framing === "lsp") {
     return Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`), body]);
   }
   return Buffer.concat([body, Buffer.from("\n")]);
 }
 
-function toolNameFromCall(params: unknown): string {
+function toolNameFromCall(params) {
   if (!params || typeof params !== "object") return "";
-  const name = (params as { name?: unknown }).name;
-  return typeof name === "string" ? name : "";
+  return typeof params.name === "string" ? params.name : "";
 }
 
-function filterListResult(result: unknown): unknown {
+function filterListResult(result) {
   if (!result || typeof result !== "object") return result;
-  const tools = (result as { tools?: unknown }).tools;
-  if (!Array.isArray(tools)) return result;
-  return { ...(result as object), tools: filterAllowlistedTools(tools as Array<{ name?: string }>) };
+  if (!Array.isArray(result.tools)) return result;
+  return { ...result, tools: filterAllowlistedTools(result.tools) };
 }
 
-function argvValue(flag: string): string | undefined {
+function argvValue(flag) {
   const idx = process.argv.indexOf(flag);
   if (idx < 0) return undefined;
   const value = process.argv[idx + 1];
@@ -96,10 +83,10 @@ function argvValue(flag: string): string | undefined {
 }
 
 export function runPinchTabAllowlistProxy(
-  stdin: NodeJS.ReadableStream = process.stdin,
-  stdout: NodeJS.WritableStream = process.stdout,
-  env: NodeJS.ProcessEnv = process.env,
-): Promise<number> {
+  stdin = process.stdin,
+  stdout = process.stdout,
+  env = process.env,
+) {
   const bin = env.OPENBOT_PINCHTAB || argvValue("--bin");
   const server = env.OPENBOT_PINCHTAB_SERVER || argvValue("--server");
   const token = env.PINCHTAB_TOKEN || argvValue("--token");
@@ -115,15 +102,15 @@ export function runPinchTabAllowlistProxy(
 
   const fromClient = new RpcReader();
   const fromChild = new RpcReader();
-  const listIds = new Set<number | string>();
-  let clientFraming: Framing = "ndjson";
+  const listIds = new Set();
+  let clientFraming = "ndjson";
 
-  const writeOut = (obj: unknown, framing: Framing) => {
+  const writeOut = (obj, framing) => {
     stdout.write(encode(obj, framing));
   };
 
-  stdin.on("data", (chunk: Buffer) => {
-    let messages: Array<{ obj: JsonRpc; framing: Framing }>;
+  stdin.on("data", (chunk) => {
+    let messages;
     try {
       messages = fromClient.push(chunk);
     } catch {
@@ -154,8 +141,8 @@ export function runPinchTabAllowlistProxy(
     }
   });
 
-  child.stdout?.on("data", (chunk: Buffer) => {
-    let messages: Array<{ obj: JsonRpc; framing: Framing }>;
+  child.stdout?.on("data", (chunk) => {
+    let messages;
     try {
       messages = fromChild.push(chunk);
     } catch {
@@ -189,9 +176,7 @@ export function runPinchTabAllowlistProxy(
   });
 }
 
-const isMain = process.argv.some((arg) => /pinchtab-mcp\.(ts|js)$/.test(arg));
-
+const isMain = process.argv.some((arg) => /pinchtab-mcp\.(mjs|js|ts)$/.test(arg));
 if (isMain) {
-  const code = await runPinchTabAllowlistProxy();
-  process.exit(code);
+  process.exit(await runPinchTabAllowlistProxy());
 }

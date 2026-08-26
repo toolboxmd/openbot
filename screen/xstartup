@@ -49,9 +49,7 @@ if command -v xfconf-query >/dev/null 2>&1; then
     xfconf-query -c xfce4-desktop -p "$prop" -s 0 >/dev/null 2>&1 || true
   done
 fi
-# Unique headed profile per display. Shared cookies are copied in/out of
-# /computer/cookies by entrypoint. CDP is localhost-only in this container so
-# PinchTab can attach to this Chrome. Do not publish CDP.
+# CDP is container-local; do not publish.
 CHROME_BIN=""
 CDP_PORT=$((9221 + n))
 if command -v google-chrome-stable >/dev/null 2>&1; then
@@ -67,7 +65,7 @@ else
     --remote-debugging-port="$CDP_PORT" \
     --remote-debugging-address=127.0.0.1 \
     --remote-allow-origins=* \
-    --no-first-run --disable-gpu --no-sandbox --test-type --disable-dev-shm-usage \
+    --no-first-run --disable-gpu --no-sandbox --password-store=basic --test-type --disable-dev-shm-usage \
     --disable-session-crashed-bubble --hide-crash-restore-bubble --disable-infobars \
     --no-default-browser-check --window-size=1100,700 --window-position=90,40 \
     chrome://new-tab-page &

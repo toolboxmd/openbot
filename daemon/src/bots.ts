@@ -52,7 +52,7 @@ import {
   type PermissionPrompt,
 } from "./acp.ts";
 import { NoopComputerRuntime, type ComputerRuntime, type DisplayHandle } from "./computer.ts";
-import { PINCHTAB_MCP_NAME, pinchTabMcpServers, stripPinchTabFromPath } from "./pinchtab.ts";
+import { pinchTabMcpServers, stripPinchTabFromPath } from "./pinchtab.ts";
 
 export { defaultHomeDir, defaultWorkspaceDir } from "./home.ts";
 export type { MessageReaction, MessageReceipt } from "./home.ts";
@@ -535,7 +535,14 @@ export class BotStore {
   }
 
   private async ensureClient(bot: Bot): Promise<{ client: AcpSession; skipHistory: boolean }> {
-    if (bot.client) return { client: bot.client, skipHistory: true };
+    if (bot.client) {
+      const attached = this.spawnSpecs.get(bot.id)?.mcpServers ?? [];
+      if (attached.length > 0) return { client: bot.client, skipHistory: true };
+      const next = await pinchTabMcpServers(this.computer, bot.id, this.spawnSpecs.get(bot.id)?.env);
+      if (next.length === 0) return { client: bot.client, skipHistory: true };
+      bot.client.close();
+      bot.client = null;
+    }
     const harness = bot.harness;
     if (!harness) throw Object.assign(new Error("pick a Harness first"), { status: 400 });
 
@@ -561,7 +568,8 @@ export class BotStore {
         env: spawnSpecEnvFallback(bot.configMode, this.home.homeDir, cwd, bot.id, this.computer.containerName()),
       };
     }
-    spec.mcpServers = await pinchTabMcpServers(this.computer, bot.id);
+    spec.mcpServers = await pinchTabMcpServers(this.computer, bot.id, spec.env);
+    this.spawnSpecs.set(bot.id, spec);
 
     const channelId = this.channelId(bot.id);
     let client: AcpSession | undefined;
@@ -693,10 +701,7 @@ export class BotStore {
   private handlePermission(bot: Bot, client: AcpSession, prompt: PermissionPrompt): void {
     const cwd = this.botCwd(bot.id);
     const requestPath = extractPermissionPath(prompt, cwd);
-    const pinchTabMcp = (this.spawnSpecs.get(bot.id)?.mcpServers ?? []).some(
-      (server) => server.name === PINCHTAB_MCP_NAME,
-    );
-    if (isPinchTabPermission(prompt) || (pinchTabMcp && !requestPath)) {
+    if (isPinchTabPermission(prompt)) {
       const allow = pickAllowOption(prompt.options);
       if (allow) {
         client.respondPermission(prompt.rpcId, allow);

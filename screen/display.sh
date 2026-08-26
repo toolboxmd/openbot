@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Extra Kasm displays inside the one Computer container.
-# usage: openbot-display start <n> | seed <n> | cookies-in <n> | cookies-out <n> | pinchtab <n>
+# usage: openbot-display start <n> | stop <n> | seed <n> | cookies-in <n> | cookies-out <n> | pinchtab <n>
 
 CMD="${1:-start}"
 N="${2:-}"
@@ -58,11 +58,15 @@ cookie_files() {
   echo Cookies Cookies-journal Cookies-wal Cookies-shm
 }
 
+# Chrome encrypts cookie values with os_crypt in Local State. Copy that with the jar.
 cookies_in() {
   local n="$1"
   local profile f
   profile="$(profile_dir "$n")"
   mkdir -p "$profile/Default/Network"
+  if [ -f "$COOKIE_JAR/Local State" ]; then
+    cp -a "$COOKIE_JAR/Local State" "$profile/Local State" || true
+  fi
   for f in $(cookie_files); do
     if [ -f "$COOKIE_JAR/$f" ]; then
       cp -a "$COOKIE_JAR/$f" "$profile/Default/$f" || true
@@ -79,6 +83,9 @@ cookies_out() {
   local profile f
   profile="$(profile_dir "$n")"
   mkdir -p "$COOKIE_JAR/Network"
+  if [ -f "$profile/Local State" ]; then
+    cp -a "$profile/Local State" "$COOKIE_JAR/Local State" || true
+  fi
   for f in $(cookie_files); do
     if [ -f "$profile/Default/$f" ]; then
       cp -a "$profile/Default/$f" "$COOKIE_JAR/$f" || true
@@ -181,6 +188,39 @@ pinchtab_start() {
   " >>"$log" 2>&1 < /dev/null &
 }
 
+stop_chrome() {
+  local n="$1"
+  local profile
+  profile="$(profile_dir "$n")"
+  # Trailing space so display 1 does not match google-chrome-d2.
+  # Pattern must not start with --; pgrep/pkill treat that as flags.
+  local pat="user-data-dir=${profile} "
+  pkill -f -- "$pat" 2>/dev/null || true
+  local i
+  for i in $(seq 1 15); do
+    if ! pgrep -af -- "$pat" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  pkill -9 -f -- "$pat" 2>/dev/null || true
+  sleep 1
+}
+
+stop_display() {
+  local n="$1"
+  if ! [[ "$n" =~ ^[1-8]$ ]]; then
+    echo "openbot-display: display must be 1-8" >&2
+    exit 1
+  fi
+  stop_chrome "$n"
+  cookies_out "$n"
+  if [[ "$n" =~ ^[2-8]$ ]]; then
+    su -s /bin/bash "$USER_NAME" -c "vncserver -kill :${n}" 2>/dev/null || true
+    rm -f "/tmp/.X${n}-lock" "/tmp/.X11-unix/X${n}"
+  fi
+}
+
 start_display() {
   local n="$1"
   if ! [[ "$n" =~ ^[2-8]$ ]]; then
@@ -203,6 +243,9 @@ case "$CMD" in
   start)
     start_display "$N"
     ;;
+  stop)
+    stop_display "$N"
+    ;;
   seed)
     seed_display "$N"
     ;;
@@ -216,7 +259,7 @@ case "$CMD" in
     pinchtab_start "$N"
     ;;
   *)
-    echo "usage: openbot-display start <n> | seed <n> | cookies-in <n> | cookies-out <n> | pinchtab <n>" >&2
+    echo "usage: openbot-display start <n> | stop <n> | seed <n> | cookies-in <n> | cookies-out <n> | pinchtab <n>" >&2
     exit 1
     ;;
 esac

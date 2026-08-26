@@ -11,7 +11,12 @@ import { startBox, type RunningBox } from "../src/box.ts";
 import { pickScreenPorts, DockerComputerRuntime, DISPLAY_BIN } from "../src/computer.ts";
 import { listHarnessesOnPath, spawnSpec } from "../src/harness.ts";
 import { defaultWorkspaceDir } from "../src/home.ts";
-import { pinchTabHealthy, pinchTabMcpServers, resolvePinchTabBin } from "../src/pinchtab.ts";
+import {
+  pinchTabHealthy,
+  pinchTabMcpServers,
+  pinchTabWrapperCommand,
+  resolvePinchTabBin,
+} from "../src/pinchtab.ts";
 
 const PASSWORD = "correct-horse";
 const POLL_MS = 180_000;
@@ -198,17 +203,100 @@ async function waitHealth(url: string, token: string, timeoutMs = 180_000): Prom
   throw new Error(`PinchTab bridge was not healthy at ${url}`);
 }
 
-function startCookieServer(secret: string): Promise<{ origin: string; close: () => Promise<void> }> {
+function writeRpc(child: { stdin: { write: (s: string) => boolean } | null }, id: number, method: string, params: unknown = {}): void {
+  child.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+}
+
+function readRpc(child: { stdout: NodeJS.ReadableStream }, id: number, timeoutMs = 12_000): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out waiting for rpc ${id}`)), timeoutMs);
+    let buf = Buffer.alloc(0);
+    const onData = (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk]);
+      const text = buf.toString("utf8");
+      for (const line of text.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("Content-Length")) continue;
+        const json = trimmed.includes("{") ? trimmed.slice(trimmed.indexOf("{")) : trimmed;
+        try {
+          const msg = JSON.parse(json) as { id?: unknown };
+          if (msg.id === id) {
+            clearTimeout(timer);
+            child.stdout.off("data", onData);
+            resolve(msg as Record<string, unknown>);
+            return;
+          }
+        } catch {
+          /* wait */
+        }
+      }
+      const headerEnd = buf.indexOf(Buffer.from("\r\n\r\n"));
+      if (headerEnd !== -1) {
+        const header = buf.subarray(0, headerEnd).toString("utf8");
+        const match = /Content-Length:\s*(\d+)/i.exec(header);
+        if (match) {
+          const len = Number(match[1]);
+          const start = headerEnd + 4;
+          if (buf.length >= start + len) {
+            try {
+              const msg = JSON.parse(buf.subarray(start, start + len).toString("utf8")) as { id?: unknown };
+              if (msg.id === id) {
+                clearTimeout(timer);
+                child.stdout.off("data", onData);
+                resolve(msg as Record<string, unknown>);
+              }
+            } catch {
+              /* wait */
+            }
+          }
+        }
+      }
+    };
+    child.stdout.on("data", onData);
+  });
+}
+
+async function listWrapperTools(server: string, token: string): Promise<string[]> {
+  const wrapper = pinchTabWrapperCommand();
+  const bin = resolvePinchTabBin();
+  if (!wrapper || !bin) return [];
+  const child = spawn(wrapper.command, [...wrapper.args, "--bin", bin, "--server", server, "--token", token], {
+    env: {
+      ...process.env,
+      OPENBOT_PINCHTAB: bin,
+      OPENBOT_PINCHTAB_SERVER: server,
+      PINCHTAB_TOKEN: token,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  try {
+    writeRpc(child, 1, "initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "openbot-live" },
+    });
+    await readRpc(child, 1);
+    writeRpc(child, 2, "tools/list");
+    const listed = await readRpc(child, 2);
+    return ((listed.result as { tools?: Array<{ name: string }> })?.tools ?? []).map((tool) => tool.name);
+  } finally {
+    child.kill("SIGTERM");
+  }
+}
+
+function startCookieServer(
+  secret: string,
+): Promise<{ port: number; setHost: (host: string) => string; close: () => Promise<void> }> {
   return new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
       if (url.pathname === "/login") {
         res.writeHead(200, {
           "content-type": "text/html; charset=utf-8",
-          "set-cookie": `openbot_pt=${secret}; Path=/; SameSite=Lax`,
+          "set-cookie": `openbot_pt=${secret}; Path=/; SameSite=Lax; Max-Age=86400`,
         });
         res.end(
-          `<!doctype html><html><body>LOGIN-PAGE-OK You are logged in.<script>document.cookie="openbot_pt=${secret};path=/"</script></body></html>`,
+          `<!doctype html><html><body>LOGIN-PAGE-OK You are logged in.<script>document.cookie="openbot_pt=${secret};path=/;max-age=86400"</script></body></html>`,
         );
         return;
       }
@@ -233,12 +321,15 @@ function startCookieServer(secret: string): Promise<{ origin: string; close: () 
         return;
       }
       resolve({
-        origin: `http://host.docker.internal:${addr.port}`,
+        port: addr.port,
+        setHost: (host: string) => `http://${host}:${addr.port}`,
         close: () => new Promise((done) => server.close(() => done())),
       });
     });
   });
 }
+
+const COOKIE_HOST = "openbot-cookies.test";
 
 describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
   let box: RunningBox;
@@ -265,7 +356,7 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
     const cookiesDir = join(homeDir, "cookies");
     mkdirSync(workspaceDir, { recursive: true });
     mkdirSync(cookiesDir, { recursive: true });
-    cookieServer = await startCookieServer(cookieSecret);
+    const cookieHttp = await startCookieServer(cookieSecret);
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       OPENBOT_PASSWORD: PASSWORD,
@@ -283,6 +374,10 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
       env[`PINCHTAB_PORT_${i + 1}`] = String(port);
     });
     await run("docker", ["compose", "up", "--detach", "--build", "--force-recreate", "screen"], env);
+    cookieServer = {
+      origin: cookieHttp.setHost(COOKIE_HOST),
+      close: cookieHttp.close,
+    };
     await waitHealth(`http://127.0.0.1:${pinchTabPorts[0]}`, token);
     const computer = new DockerComputerRuntime({
       containerName: container,
@@ -316,7 +411,7 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
     }
     await writeFile(
       join(workspaceDir, "bots", adaId, "AGENTS.md"),
-      `# This Bot\nUse PinchTab MCP for the browser. Do not exec pinchtab from PATH. Do not open host Chrome. Do not use Playwright.\n`,
+      `# This Bot\nUse PinchTab MCP for the browser. Search MCP tools for pinchtab if they are not already visible. Do not exec pinchtab from PATH. Do not open host Chrome. Do not use Playwright.\n`,
     );
     await postText(box.url, cookie, adaId, "Reply with the exact word READY.");
     await pollIdle(box.url, cookie, adaId);
@@ -328,6 +423,16 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
   });
 
   test("Isolated Ada Session lists only allowlisted PinchTab tools", async () => {
+    const wrapperTools = await listWrapperTools(`http://127.0.0.1:${pinchTabPorts[0]}`, token);
+    assert.ok(
+      wrapperTools.some((name) => /navigate/i.test(name)),
+      `stock wrapper tools/list missed navigate: ${wrapperTools.join(",")}`,
+    );
+    assert.equal(
+      wrapperTools.some((name) => /cookies|eval|scrape|pdf|capture|record|network[_-]route|wait_for_function/i.test(name)),
+      false,
+      `allowlist leaked: ${wrapperTools.join(",")}`,
+    );
     const prior = ((await getBot(box.url, cookie, adaId)).messages ?? []).filter(
       (message) => message.role === "assistant" && message.text,
     ).length;
@@ -335,12 +440,16 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
       box.url,
       cookie,
       adaId,
-      "List every PinchTab MCP tool you can call. Reply with the exact tool names, one per line. If you have no PinchTab tools, reply with the exact words NO-PINCHTAB. Do not invent tools.",
+      "Search MCP tools for pinchtab (use tool_search or /mcp if needed). Then list every PinchTab MCP tool you can call, one name per line. If none exist after searching, reply with the exact words NO-PINCHTAB. Do not invent tools.",
     );
     const idle = await pollIdle(box.url, cookie, adaId);
     assert.equal(idle.needsYou, null, `login/auth failed: ${JSON.stringify(idle.needsYou)}`);
     const text = assistantText(idle.messages ?? [], prior);
-    assert.doesNotMatch(text, /NO-PINCHTAB/);
+    assert.doesNotMatch(
+      text,
+      /NO-PINCHTAB/,
+      `Codex Session has no PinchTab tools; wrapper listed ${wrapperTools.join(",")}`,
+    );
     assert.match(text, /navigate/i);
     assert.match(text, /get_text|gettext/i);
     assert.match(text, /snapshot/i);
@@ -352,6 +461,7 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
     assert.doesNotMatch(text, /pinchtab_capture/i);
     assert.doesNotMatch(text, /pinchtab_record/i);
     assert.doesNotMatch(text, /network[_-]route/i);
+    assert.doesNotMatch(text, /wait_for_function/i);
   });
 
   test("Ada opens a public page on Screen Chrome; Computer preview shows it", async () => {
@@ -359,7 +469,7 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
       box.url,
       cookie,
       adaId,
-      "Using PinchTab MCP, open https://example.com. Use get_text first, then snapshot. Screenshot only if you must. Reply with the page title and one short quote from the text. Do not exec pinchtab from PATH. Do not open host Chrome.",
+      "Search MCP tools for pinchtab if they are not already visible. Using PinchTab MCP, open https://example.com. Use get_text first, then snapshot. Screenshot only if you must. Reply with the page title and one short quote from the text. Do not exec pinchtab from PATH. Do not open host Chrome.",
     );
     const idle = await pollIdle(box.url, cookie, adaId);
     const text = assistantText(idle.messages ?? []);
@@ -385,45 +495,6 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
     assert.match(shotText, /SCREENSHOT-OK|SCREENSHOT-NO/i);
   });
 
-  test("cookie jar: Ada login reaches Ben after Ben's Screen starts; chat has no cookie values", async () => {
-    assert.ok(cookieServer);
-    await postText(
-      box.url,
-      cookie,
-      adaId,
-      `Using PinchTab, navigate exactly to ${cookieServer.origin}/login and no other URL. Then get_text. Reply with the visible page text. The right page says LOGIN-PAGE-OK. Do not print cookie values.`,
-    );
-    const adaIdle = await pollIdle(box.url, cookie, adaId);
-    const adaText = assistantText(adaIdle.messages ?? []);
-    assert.doesNotMatch(allText(adaIdle.messages ?? []), new RegExp(cookieSecret));
-    assert.match(adaText, /LOGIN-PAGE-OK/);
-    await new Promise((resolve) => setTimeout(resolve, 2500));
-    let copied = spawnSync("docker", ["exec", container, DISPLAY_BIN, "cookies-out", "1"], { encoding: "utf8" });
-    for (let i = 0; i < 4 && copied.status !== 0; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      copied = spawnSync("docker", ["exec", container, DISPLAY_BIN, "cookies-out", "1"], { encoding: "utf8" });
-    }
-    assert.equal(copied.status, 0, copied.stderr);
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    const benId = await createBot(box.url, cookie, "Ben");
-    await waitHealth(`http://127.0.0.1:${pinchTabPorts[1]}`, token);
-    await writeFile(
-      join(workspaceDir, "bots", benId, "AGENTS.md"),
-      `# This Bot\nUse PinchTab MCP for the browser. Do not print cookie values.\n`,
-    );
-    await postText(
-      box.url,
-      cookie,
-      benId,
-      `Using PinchTab, navigate exactly to ${cookieServer.origin}/whoami and no other URL. Then get_text. Reply with the visible page text. Do not print cookie values.`,
-    );
-    const benIdle = await pollIdle(box.url, cookie, benId);
-    const benText = assistantText(benIdle.messages ?? []);
-    assert.match(benText, /WHOAMI-COOKIE-OK/);
-    assert.doesNotMatch(allText(benIdle.messages ?? []), new RegExp(cookieSecret));
-    assert.doesNotMatch(allText(adaIdle.messages ?? []), new RegExp(cookieSecret));
-  });
-
   test("captcha path is screenshot and clicks then Open computer, not a solver", async () => {
     const before = (await getBot(box.url, cookie, adaId)).messages ?? [];
     const prior = before.filter((message) => message.role === "assistant" && message.text).length;
@@ -440,6 +511,55 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
     assert.match(text, /Open computer/i);
     assert.doesNotMatch(text, /capsolver|2captcha/i);
     assert.doesNotMatch(text, /use pinchtab_eval/i);
+  });
+
+  test("cookie jar: Ada login reaches Ben after Ada Screen stop; chat has no cookie values", async () => {
+    assert.ok(cookieServer);
+    await postText(
+      box.url,
+      cookie,
+      adaId,
+      `Search MCP tools for pinchtab if they are not already visible. Using only PinchTab MCP (not curl, wget, or docker exec), navigate exactly to ${cookieServer.origin}/login and no other URL. Then get_text. Reply with the visible page text. The right page says LOGIN-PAGE-OK. Do not print cookie values.`,
+    );
+    const adaIdle = await pollIdle(box.url, cookie, adaId);
+    const adaText = assistantText(adaIdle.messages ?? []);
+    assert.doesNotMatch(allText(adaIdle.messages ?? []), new RegExp(cookieSecret));
+    assert.match(adaText, /LOGIN-PAGE-OK/);
+    const adaCookies = spawnSync(
+      "docker",
+      [
+        "exec",
+        container,
+        "python3",
+        "-c",
+        "import sqlite3; c=sqlite3.connect('/home/openbot/.config/google-chrome/Default/Cookies'); print([r[0] for r in c.execute('select host_key from cookies')])",
+      ],
+      { encoding: "utf8" },
+    );
+    assert.match(
+      adaCookies.stdout,
+      /openbot-cookies\.test/,
+      `Ada Chrome did not persist the login cookie hosts=${adaCookies.stdout} err=${adaCookies.stderr}`,
+    );
+    const stopped = spawnSync("docker", ["exec", container, DISPLAY_BIN, "stop", "1"], { encoding: "utf8" });
+    assert.equal(stopped.status, 0, stopped.stderr);
+    const benId = await createBot(box.url, cookie, "Ben");
+    await waitHealth(`http://127.0.0.1:${pinchTabPorts[1]}`, token);
+    await writeFile(
+      join(workspaceDir, "bots", benId, "AGENTS.md"),
+      `# This Bot\nUse PinchTab MCP for the browser. Search MCP tools for pinchtab if they are not already visible. Do not print cookie values.\n`,
+    );
+    await postText(
+      box.url,
+      cookie,
+      benId,
+      `Search MCP tools for pinchtab if they are not already visible. Using only PinchTab MCP (not curl, wget, or docker exec), navigate exactly to ${cookieServer.origin}/whoami and no other URL. Then get_text. Reply with the visible page text. Do not print cookie values.`,
+    );
+    const benIdle = await pollIdle(box.url, cookie, benId);
+    const benText = assistantText(benIdle.messages ?? []);
+    assert.match(benText, /WHOAMI-COOKIE-OK/);
+    assert.doesNotMatch(allText(benIdle.messages ?? []), new RegExp(cookieSecret));
+    assert.doesNotMatch(allText(adaIdle.messages ?? []), new RegExp(cookieSecret));
   });
 
   test("PinchTab stopped: Ada does not drive host Chrome; she asks to Open computer", async () => {

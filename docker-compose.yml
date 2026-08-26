@@ -31,6 +31,7 @@ services:
       PINCHTAB_TOKEN: ${PINCHTAB_TOKEN:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+      - "openbot-cookies.test:host-gateway"
     volumes:
       - ${OPENBOT_WORKSPACE:-${OPENBOT_HOME:-${HOME}/.openbot}/workspace}:/workspace
       - ${OPENBOT_COOKIES:-./computer/cookies}:/computer/cookies

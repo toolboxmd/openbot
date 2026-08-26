@@ -131,6 +131,7 @@ describe("Isolated Harness Home layout", () => {
     assert.match(openbot, /Screen/);
     assert.match(openbot, /OPENBOT_SCREEN_CONTAINER/);
     assert.match(openbot, /PinchTab/);
+    assert.match(openbot, /search MCP tools/i);
     assert.match(openbot, /get_text/);
     assert.match(openbot, /snapshot/);
     assert.match(openbot, /screenshot/);
@@ -144,6 +145,9 @@ describe("Isolated Harness Home layout", () => {
     assert.match(isolatedConfig, /sandbox_mode = "danger-full-access"/);
     assert.match(isolatedConfig, /allow_login_shell = false/);
     assert.doesNotMatch(isolatedConfig, /sandbox_mode = "workspace-write"/);
+    assert.match(isolatedConfig, /\[projects\./);
+    assert.match(isolatedConfig, /trust_level = "trusted"/);
+    assert.doesNotMatch(isolatedConfig, /\[mcp_servers/);
   });
 
   test("ensureHarnessHome pins Isolated OPENBOT.md and Isolated Seatbelt off on existing homes", async () => {
@@ -171,6 +175,7 @@ allow_login_shell = true
     const isolatedConfig = readFileSync(codexConfig, "utf8");
     assert.match(isolatedConfig, /sandbox_mode = "danger-full-access"/);
     assert.match(isolatedConfig, /allow_login_shell = false/);
+    assert.match(isolatedConfig, /trust_level = "trusted"/);
   });
 
   test("Isolated env sets vendor homes; Host unsets them", async () => {
