@@ -101,6 +101,7 @@ COPY xfce/launcher-2 /etc/xdg/xfce4/panel/launcher-2
 COPY xfce/launcher-3 /etc/xdg/xfce4/panel/launcher-3
 COPY xfce/xfdesktop.desktop /etc/xdg/autostart/xfdesktop.desktop
 COPY www/openbot.css /usr/share/kasmvnc/www/openbot.css
+COPY chrome-ext/strip-pinchtab-title /etc/openbot/strip-pinchtab-title
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh /etc/openbot/xstartup /usr/local/bin/openbot-display \
     && sed -i 's|</head>|<link rel="stylesheet" href="openbot.css"></head>|' \

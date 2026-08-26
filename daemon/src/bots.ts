@@ -739,6 +739,12 @@ export class BotStore {
       bot.eyesMode = "needs-you";
       return;
     }
+    // Isolated v1 is not a jail (ADR 0010). Pathless commands auto-allow. Host grant is host paths only.
+    const allow = pickAllowOption(prompt.options);
+    if (allow) {
+      client.respondPermission(prompt.rpcId, allow);
+      return;
+    }
     bot.permission = prompt;
     bot.eyesMode = "needs-you";
   }

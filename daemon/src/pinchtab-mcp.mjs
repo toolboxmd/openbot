@@ -1,5 +1,90 @@
 import { spawn } from "node:child_process";
-import { filterAllowlistedTools, pinchTabToolAllowed } from "./pinchtab-allowlist.mjs";
+import { filterAllowlistedTools, normalizePinchTabToolName, pinchTabToolAllowed } from "./pinchtab-allowlist.mjs";
+
+const BRING_FRONT = new Set([
+  "navigate",
+  "click",
+  "type",
+  "fill",
+  "select",
+  "key",
+  "press",
+  "scroll",
+  "back",
+  "screenshot",
+  "wait",
+  "wait_for_selector",
+  "wait_for_text",
+  "wait_for_url",
+  "wait_for_load",
+]);
+
+export function shouldBringTabFront(name) {
+  return BRING_FRONT.has(normalizePinchTabToolName(name));
+}
+
+export function tabIdFromToolResult(result) {
+  if (!result || typeof result !== "object") return "";
+  if (typeof result.tabId === "string" && result.tabId) return result.tabId;
+  if (typeof result.tab_id === "string" && result.tab_id) return result.tab_id;
+  const content = result.content;
+  if (!Array.isArray(content)) return "";
+  for (const part of content) {
+    if (!part || typeof part.text !== "string") continue;
+    try {
+      const parsed = JSON.parse(part.text);
+      if (parsed && typeof parsed.tabId === "string" && parsed.tabId) return parsed.tabId;
+      if (parsed && typeof parsed.tab_id === "string" && parsed.tab_id) return parsed.tab_id;
+    } catch {
+      const match = /"tabId"\s*:\s*"([^"]+)"/.exec(part.text);
+      if (match) return match[1];
+    }
+  }
+  return "";
+}
+
+function toolArguments(params) {
+  if (!params || typeof params !== "object") return {};
+  const args = params.arguments;
+  return args && typeof args === "object" ? args : {};
+}
+
+export async function reuseExistingTabId(server, token) {
+  if (!server) return "";
+  try {
+    const res = await fetch(`${server.replace(/\/$/, "")}/tabs`, {
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!res.ok) return "";
+    const data = await res.json();
+    const tabs = Array.isArray(data?.tabs) ? data.tabs : Array.isArray(data) ? data : [];
+    const page = tabs.find((tab) => tab && (tab.type === "page" || tab.url)) ?? tabs[0];
+    if (!page || typeof page !== "object") return "";
+    if (typeof page.id === "string" && page.id) return page.id;
+    if (typeof page.tabId === "string" && page.tabId) return page.tabId;
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+export async function focusPinchTab(server, token, tabId) {
+  if (!server || !tabId) return;
+  try {
+    await fetch(`${server.replace(/\/$/, "")}/tab`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ action: "focus", tabId }),
+      signal: AbortSignal.timeout(1500),
+    });
+  } catch {
+    /* Screen Chrome stays as-is */
+  }
+}
 
 class RpcReader {
   constructor() {
@@ -103,6 +188,7 @@ export function runPinchTabAllowlistProxy(
   const fromClient = new RpcReader();
   const fromChild = new RpcReader();
   const listIds = new Set();
+  const frontIds = new Set();
   let clientFraming = "ndjson";
 
   const writeOut = (obj, framing) => {
@@ -133,6 +219,19 @@ export function runPinchTabAllowlistProxy(
           }
           continue;
         }
+        if (obj.id !== undefined && obj.id !== null && shouldBringTabFront(name)) {
+          frontIds.add(obj.id);
+        }
+        if (normalizePinchTabToolName(name) === "navigate") {
+          const args = toolArguments(obj.params);
+          if (!args.tabId && !args.tab_id) {
+            void reuseExistingTabId(server, token).then((tabId) => {
+              const next = tabId ? { ...obj, params: { ...obj.params, arguments: { ...args, tabId } } } : obj;
+              if (child.stdin) child.stdin.write(encode(next, framing));
+            });
+            continue;
+          }
+        }
       }
       if (obj.method === "tools/list" && obj.id !== undefined && obj.id !== null) {
         listIds.add(obj.id);
@@ -156,6 +255,11 @@ export function runPinchTabAllowlistProxy(
         continue;
       }
       writeOut(obj, framing);
+      if (obj.id !== undefined && obj.id !== null && frontIds.has(obj.id) && obj.result !== undefined) {
+        frontIds.delete(obj.id);
+        const tabId = tabIdFromToolResult(obj.result);
+        if (tabId) void focusPinchTab(server, token, tabId);
+      }
     }
   });
 

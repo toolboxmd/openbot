@@ -20,9 +20,15 @@ import {
   pinchTabToolAllowed,
   stripPinchTabFromPath,
 } from "../src/pinchtab.ts";
+import {
+  focusPinchTab,
+  shouldBringTabFront,
+  tabIdFromToolResult,
+} from "../src/pinchtab-mcp.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const displaySh = join(here, "../../screen/display.sh");
+const xstartup = join(here, "../../screen/xstartup");
 const wrapper = join(here, "../src/pinchtab-mcp.mjs");
 
 async function tempDir(prefix: string): Promise<string> {
@@ -361,8 +367,19 @@ describe("session/new mcpServers attach only when Screen and bridge are Up", () 
         ],
         rawInput: { command: "ls" },
       });
-      assert.deepEqual(fake.answered, ["allow_once"]);
-      assert.ok(store.get(ada.id)?.permission);
+      assert.deepEqual(fake.answered, ["allow_once", "allow_once"]);
+      assert.equal(store.get(ada.id)?.permission, null);
+      fake.fire({
+        rpcId: 9,
+        title: "Write file",
+        options: [
+          { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+          { optionId: "decline", name: "Decline", kind: "reject_once" },
+        ],
+        locations: [{ path: "/tmp/outside-pt.txt" }],
+        toolKind: "edit",
+      });
+      assert.ok(store.get(ada.id)?.permission?.hostGrant);
       store.close();
     } finally {
       await health.close();
@@ -551,6 +568,58 @@ describe("Computer cookie jar copy", () => {
     assert.match(body, /pgrep -af -- /);
     assert.doesNotMatch(body, /pgrep -f "--user-data-dir/);
     assert.doesNotMatch(body, /pkill -f "--user-data-dir/);
+  });
+
+  test("Screen Chrome loads the extension that strips PinchTab port titles", () => {
+    const body = readFileSync(xstartup, "utf8");
+    assert.match(body, /--load-extension=\/etc\/openbot\/strip-pinchtab-title/);
+    const strip = readFileSync(join(here, "../../screen/chrome-ext/strip-pinchtab-title/strip.js"), "utf8");
+    assert.match(strip, /\\\[PinchTab :\\d\+/);
+  });
+});
+
+describe("PinchTab tab focus", () => {
+  test("tabIdFromToolResult reads MCP text JSON", () => {
+    assert.equal(tabIdFromToolResult({ tabId: "abc" }), "abc");
+    assert.equal(
+      tabIdFromToolResult({ content: [{ type: "text", text: JSON.stringify({ tabId: "from-text" }) }] }),
+      "from-text",
+    );
+    assert.equal(shouldBringTabFront("pinchtab_navigate"), true);
+    assert.equal(shouldBringTabFront("pinchtab_snapshot"), false);
+  });
+
+  test("focusPinchTab POSTs action=focus", async () => {
+    const seen: Array<{ url?: string; body?: string }> = [];
+    const stub = await new Promise<{ url: string; close: () => Promise<void> }>((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk) => chunks.push(chunk));
+        req.on("end", () => {
+          seen.push({ url: req.url, body: Buffer.concat(chunks).toString("utf8") });
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end("{}");
+        });
+      });
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address();
+        if (!addr || typeof addr === "string") {
+          reject(new Error("focus stub failed"));
+          return;
+        }
+        resolve({
+          url: `http://127.0.0.1:${addr.port}`,
+          close: () => new Promise((done) => server.close(() => done())),
+        });
+      });
+    });
+    try {
+      await focusPinchTab(stub.url, "tok", "tab-1");
+      assert.equal(seen[0]?.url, "/tab");
+      assert.deepEqual(JSON.parse(seen[0]?.body ?? "{}"), { action: "focus", tabId: "tab-1" });
+    } finally {
+      await stub.close();
+    }
   });
 });
 
