@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.0] - 2026-08-27
+
+### Added
+
+- Add quiet Chat header and functional Bot Settings
+
 ## [0.3.0] - 2026-08-27
 
 ### Added

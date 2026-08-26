@@ -1,7 +1,8 @@
-import { FormEvent, Fragment, useEffect, useRef, useState, type ReactNode } from "react";
+import { FormEvent, Fragment, useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { motion } from "framer-motion";
-import { ArrowUp, Menu, MessageSquare, Monitor, MoreHorizontal, Plus, Reply, Smile, Users, X } from "lucide-react";
+import { ArrowUp, Menu, MessageSquare, Monitor, MoreHorizontal, Plus, Reply, Settings, Smile, Users, X } from "lucide-react";
 import { AppSettings } from "@/components/AppSettings";
+import { BotSettings } from "@/components/BotSettings";
 import { ComputerScreen } from "@/components/Computer";
 import { Eyes } from "@/components/Eyes";
 import { MessengerShell, type MobileSurface } from "@/components/MessengerShell";
@@ -21,9 +22,13 @@ import {
   sidebarGroups,
   type Channel,
 } from "@/lib/channels";
-import { AgentsEditors } from "@/components/AgentsEditors";
 import { HostGrantCard } from "@/components/HostGrantCard";
 import { isHostGrantPermission } from "@/lib/harness-home";
+import {
+  botSettingsHash,
+  parseBotSettingsHash,
+  type BotSettingsSection,
+} from "@/lib/bot-settings";
 import { computerPaneIsOpen } from "@/lib/ui-preferences";
 import {
   answerHostGrant,
@@ -35,9 +40,7 @@ import {
   listBots,
   listChannels,
   listHarnesses,
-  pickHarness,
   sendMessage,
-  setConfigMode,
   toggleReaction,
   type Bot,
   type Harness,
@@ -45,6 +48,18 @@ import {
 
 
 type ChatMessage = NonNullable<Bot["messages"]>[number];
+
+function clearBotSettingsLocation() {
+  window.history.replaceState(
+    window.history.state,
+    "",
+    `${window.location.pathname}${window.location.search}`,
+  );
+}
+
+function botSettingsLocationCandidate(hash: string): boolean {
+  return hash.startsWith("#bots/");
+}
 
 function autolink(text: string) {
   return text.split(/(https?:\/\/[^\s<]+)/g).map((part, index) => {
@@ -253,6 +268,11 @@ export function Messenger() {
   const closeChatsButtonRef = useRef<HTMLButtonElement | null>(null);
   const computerButtonRef = useRef<HTMLButtonElement | null>(null);
   const closeComputerButtonRef = useRef<HTMLButtonElement | null>(null);
+  const botSettingsOpenerRef = useRef<HTMLButtonElement | null>(null);
+  const activeIdRef = useRef<string | null>(null);
+  const botSettingsNavigationRef = useRef(0);
+  const [botSettingsOpen, setBotSettingsOpen] = useState(false);
+  const [botSettingsSection, setBotSettingsSection] = useState<BotSettingsSection>("ai");
   const { preferences, updateComputerPane } = useUiPreferences();
   const computerOpen = computerPaneIsOpen(preferences, activeId);
 
@@ -277,16 +297,35 @@ export function Messenger() {
 
   useEffect(() => {
     let cancelled = false;
+    const navigation = ++botSettingsNavigationRef.current;
     void Promise.all([listBots(), listChannels()])
-      .then(async ([data, channelList]) => {
+      .then(([data, channelList]) => {
         if (cancelled) return;
         setBots(data.bots);
         setChannels(channelList.channels);
-        const first = data.bots[0];
-        if (first) {
-          setActiveId(first.id);
-          setActive(await getBot(first.id));
+        const requestedSettings = parseBotSettingsHash(window.location.hash);
+        const requestedBot = data.bots.find((bot) => bot.id === requestedSettings?.botId);
+        if ((requestedSettings && !requestedBot) || (!requestedSettings && botSettingsLocationCandidate(window.location.hash))) {
+          clearBotSettingsLocation();
         }
+        const selected = requestedBot ?? data.bots[0];
+        if (!selected) return;
+        void getBot(selected.id)
+          .then((bot) => {
+            if (cancelled || navigation !== botSettingsNavigationRef.current) return;
+            activeIdRef.current = bot.id;
+            setActiveId(bot.id);
+            setActive(bot);
+            if (requestedSettings?.botId === bot.id) {
+              setBotSettingsSection(requestedSettings.section);
+              setBotSettingsOpen(true);
+            }
+          })
+          .catch(() => {
+            if (cancelled || navigation !== botSettingsNavigationRef.current) return;
+            setBotSettingsOpen(false);
+            if (requestedSettings) clearBotSettingsLocation();
+          });
       })
       .catch(() => {
         if (!cancelled) {
@@ -305,6 +344,53 @@ export function Messenger() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const syncBotSettingsLocation = () => {
+      const navigation = ++botSettingsNavigationRef.current;
+      const requested = parseBotSettingsHash(window.location.hash);
+      if (!requested) {
+        setBotSettingsOpen(false);
+        if (botSettingsLocationCandidate(window.location.hash)) clearBotSettingsLocation();
+        return;
+      }
+      if (requested.botId === activeIdRef.current) {
+        setBotSettingsSection(requested.section);
+        setMobileSurface("chat");
+        setBotSettingsOpen(true);
+        return;
+      }
+      setBotSettingsOpen(false);
+      void getBot(requested.botId)
+        .then((bot) => {
+          if (cancelled || navigation !== botSettingsNavigationRef.current) return;
+          activeIdRef.current = bot.id;
+          setActiveId(bot.id);
+          setActive(bot);
+          setActiveGroup(null);
+          setBotSettingsSection(requested.section);
+          setMobileSurface("chat");
+          setBotSettingsOpen(true);
+        })
+        .catch(() => {
+          if (cancelled || navigation !== botSettingsNavigationRef.current) return;
+          setBotSettingsOpen(false);
+          clearBotSettingsLocation();
+        });
+    };
+    window.addEventListener("hashchange", syncBotSettingsLocation);
+    window.addEventListener("popstate", syncBotSettingsLocation);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("hashchange", syncBotSettingsLocation);
+      window.removeEventListener("popstate", syncBotSettingsLocation);
+    };
+  }, []);
+
+  useEffect(() => {
+    activeIdRef.current = activeId;
+  }, [activeId]);
 
   useEffect(() => {
     setReplyTo(null);
@@ -381,21 +467,6 @@ export function Messenger() {
     }
   }
 
-  async function onPick(harness: string) {
-    if (!activeId || !harness) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const bot = await pickHarness(activeId, harness);
-      setActive(bot);
-      await refresh(activeId);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not pick Harness.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!composerSendEnabled(activeGroup ? "group" : active ? "direct" : null)) return;
@@ -424,20 +495,6 @@ export function Messenger() {
     try {
       const bot = await answerPermission(activeId, optionId);
       setActive(bot);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function onConfigMode(configMode: "isolated" | "host") {
-    if (!activeId) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const bot = await setConfigMode(activeId, configMode);
-      setActive(bot);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not set Isolated or Host.");
     } finally {
       setBusy(false);
     }
@@ -614,6 +671,42 @@ export function Messenger() {
     void getChannel(channel.id).then(setActiveGroup);
   }
 
+  function openBotSettings(event: MouseEvent<HTMLButtonElement>) {
+    if (!activeId) return;
+    botSettingsNavigationRef.current += 1;
+    botSettingsOpenerRef.current = event.currentTarget;
+    setBotSettingsSection("ai");
+    setBotSettingsOpen(true);
+    window.history.pushState(
+      window.history.state,
+      "",
+      `${window.location.pathname}${window.location.search}${botSettingsHash(activeId, "ai")}`,
+    );
+  }
+
+  function setBotSettingsOpenFromDialog(next: boolean) {
+    if (!next) botSettingsNavigationRef.current += 1;
+    setBotSettingsOpen(next);
+    if (next || !parseBotSettingsHash(window.location.hash)) return;
+    clearBotSettingsLocation();
+  }
+
+  function chooseBotSettingsSection(section: BotSettingsSection) {
+    if (!activeId || section === botSettingsSection) return;
+    botSettingsNavigationRef.current += 1;
+    setBotSettingsSection(section);
+    window.history.pushState(
+      window.history.state,
+      "",
+      `${window.location.pathname}${window.location.search}${botSettingsHash(activeId, section)}`,
+    );
+  }
+
+  function applyBotUpdate(bot: Bot) {
+    setActive(bot);
+    setBots((rows) => rows.map((row) => (row.id === bot.id ? { ...row, ...bot } : row)));
+  }
+
   function openComputer() {
     if (!activeId) return;
     updateComputerPane(activeId, true);
@@ -628,9 +721,10 @@ export function Messenger() {
   }
 
   return (
-    <MessengerShell
-      mobileSurface={mobileSurface}
-      sidebar={
+    <>
+      <MessengerShell
+        mobileSurface={mobileSurface}
+        sidebar={
         <>
           <div className="flex h-[var(--header-height)] items-center justify-between gap-3 px-4">
             <div className="flex min-w-0 items-center gap-3">
@@ -806,7 +900,7 @@ export function Messenger() {
         </div>
         </>
       }
-      chat={
+        chat={
         <>
         <header className="flex min-h-[var(--header-height)] flex-wrap items-center justify-between gap-x-2 gap-y-1 px-3 py-1 min-[48rem]:h-[var(--header-height)] min-[48rem]:flex-nowrap min-[48rem]:gap-3 min-[48rem]:px-6 min-[48rem]:py-0">
           <div className="flex min-w-0 flex-1 items-center gap-1">
@@ -826,47 +920,34 @@ export function Messenger() {
               </TooltipTrigger>
               <TooltipContent>Open Chats</TooltipContent>
             </Tooltip>
-            <h1 className="truncate text-sm font-medium">
-              {activeGroup ? groupDisplayTitle(activeGroup) : (active?.name ?? "Thread")}
-            </h1>
+            {active && !activeGroup ? (
+              <button
+                type="button"
+                onClick={openBotSettings}
+                className="flex min-h-[var(--touch-min)] min-w-0 items-center gap-2 rounded-[var(--radius-control)] px-2 text-left transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <Eyes
+                  name={active.name}
+                  color={active.eyes.color}
+                  shape={active.eyes.shape as FaceShape}
+                  mode={active.eyes.mode as FaceMode}
+                  size={28}
+                  className="aspect-square shrink-0"
+                />
+                <span className="truncate text-sm font-medium">{active.name}</span>
+              </button>
+            ) : (
+              <h1 className="truncate text-sm font-medium">
+                {activeGroup ? groupDisplayTitle(activeGroup) : "Thread"}
+              </h1>
+            )}
           </div>
           {active && !activeGroup ? (
             <div
               role="group"
               aria-label="Bot controls"
-              className="flex w-full min-w-0 items-center gap-2 overflow-x-auto pb-1 min-[48rem]:w-auto min-[48rem]:gap-3 min-[48rem]:pb-0"
+              className="flex shrink-0 items-center gap-1"
             >
-              <label className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
-                Harness
-                <select
-                  className="h-8 rounded-full border border-input bg-background px-3 text-sm text-foreground max-[47.999rem]:h-[var(--touch-min)]"
-                  value={active.harness ?? ""}
-                  disabled={busy}
-                  onChange={(event) => void onPick(event.target.value)}
-                >
-                  <option value="">Pick a Harness</option>
-                  {harnesses.map((item) => (
-                    <option key={item.id} value={item.id} disabled={!item.talk && item.id !== "codex"}>
-                      {item.name}
-                      {item.id !== "codex" ? " (detected)" : ""}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
-                Config
-                <select
-                  data-testid="config-mode"
-                  className="h-8 rounded-full border border-input bg-background px-3 text-sm text-foreground max-[47.999rem]:h-[var(--touch-min)]"
-                  value={active.configMode ?? "isolated"}
-                  disabled={busy}
-                  onChange={(event) => void onConfigMode(event.target.value === "host" ? "host" : "isolated")}
-                >
-                  <option value="isolated">Isolated</option>
-                  <option value="host">Host</option>
-                </select>
-              </label>
-              <AgentsEditors botId={active.id} />
               <Button
                 ref={computerButtonRef}
                 type="button"
@@ -880,6 +961,21 @@ export function Messenger() {
                 {computerOpen ? <MessageSquare /> : <Monitor />}
                 {computerOpen ? "Hide Computer" : "Computer"}
               </Button>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    aria-label="Bot Settings"
+                    onClick={openBotSettings}
+                    className="min-h-[var(--touch-min)] min-w-[var(--touch-min)]"
+                  >
+                    <Settings />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Bot Settings</TooltipContent>
+              </Tooltip>
             </div>
           ) : null}
         </header>
@@ -1082,7 +1178,7 @@ export function Messenger() {
         </form>
         </>
       }
-      computer={
+        computer={
         computerOpen && activeId ? (
           <>
             <header className="flex h-[var(--header-height)] items-center justify-between gap-2 px-4">
@@ -1120,6 +1216,21 @@ export function Messenger() {
           </>
         ) : null
       }
-    />
+      />
+      {active && !activeGroup ? (
+        <BotSettings
+          key={active.id}
+          bot={active}
+          harnesses={harnesses}
+          open={botSettingsOpen}
+          onOpenChange={setBotSettingsOpenFromDialog}
+          openerRef={botSettingsOpenerRef}
+          onBotChange={applyBotUpdate}
+          onOpenComputer={openComputer}
+          section={botSettingsSection}
+          onSectionChange={chooseBotSettingsSection}
+        />
+      ) : null}
+    </>
   );
 }
