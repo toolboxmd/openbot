@@ -129,6 +129,13 @@
   --composer-max-width: 45rem;
   --dialog-max-width: 46rem;
   --phone-edge: 0.75rem;
+  --message-max-width: 42rem;
+  --message-max-width-compact: 85%;
+  --message-burst-gap: 0.25rem;
+  --message-inter-burst-gap: 0.75rem;
+  --message-tail-width: 0.5rem;
+  --message-tail-height: 0.625rem;
+  --message-code-surface: color-mix(in srgb, currentColor 10%, transparent);
   --motion-fast: 120ms;
   --motion-normal: 180ms;
   --motion-entrance: 240ms;
@@ -184,6 +191,27 @@
   ::selection {
     background: color-mix(in srgb, var(--info) 24%, transparent);
   }
+}
+
+.openbot-chat-bubble[data-tail="incoming"]::after,
+.openbot-chat-bubble[data-tail="outgoing"]::after {
+  position: absolute;
+  bottom: 0;
+  width: var(--message-tail-width);
+  height: var(--message-tail-height);
+  background: inherit;
+  content: "";
+  pointer-events: none;
+}
+
+.openbot-chat-bubble[data-tail="incoming"]::after {
+  left: calc(var(--message-tail-width) * -0.55);
+  clip-path: polygon(100% 0, 100% 100%, 0 100%);
+}
+
+.openbot-chat-bubble[data-tail="outgoing"]::after {
+  right: calc(var(--message-tail-width) * -0.55);
+  clip-path: polygon(0 0, 100% 100%, 0 100%);
 }
 
 @keyframes openbot-overlay-in {

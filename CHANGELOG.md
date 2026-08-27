@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.0] - 2026-08-27
+
+### Added
+
+- Add message bursts, tails, dates, times, receipts, and safe chat formatting
+
 ## [0.6.0] - 2026-08-27
 
 ### Added

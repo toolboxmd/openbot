@@ -98,6 +98,13 @@ import {
   type Bot,
   type Harness,
 } from "@/lib/session";
+import {
+  buildChatChronology,
+  orderThreadedChatMessages,
+  parseChatText,
+  type ChatChronologyItem,
+  type ChatInline,
+} from "@/lib/chat-chronology";
 
 
 type ChatMessage = NonNullable<Bot["messages"]>[number];
@@ -115,80 +122,52 @@ function botSettingsLocationCandidate(hash: string): boolean {
   return hash.startsWith("#bots/");
 }
 
-function autolink(text: string) {
-  return text.split(/(https?:\/\/[^\s<]+)/g).map((part, index) => {
-    if (!/^https?:\/\//.test(part)) return <span key={index}>{part}</span>;
-    const href = part.replace(/[.,;:!?)]+$/, "");
-    const trailing = part.slice(href.length);
+function renderChatInline(inline: ChatInline, index: number) {
+  if (inline.kind === "link") {
     return (
-      <span key={index}>
-        <a href={href} target="_blank" rel="noreferrer noopener" className="underline underline-offset-2">
-          {href}
-        </a>
-        {trailing}
-      </span>
+      <a
+        key={index}
+        href={inline.href}
+        target="_blank"
+        rel="noreferrer noopener"
+        className="font-medium underline underline-offset-2"
+      >
+        {inline.text}
+      </a>
     );
-  });
-}
-
-function dayLabel(iso: string | undefined, now = new Date()): string | null {
-  if (!iso) return null;
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return null;
-  const startOfDay = (value: Date) => new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
-  const diff = Math.round((startOfDay(now) - startOfDay(date)) / 86_400_000);
-  if (diff === 0) return "Today";
-  if (diff === 1) return "Yesterday";
-  return date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
-}
-
-function timeLabel(iso: string | undefined): string | null {
-  if (!iso) return null;
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return null;
-  return date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-}
-
-function sameMinute(a: string | undefined, b: string | undefined): boolean {
-  if (!a || !b) return false;
-  const left = new Date(a);
-  const right = new Date(b);
-  if (Number.isNaN(left.getTime()) || Number.isNaN(right.getTime())) return false;
-  return (
-    left.getFullYear() === right.getFullYear() &&
-    left.getMonth() === right.getMonth() &&
-    left.getDate() === right.getDate() &&
-    left.getHours() === right.getHours() &&
-    left.getMinutes() === right.getMinutes()
-  );
-}
-
-function receiptLabel(receipt: ChatMessage["receipt"]): string | null {
-  if (receipt === "sent") return "Sent";
-  if (receipt === "delivered") return "Delivered";
-  if (receipt === "read") return "Read";
-  return null;
-}
-
-/** iMessage-style: latest user bubble always shows its receipt; at most one Read. */
-export function showReceipt(
-  messages: Array<{ role: string; receipt?: ChatMessage["receipt"] }>,
-  index: number,
-): boolean {
-  const msg = messages[index];
-  if (!msg || msg.role !== "user") return false;
-  let lastUser = -1;
-  let lastRead = -1;
-  for (let i = 0; i < messages.length; i++) {
-    const row = messages[i];
-    if (row.role !== "user") continue;
-    lastUser = i;
-    if (row.receipt === "read") lastRead = i;
   }
-  if (index === lastUser) return true;
-  if (msg.receipt !== "read") return false;
-  if (lastUser >= 0 && messages[lastUser]?.receipt === "read") return false;
-  return index === lastRead;
+  if (inline.kind === "strong") return <strong key={index}>{inline.text}</strong>;
+  if (inline.kind === "emphasis") return <em key={index}>{inline.text}</em>;
+  if (inline.kind === "code") {
+    return (
+      <code key={index} className="rounded bg-[var(--message-code-surface)] px-1 py-0.5 font-mono text-[0.9em]">
+        {inline.text}
+      </code>
+    );
+  }
+  return <span key={index}>{inline.text}</span>;
+}
+
+function ChatMessageText({ text }: { text: string }) {
+  const blocks = parseChatText(text);
+  return (
+    <div className="grid gap-2">
+      {blocks.map((block, index) => block.kind === "code-block" ? (
+        <pre
+          key={index}
+          data-testid="chat-code-block"
+          data-language={block.language}
+          className="max-h-64 max-w-full overflow-auto rounded-lg bg-[var(--message-code-surface)] p-2 font-mono text-xs leading-relaxed"
+        >
+          <code>{block.text}</code>
+        </pre>
+      ) : (
+        <span key={index} className="whitespace-pre-wrap">
+          {(block.inlines ?? []).map(renderChatInline)}
+        </span>
+      ))}
+    </div>
+  );
 }
 
 function isCancelledMessage(message: string): boolean {
@@ -1024,22 +1003,61 @@ export function Messenger() {
     }
   }
 
-  function renderBubble(message: ChatMessage, prev: ChatMessage | undefined, nested: boolean) {
+  function renderDaySeparator(
+    message: ChatMessage,
+    presentation: ChatChronologyItem | undefined,
+  ) {
+    if (!presentation?.dayLabel) return null;
+    return (
+      <li
+        role="separator"
+        className="self-center px-3 pb-1 pt-4 text-[11px] font-medium text-muted-foreground"
+      >
+        <time dateTime={message.createdAt}>{presentation.dayLabel}</time>
+      </li>
+    );
+  }
+
+  function renderBubble(
+    message: ChatMessage,
+    presentation: ChatChronologyItem | undefined,
+    nested: boolean,
+  ) {
+    const spacingClass = presentation?.spacing === "compact"
+      ? "mt-[var(--message-burst-gap)]"
+      : "mt-[var(--message-inter-burst-gap)]";
     if (message.kind === "host-grant") {
+      const card = (
+        <div
+          data-testid="host-grant-history"
+          tabIndex={0}
+          className="rounded-2xl bg-secondary px-4 py-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+        >
+          <p className="font-medium">Host grant</p>
+          <p className="mt-1 whitespace-pre-wrap break-all text-muted-foreground">{message.text}</p>
+        </div>
+      );
       return (
-        <li key={message.id} className="self-center w-full max-w-2xl">
-          <div data-testid="host-grant-history" className="rounded-2xl bg-secondary px-4 py-3 text-sm">
-            <p className="font-medium">Host grant</p>
-            <p className="mt-1 whitespace-pre-wrap break-all text-muted-foreground">{message.text}</p>
-          </div>
+        <li
+          key={message.id}
+          data-message-id={message.id}
+          data-burst="card"
+          data-tail="none"
+          className={cn("w-full max-w-[var(--message-max-width)] self-center", spacingClass)}
+        >
+          {presentation?.exactTime ? (
+            <Tooltip>
+              <TooltipTrigger asChild>{card}</TooltipTrigger>
+              <TooltipContent>
+                <time dateTime={message.createdAt}>{presentation.exactTime}</time>
+              </TooltipContent>
+            </Tooltip>
+          ) : card}
         </li>
       );
     }
     const user = message.role === "user";
-    const index = visible.findIndex((row) => row.id === message.id);
-    const grouped = Boolean(prev && prev.role === message.role && sameMinute(prev.createdAt, message.createdAt));
-    const time = grouped || nested ? null : timeLabel(message.createdAt);
-    const receipt = user && showReceipt(visible, index) ? receiptLabel(message.receipt) : null;
+    const receipt = presentation?.receipt ?? null;
     const kids = childrenOf(visible, message.id);
     const open = reactingId === message.id;
     const mine = (message.reactions ?? []).map((item) => item.emoji);
@@ -1068,74 +1086,91 @@ export function Messenger() {
         ))}
       </div>
     ) : null;
-    return (
-      <li
-        key={message.id}
-        data-reply-to={message.replyTo}
+    const bubble = (
+      <div
+        data-testid="message-bubble"
+        data-message-id={message.id}
+        data-tail={presentation?.tail ?? "none"}
+        tabIndex={0}
         className={cn(
-          "group flex flex-col gap-1",
-          nested ? "max-w-full" : "max-w-[85%]",
-          user ? "self-end items-end" : "self-start items-start",
+          "openbot-chat-bubble relative rounded-[var(--radius-bubble)] px-4 py-2.5 text-sm break-words focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+          user
+            ? "bg-bubble-outgoing text-bubble-outgoing-foreground"
+            : "bg-bubble-incoming text-bubble-incoming-foreground",
+          nested && "text-[13px]",
         )}
       >
-        {time ? (
-          <time className="px-1 text-[11px] text-muted-foreground" dateTime={message.createdAt}>
-            {time}
-          </time>
-        ) : null}
-        <div className={cn("flex items-end gap-1", user ? "flex-row-reverse" : "flex-row")}>
-          <div className={cn("relative", message.reactions && message.reactions.length > 0 && "mb-2 pb-1")}>
-            <div
-              className={cn(
-                "rounded-2xl px-4 py-2 text-sm whitespace-pre-wrap break-words",
-                user
-                  ? "bg-bubble-outgoing text-bubble-outgoing-foreground"
-                  : "bg-bubble-incoming text-bubble-incoming-foreground",
-                nested && "text-[13px]",
-              )}
-            >
-              {autolink(message.text)}
+        <ChatMessageText text={message.text} />
+      </div>
+    );
+    return (
+      <>
+        <li
+          key={message.id}
+          data-testid={nested ? "reply-thread" : undefined}
+          data-message-id={message.id}
+          data-burst={presentation?.burst ?? "none"}
+          data-tail={presentation?.tail ?? "none"}
+          data-reply-to={message.replyTo}
+          className={cn(
+            "group flex flex-col gap-1",
+            spacingClass,
+            nested
+              ? cn(
+                  "max-w-[calc(var(--message-max-width-compact)-1rem)] border-border min-[48rem]:max-w-[calc(var(--message-max-width)-1rem)]",
+                  user ? "mr-4 border-r pr-3" : "ml-4 border-l pl-3",
+                )
+              : "max-w-[var(--message-max-width-compact)] min-[48rem]:max-w-[var(--message-max-width)]",
+            user ? "self-end items-end" : "self-start items-start",
+          )}
+        >
+          <div className={cn("flex items-end gap-1", user ? "flex-row-reverse" : "flex-row")}>
+            <div className={cn("relative", message.reactions && message.reactions.length > 0 && "mb-2 pb-1")}>
+              {presentation?.exactTime ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>{bubble}</TooltipTrigger>
+                  <TooltipContent>
+                    <time dateTime={message.createdAt}>{presentation.exactTime}</time>
+                  </TooltipContent>
+                </Tooltip>
+              ) : bubble}
+              {message.reactions && message.reactions.length > 0 ? (
+                <div
+                  data-testid="reaction-badge"
+                  className={cn(
+                    "absolute -bottom-2 flex gap-0.5 rounded-full border border-border bg-background px-1.5 py-0.5 text-[13px] leading-none shadow-sm",
+                    user ? "left-1" : "right-1",
+                  )}
+                >
+                  {message.reactions.map((item) => (
+                    <span key={`${item.emoji}:${item.by}`}>{item.emoji}</span>
+                  ))}
+                </div>
+              ) : null}
             </div>
-            {message.reactions && message.reactions.length > 0 ? (
-              <div
-                data-testid="reaction-badge"
-                className={cn(
-                  "absolute -bottom-2 flex gap-0.5 rounded-full border border-border bg-background px-1.5 py-0.5 text-[13px] leading-none shadow-sm",
-                  user ? "left-1" : "right-1",
-                )}
-              >
-                {message.reactions.map((item) => (
-                  <span key={`${item.emoji}:${item.by}`}>{item.emoji}</span>
-                ))}
-              </div>
-            ) : null}
+            <HoverActions
+              user={user}
+              open={open}
+              onReply={() => {
+                setReplyTo(message);
+                setReactingId(null);
+              }}
+              onReact={() => setReactingId(open ? null : message.id)}
+              picker={picker}
+            />
           </div>
-          <HoverActions
-            user={user}
-            open={open}
-            onReply={() => {
-              setReplyTo(message);
-              setReactingId(null);
-            }}
-            onReact={() => setReactingId(open ? null : message.id)}
-            picker={picker}
-          />
-        </div>
-        {receipt ? <span className="px-1 text-[11px] text-muted-foreground">{receipt}</span> : null}
-        {kids.length > 0 ? (
-          <ul
-            data-testid="reply-thread"
-            className={cn(
-              "mt-2 flex w-[calc(100%+0.5rem)] flex-col gap-2 border-border",
-              user ? "mr-1 items-end border-r pr-3" : "ml-1 items-start border-l pl-3",
-            )}
-          >
-            {kids.map((child, i) => (
-              <Fragment key={child.id}>{renderBubble(child, i > 0 ? kids[i - 1] : message, true)}</Fragment>
-            ))}
-          </ul>
-        ) : null}
-      </li>
+          {receipt ? <span className="px-1 text-[11px] text-muted-foreground">{receipt}</span> : null}
+        </li>
+        {kids.map((child) => {
+          const childPresentation = chronologyById.get(child.id);
+          return (
+            <Fragment key={child.id}>
+              {renderDaySeparator(child, childPresentation)}
+              {renderBubble(child, childPresentation, true)}
+            </Fragment>
+          );
+        })}
+      </>
     );
   }
 
@@ -1147,6 +1182,15 @@ export function Messenger() {
       })
     : null;
   const visible = messages.filter((message) => message.text.length > 0);
+  const rootMessages = rootsOf(visible);
+  const chronologyNow = new Date();
+  const chronology = buildChatChronology(
+    orderThreadedChatMessages(visible),
+    chronologyNow,
+    undefined,
+    { receiptOrder: visible },
+  );
+  const chronologyById = new Map(chronology.map((item) => [item.id, item]));
   const writing = isWorkingMode(active?.eyes.mode);
   const inboxRows = buildChatInbox({ bots, channels, drafts });
   const filteredInboxRows = filterChatInbox(inboxRows, inboxQuery);
@@ -1665,26 +1709,21 @@ export function Messenger() {
         ) : active && chatDetailState === "error" ? (
           <ChatDetailError bot={active} onRetry={retryActiveChat} />
         ) : active && chatDetailState === "populated" ? (
-          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-6 py-4">
-            <ul className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-3">
-              {rootsOf(visible).map((message, index, roots) => {
-                const day = dayLabel(message.createdAt);
-                const prevDay = index > 0 ? dayLabel(roots[index - 1]?.createdAt) : null;
-                const showDay = Boolean(day && day !== prevDay);
-                const prev = index > 0 ? roots[index - 1] : undefined;
+          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-[var(--phone-edge)] py-4 min-[48rem]:px-6">
+            <ul className="mx-auto flex w-full max-w-[var(--transcript-max-width)] flex-1 flex-col">
+              {rootMessages.map((message) => {
+                const presentation = chronologyById.get(message.id);
                 return (
                   <Fragment key={message.id}>
-                    {showDay ? (
-                      <li className="self-center py-2 text-[11px] font-medium text-muted-foreground">{day}</li>
-                    ) : null}
-                    {renderBubble(message, prev, false)}
+                    {renderDaySeparator(message, presentation)}
+                    {renderBubble(message, presentation, false)}
                   </Fragment>
                 );
               })}
               {writing ? (
                 <li
                   data-testid="working-indicator"
-                  className="flex max-w-[85%] flex-col items-start gap-1.5 self-start"
+                  className="mt-[var(--message-inter-burst-gap)] flex max-w-[85%] flex-col items-start gap-1.5 self-start"
                 >
                   <TypingDots />
                   <Tooltip>
