@@ -682,6 +682,24 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         return;
       }
 
+      const retryCardMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/cards\/([^/]+)\/retry$/);
+      if (retryCardMatch && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        try {
+          const bot = await store.retryCard(
+            decodeURIComponent(retryCardMatch[1]),
+            decodeURIComponent(retryCardMatch[2]),
+          );
+          sendJson(res, 200, bot);
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
       const botReadMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/read$/);
       if (botReadMatch && method === "POST") {
         if (!hasSession(req, key)) {

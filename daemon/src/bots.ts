@@ -28,7 +28,7 @@ import {
   botWorkspaceDir,
   ensureBotWorkspace,
   ensureHarnessHome,
-  extractPermissionPaths,
+  extractPermissionPath,
   isConfigMode,
   isHostGrantAccess,
   isHostGrantDuration,
@@ -51,9 +51,12 @@ import {
   expiredTranscriptCard,
   hostGrantTranscriptCard,
   permissionTranscriptCard,
+  retriedBotFailureTranscriptCard,
   resolvedHostGrantCard,
   resolvedPermissionCard,
+  retryingBotFailureTranscriptCard,
   transcriptCardSummary,
+  unsupportedPermissionTranscriptCard,
 } from "./transcript-card.ts";
 import {
   isAuthError,
@@ -182,15 +185,6 @@ function publicPermission(p: BotPermission | null): PublicPermission | null {
   if (p.cardId) out.cardId = p.cardId;
   if (p.hostGrant) out.hostGrant = p.hostGrant;
   return out;
-}
-
-function isExecutePlumbingPath(target: string, toolKind: string | undefined): boolean {
-  if ((toolKind ?? "").toLowerCase() !== "execute") return false;
-  return target === "/dev/null"
-    || target.startsWith("/bin/")
-    || target.startsWith("/sbin/")
-    || target.startsWith("/usr/bin/")
-    || target.startsWith("/usr/sbin/");
 }
 
 export class BotStore {
@@ -572,6 +566,34 @@ export class BotStore {
     return this.toPublic(bot, true);
   }
 
+  async retryCard(id: string, cardId: string): Promise<PublicBot> {
+    const bot = this.require(id);
+    if (!cardId) throw Object.assign(new Error("cardId is required"), { status: 400 });
+    if (bot.write) throw Object.assign(new Error("wait for the current message to finish"), { status: 409 });
+    const message = this.home.getMessage(this.channelId(bot.id), cardId);
+    if (!message?.card || message.card.kind !== "bot-failure") {
+      throw Object.assign(new Error("failure Card not found"), { status: 404 });
+    }
+    const action = message.card.actions.find((candidate) => candidate.command.kind === "retry-message");
+    if (!action || action.command.kind !== "retry-message") {
+      throw Object.assign(new Error("failure Card is no longer actionable"), { status: 409 });
+    }
+    const source = this.home.getMessage(this.channelId(bot.id), action.command.messageId);
+    if (!source || source.role !== "user" || (source.kind && source.kind !== "text")) {
+      throw Object.assign(new Error("original message is no longer available"), { status: 409 });
+    }
+    const originalCard = message.card;
+    this.home.updateMessageCard(message.id, retryingBotFailureTranscriptCard(originalCard));
+    try {
+      await this.send(bot.id, source.text, source.replyTo);
+      this.home.updateMessageCard(message.id, retriedBotFailureTranscriptCard(originalCard));
+      return this.toPublic(bot, true);
+    } catch (err) {
+      this.home.updateMessageCard(message.id, originalCard);
+      throw err;
+    }
+  }
+
   answerPermission(id: string, optionId: string, cardId: string): PublicBot {
     const bot = this.require(id);
     if (!bot.permission || !bot.client) {
@@ -950,16 +972,11 @@ export class BotStore {
   private handlePermission(bot: Bot, client: AcpSession, prompt: PermissionPrompt): void {
     if (!this.supersedeActivePermission(bot, client)) return;
     const cwd = this.botCwd(bot.id);
-    const requestPaths = extractPermissionPaths(prompt, cwd);
+    const requestPath = extractPermissionPath(prompt, cwd);
     const requested = requestedAccessFromKind(prompt.toolKind);
-    const pathIsInJail = (target: string) =>
-      isInsideWorkspace(target, this.workspaceDir)
-      || (bot.configMode === "isolated" && isInsideScreenWorkspace(target));
-    const requestPath = requestPaths.find((target) =>
-      !pathIsInJail(target) && !isExecutePlumbingPath(target, prompt.toolKind))
-      ?? requestPaths.find(pathIsInJail)
-      ?? null;
-    const inJail = requestPath ? pathIsInJail(requestPath) : false;
+    const inJail =
+      (requestPath && isInsideWorkspace(requestPath, this.workspaceDir))
+      || (requestPath && bot.configMode === "isolated" && isInsideScreenWorkspace(requestPath));
     if (inJail) {
       const allow = pickAllowOption(prompt.options);
       if (allow) {
@@ -1004,6 +1021,29 @@ export class BotStore {
       return;
     }
     const card = permissionTranscriptCard(prompt.toolKind, prompt.options);
+    if (card.actions.length === 0) {
+      const reject = pickRejectOption(prompt.options);
+      try {
+        if (reject) client.respondPermission(prompt.rpcId, reject);
+        else client.cancel();
+      } catch {
+        client.close();
+        bot.client = null;
+      }
+      const unsupported = unsupportedPermissionTranscriptCard();
+      this.home.appendMessage(this.channelId(bot.id), {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        kind: "card",
+        card: unsupported,
+        text: transcriptCardSummary(unsupported),
+        createdAt: nowIso(),
+        senderId: bot.id,
+      });
+      bot.permission = null;
+      bot.eyesMode = bot.write ? "write" : "idle";
+      return;
+    }
     const cardId = crypto.randomUUID();
     this.home.appendMessage(this.channelId(bot.id), {
       id: cardId,

@@ -171,17 +171,6 @@ export function requestedAccessFromKind(kind: string | undefined): HostGrantAcce
 }
 
 export function extractPermissionPath(
-  input: Parameters<typeof extractPermissionPaths>[0],
-  cwd: string,
-): string | null {
-  const found = extractPermissionPaths(input, cwd);
-  const preferred = found.find(
-    (candidate) => !SYSTEM_PATH_PREFIXES.some((prefix) => candidate === prefix.slice(0, -1) || candidate.startsWith(prefix)),
-  );
-  return preferred ?? found[0] ?? null;
-}
-
-export function extractPermissionPaths(
   input: {
     title?: string;
     description?: string;
@@ -190,28 +179,30 @@ export function extractPermissionPaths(
     meta?: unknown;
   },
   cwd: string,
-): string[] {
-  const locations = (input.locations ?? []).flatMap((loc) =>
-    typeof loc.path === "string" && loc.path.trim()
-      ? [resolveMaybeRelative(loc.path.trim(), cwd)]
-      : []);
-  if (locations.length > 0) return uniquePaths(locations);
+): string | null {
+  for (const loc of input.locations ?? []) {
+    if (typeof loc.path === "string" && loc.path.trim()) {
+      return resolveMaybeRelative(loc.path.trim(), cwd);
+    }
+  }
   const raw = input.rawInput;
   if (raw && typeof raw === "object") {
     for (const key of ["filepath", "filePath", "path", "target", "destination", "dir", "parentDir"]) {
       const value = raw[key];
       if (typeof value === "string" && value.trim()) {
-        return [resolveMaybeRelative(value.trim(), cwd)];
+        return resolveMaybeRelative(value.trim(), cwd);
       }
     }
     const command = raw.command;
     if (typeof command === "string") {
-      const fromCommand = absolutePaths(command);
-      if (fromCommand.length > 0) return fromCommand;
+      const fromCommand = firstAbsolutePath(command);
+      if (fromCommand) return fromCommand;
     }
   }
   const blob = `${input.title ?? ""}\n${input.description ?? ""}\n${safeJson(input.meta)}`;
-  return absolutePaths(blob);
+  const fromText = firstAbsolutePath(blob);
+  if (fromText) return fromText;
+  return null;
 }
 
 function resolveMaybeRelative(value: string, cwd: string): string {
@@ -229,41 +220,15 @@ function safeJson(value: unknown): string {
 
 const SYSTEM_PATH_PREFIXES = ["/bin/", "/usr/", "/sbin/", "/lib/", "/lib64/", "/dev/", "/proc/", "/etc/"];
 
-function absolutePaths(text: string): string[] {
+function firstAbsolutePath(text: string): string | null {
   const found: string[] = [];
   const pattern = /(?:^|[\s"'`=<>])(\/(?:[^\s"'`;|&<>]+))/g;
   let match: RegExpExecArray | null;
-  while ((match = pattern.exec(text))) {
-    const delimiter = match[0].slice(0, match[0].length - match[1].length);
-    found.push(trimShellGroupSuffix(match[1], delimiter));
-  }
-  return uniquePaths(found);
-}
-
-function uniquePaths(found: string[]): string[] {
-  return [...new Set(found)];
-}
-
-function trimShellGroupSuffix(candidate: string, delimiter: string): string {
-  if (delimiter === "\"" || delimiter === "'" || delimiter === "`") return candidate;
-  const unmatchedClosers = new Set<number>();
-  let depth = 0;
-  for (let index = 0; index < candidate.length; index += 1) {
-    const char = candidate[index];
-    if (char === "\\") {
-      index += 1;
-      continue;
-    }
-    if (char === "(") {
-      depth += 1;
-    } else if (char === ")") {
-      if (depth > 0) depth -= 1;
-      else unmatchedClosers.add(index);
-    }
-  }
-  let end = candidate.length;
-  while (end > 0 && candidate[end - 1] === ")" && unmatchedClosers.has(end - 1)) end -= 1;
-  return candidate.slice(0, end);
+  while ((match = pattern.exec(text))) found.push(match[1]);
+  const preferred = found.find(
+    (candidate) => !SYSTEM_PATH_PREFIXES.some((prefix) => candidate === prefix.slice(0, -1) || candidate.startsWith(prefix)),
+  );
+  return preferred ?? found[0] ?? null;
 }
 
 export function pickAllowOption(

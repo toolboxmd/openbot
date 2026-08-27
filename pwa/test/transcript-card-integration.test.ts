@@ -19,9 +19,7 @@ describe("Transcript Card integration", () => {
     assert.match(source, /action\.command\.kind === "host-grant"/);
     assert.match(source, /answerHostGrant\(botId, messageId, access, duration/);
     assert.match(source, /action\.command\.kind === "retry-message"/);
-    assert.match(source, /source\.role !== "user"/);
-    assert.match(source, /retryMessageInput\(source\)/);
-    assert.match(source, /sendMessage\(botId, retry\.text, retry\.replyTo\)/);
+    assert.match(source, /retryTranscriptCard\(botId, messageId\)/);
   });
 
   test("retries the original reply relationship instead of creating a root message", () => {
@@ -32,12 +30,17 @@ describe("Transcript Card integration", () => {
     assert.deepEqual(retryMessageInput({ text: "Try again" }), { text: "Try again" });
   });
 
-  test("restores focus to a resolved Card and keeps UI failures transient", () => {
+  test("keeps progress local and restores focus from authoritative Card state", () => {
     const start = source.indexOf("async function onCardAction");
     const end = source.indexOf("async function onReact", start);
     const handler = source.slice(start, end);
+    assert.match(handler, /setCardPending\(messageId, true\)/);
+    assert.match(handler, /setCardPending\(messageId, false\)/);
+    assert.doesNotMatch(handler, /setBusy\(/);
+    assert.match(source, /busy=\{pendingCardIds\.has\(message\.id\)\}/);
     assert.match(handler, /requestAnimationFrame/);
     assert.match(handler, /messageBubbleRefs\.current\.get\(messageId\)\?\.focus\(\)/);
+    assert.match(handler, /getBot\(botId\)/);
     assert.match(source, /<ToastProvider/);
     assert.match(source, /<ToastTitle>Action not completed<\/ToastTitle>/);
     assert.match(source, /<ToastViewport/);

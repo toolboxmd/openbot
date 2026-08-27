@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { AcpClient, isCancelled, type PermissionPrompt } from "../src/acp.ts";
+import { AcpClient, isCancelled } from "../src/acp.ts";
 
 const FAKE_ACP = String.raw`
 const readline = require("node:readline");
@@ -8,7 +8,6 @@ const input = readline.createInterface({ input: process.stdin });
 let firstPromptId = null;
 const cancelledPermissions = new Set();
 let cancellationTailDone = false;
-let correlatedPromptId = null;
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const finishCancelledPrompt = () => {
   if (!cancellationTailDone) return;
@@ -57,40 +56,6 @@ const permission = (id, title) => send({
   method: "session/request_permission",
   params: { sessionId: "s1", title, options: [] },
 });
-const correlatedPermission = () => {
-  send({
-    jsonrpc: "2.0",
-    method: "session/update",
-    params: {
-      sessionId: "s1",
-      update: {
-        sessionUpdate: "tool_call",
-        toolCallId: "file-change-1",
-        title: "Editing files",
-        kind: "edit",
-        content: [{
-          type: "diff",
-          path: "/tmp/openbot-correlated-permission.txt",
-          oldText: null,
-          newText: "proof",
-        }],
-      },
-    },
-  });
-  send({
-    jsonrpc: "2.0",
-    id: 702,
-    method: "session/request_permission",
-    params: {
-      sessionId: "s1",
-      toolCall: { toolCallId: "file-change-1", kind: "edit", status: "pending" },
-      options: [
-        { optionId: "allow_once", name: "Allow Once", kind: "allow_once" },
-        { optionId: "reject_once", name: "Reject", kind: "reject_once" },
-      ],
-    },
-  });
-};
 const idle = () => send({
   jsonrpc: "2.0",
   method: "session/update",
@@ -145,10 +110,6 @@ input.on("line", (line) => {
       update("Anonymous complete.");
       send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
     }
-    if (text === "correlated-permission") {
-      correlatedPromptId = message.id;
-      correlatedPermission();
-    }
     return;
   }
   if (message.method === "session/cancel") {
@@ -167,9 +128,6 @@ input.on("line", (line) => {
     }
     finishCancelledPrompt();
   }
-  if (message.id === 702) {
-    send({ jsonrpc: "2.0", id: correlatedPromptId, result: { stopReason: "end_turn" } });
-  }
 });
 `;
 
@@ -182,30 +140,6 @@ function defer() {
 }
 
 describe("AcpClient cancellation boundary", () => {
-  test("correlates a file-change permission with its preceding tool-call path", async () => {
-    const captured: PermissionPrompt[] = [];
-    const client = new AcpClient({
-      command: process.execPath,
-      args: ["-e", FAKE_ACP],
-      env: { ...process.env },
-    }, process.cwd());
-
-    try {
-      await client.initialize();
-      await client.newSession(process.cwd());
-      await client.prompt("correlated-permission", {
-        onPermission(prompt) {
-          captured.push(prompt);
-          client.respondPermission(prompt.rpcId, "allow_once");
-        },
-      });
-      assert.deepEqual(captured[0]?.locations, [{ path: "/tmp/openbot-correlated-permission.txt" }]);
-      assert.equal(captured[0]?.toolKind, "edit");
-    } finally {
-      client.close();
-    }
-  });
-
   test("drains cancelled updates before assigning replacement Turn handlers", async () => {
     const oldStarted = defer();
     const oldPermission = defer();

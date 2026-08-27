@@ -73,6 +73,7 @@ function permissionFake() {
   let settleAnswers = true;
   let responseError: Error | null = null;
   let closed = 0;
+  let cancelled = 0;
   const spawnAcp = (_spec: SpawnSpec, _cwd: string, next?: AcpHandlers): AcpSession => {
     handlers = next;
     return {
@@ -90,7 +91,9 @@ function permissionFake() {
           settlePrompt = resolve;
         });
       },
-      cancel() {},
+      cancel() {
+        cancelled += 1;
+      },
       respondPermission(_rpcId, optionId) {
         answered.push(optionId);
         if (responseError) throw responseError;
@@ -103,6 +106,9 @@ function permissionFake() {
     answered,
     get closed() {
       return closed;
+    },
+    get cancelled() {
+      return cancelled;
     },
     failResponses(error = new Error("permission transport closed")) {
       responseError = error;
@@ -318,6 +324,56 @@ describe("Talk HTTP Transcript Cards", () => {
       assert.deepEqual(persisted?.card?.actions, []);
     } finally {
       await restarted.box.close();
+    }
+  });
+
+  test("fails closed instead of persisting an unresolvable permission Card", async () => {
+    const homeDir = await tempHome();
+    const pwaDir = await mkdtemp(join(tmpdir(), "openbot-unsupported-permission-pwa-"));
+    await writeFile(join(pwaDir, "index.html"), "<!doctype html><title>OpenBot</title>");
+    const running = await startCardBox(homeDir, pwaDir);
+    try {
+      const cookie = await login(running.box);
+      const created = await fetch(`${running.box.url}/api/bots`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ name: "Ada" }),
+      });
+      const botId = ((await created.json()) as { id: string }).id;
+      await fetch(`${running.box.url}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ harness: "codex" }),
+      });
+      await fetch(`${running.box.url}/api/bots/${botId}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "Continue safely." }),
+      });
+
+      running.fake.fire({
+        rpcId: 79,
+        title: "Raw provider prompt SECRET-79",
+        description: "stack SECRET-79",
+        toolKind: "provider-specific",
+        options: [{ optionId: "provider-choice", name: "Raw provider choice" }],
+      });
+
+      const card = await waitForCard(running.box, cookie, botId);
+      const botResponse = await fetch(`${running.box.url}/api/bots/${botId}`, { headers: { cookie } });
+      const bot = (await botResponse.json()) as { permission: unknown; messages: CardMessage[] };
+      assert.equal(bot.permission, null);
+      assert.equal(running.fake.cancelled, 1);
+      assert.deepEqual(card.card, {
+        kind: "permission",
+        title: "Permission not available",
+        body: "This Bot requested a choice OpenBot cannot safely show. The request was not approved.",
+        status: { tone: "neutral", label: "Not approved" },
+        actions: [],
+      });
+      assert.doesNotMatch(JSON.stringify(bot), /SECRET-79|Raw provider|stack|provider-choice/);
+    } finally {
+      await running.box.close();
     }
   });
 
@@ -729,6 +785,86 @@ describe("Talk HTTP Transcript Cards", () => {
         ],
       });
       assert.doesNotMatch(JSON.stringify(bot), new RegExp(`${secret}|ACP child|stack|credential`, "i"));
+    } finally {
+      await box.close();
+    }
+  });
+
+  test("retries through the Card contract and durably removes the stale retry action", async () => {
+    const homeDir = await tempHome();
+    const pwaDir = await mkdtemp(join(tmpdir(), "openbot-retry-card-pwa-"));
+    await writeFile(join(pwaDir, "index.html"), "<!doctype html><title>OpenBot</title>");
+    const box = await startBox({
+      password: "correct-horse",
+      pwaDir,
+      host: "127.0.0.1",
+      port: 0,
+      homeDir,
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: failureFake("RETRY-SECRET").spawnAcp,
+    });
+    try {
+      const cookie = await login(box);
+      const created = await fetch(`${box.url}/api/bots`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ name: "Ada" }),
+      });
+      const botId = ((await created.json()) as { id: string }).id;
+      await fetch(`${box.url}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ harness: "codex" }),
+      });
+      await fetch(`${box.url}/api/bots/${botId}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "Retry this exact request." }),
+      });
+      const failure = await waitForCard(box, cookie, botId);
+
+      const retried = await fetch(
+        `${box.url}/api/bots/${botId}/cards/${failure.id}/retry`,
+        { method: "POST", headers: { cookie } },
+      );
+      assert.equal(retried.status, 200, await retried.text());
+      const bot = (await retried.json()) as { messages: CardMessage[] };
+      const resolved = bot.messages.find((message) => message.id === failure.id);
+      assert.deepEqual(resolved?.card?.status, { tone: "success", label: "Retried" });
+      assert.deepEqual(resolved?.card?.actions, []);
+      assert.equal(
+        bot.messages.filter((message) => message.role === "user" && message.text === "Retry this exact request.").length,
+        2,
+      );
+
+      const stale = await fetch(
+        `${box.url}/api/bots/${botId}/cards/${failure.id}/retry`,
+        { method: "POST", headers: { cookie } },
+      );
+      assert.equal(stale.status, 409);
+
+      await box.close();
+      const restarted = await startBox({
+        password: "correct-horse",
+        pwaDir,
+        host: "127.0.0.1",
+        port: 0,
+        homeDir,
+        listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+        spawnAcp: failureFake("RESTART-SECRET").spawnAcp,
+      });
+      try {
+        const restartedCookie = await login(restarted);
+        const response = await fetch(`${restarted.url}/api/bots/${botId}`, {
+          headers: { cookie: restartedCookie },
+        });
+        const persisted = (await response.json()) as { messages: CardMessage[] };
+        const persistedCard = persisted.messages.find((message) => message.id === failure.id);
+        assert.deepEqual(persistedCard?.card?.status, { tone: "success", label: "Retried" });
+        assert.deepEqual(persistedCard?.card?.actions, []);
+      } finally {
+        await restarted.close();
+      }
     } finally {
       await box.close();
     }

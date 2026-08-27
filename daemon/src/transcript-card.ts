@@ -114,6 +114,16 @@ export function permissionTranscriptCard(toolKind: string | undefined, options: 
   };
 }
 
+export function unsupportedPermissionTranscriptCard(): TranscriptCard {
+  return {
+    kind: "permission",
+    title: "Permission not available",
+    body: "This Bot requested a choice OpenBot cannot safely show. The request was not approved.",
+    status: { tone: "neutral", label: "Not approved" },
+    actions: [],
+  };
+}
+
 export function hostGrantTranscriptCard(
   path: string,
   requested: "read" | "read-write",
@@ -225,6 +235,28 @@ export function botFailureTranscriptCard(messageId: string, needsSignIn = false)
         command: { kind: "retry-message", messageId },
       },
     ],
+  };
+}
+
+export function retryingBotFailureTranscriptCard(card: TranscriptCard): TranscriptCard {
+  if (card.kind !== "bot-failure") {
+    throw Object.assign(new Error("failure Card not found"), { status: 409 });
+  }
+  return {
+    ...card,
+    status: { tone: "waiting", label: "Retrying" },
+    actions: [],
+  };
+}
+
+export function retriedBotFailureTranscriptCard(card: TranscriptCard): TranscriptCard {
+  if (card.kind !== "bot-failure") {
+    throw Object.assign(new Error("failure Card not found"), { status: 409 });
+  }
+  return {
+    ...card,
+    status: { tone: "success", label: "Retried" },
+    actions: [],
   };
 }
 

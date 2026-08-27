@@ -9,13 +9,6 @@ type Pending = {
   reject: (err: Error) => void;
 };
 
-type ToolCallContext = {
-  kind?: string;
-  title?: string;
-  locations?: Array<{ path?: string }>;
-  rawInput?: Record<string, unknown>;
-};
-
 export type PermissionPrompt = {
   rpcId: RpcId;
   title: string;
@@ -78,34 +71,6 @@ function readMessageId(update: Record<string, unknown>): string | undefined {
   return typeof raw === "string" && raw.length > 0 ? raw : undefined;
 }
 
-function toolCallLocations(update: Record<string, unknown>): Array<{ path?: string }> | undefined {
-  const locations: Array<{ path?: string }> = [];
-  if (Array.isArray(update.locations)) {
-    for (const value of update.locations) {
-      if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
-      const candidate = value as { path?: unknown };
-      if (typeof candidate.path === "string") locations.push({ path: candidate.path });
-    }
-  }
-  if (Array.isArray(update.content)) {
-    for (const value of update.content) {
-      if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
-      const candidate = value as { type?: unknown; path?: unknown };
-      if (candidate.type === "diff" && typeof candidate.path === "string") {
-        locations.push({ path: candidate.path });
-      }
-    }
-  }
-  if (locations.length === 0) return undefined;
-  return [...new Map(locations.map((location) => [location.path, location])).values()];
-}
-
-function toolCallRawInput(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
-
 function cancelledError(): Error {
   return Object.assign(new Error("cancelled"), { code: "cancelled" });
 }
@@ -129,7 +94,6 @@ export class AcpClient {
   private promptDrain: Promise<void> | null = null;
   private abortPrompt: (() => void) | null = null;
   private pendingPermissions = new Map<RpcId, number>();
-  private toolCalls = new Map<string, ToolCallContext>();
   readonly spec: SpawnSpec;
 
   constructor(
@@ -236,7 +200,6 @@ export class AcpClient {
       const params = (msg.params ?? {}) as {
         title?: string;
         toolCall?: {
-          toolCallId?: string;
           title?: string;
           kind?: string;
           locations?: Array<{ path?: string }>;
@@ -246,8 +209,6 @@ export class AcpClient {
         options?: Array<{ optionId: string; name: string; kind?: string }>;
         _meta?: unknown;
       };
-      const toolCallId = params.toolCall?.toolCallId;
-      const priorToolCall = toolCallId ? this.toolCalls.get(toolCallId) : undefined;
       const handler = (this.activeHandlers ?? this.handlers).onPermission;
       this.pendingPermissions.set(rpcId, this.activeGen);
       if (!handler) {
@@ -256,15 +217,14 @@ export class AcpClient {
       }
       handler({
         rpcId,
-        title: params.title ?? params.toolCall?.title ?? priorToolCall?.title ?? "Allow this tool?",
-        description: params.description ?? params.toolCall?.title ?? priorToolCall?.title,
+        title: params.title ?? params.toolCall?.title ?? "Allow this tool?",
+        description: params.description ?? params.toolCall?.title,
         options: Array.isArray(params.options) ? params.options : [],
-        locations: params.toolCall?.locations ?? priorToolCall?.locations,
-        rawInput: toolCallRawInput(params.toolCall?.rawInput) ?? priorToolCall?.rawInput ?? null,
-        toolKind: params.toolCall?.kind ?? priorToolCall?.kind,
+        locations: params.toolCall?.locations,
+        rawInput: params.toolCall?.rawInput ?? null,
+        toolKind: params.toolCall?.kind,
         meta: params._meta,
       });
-      if (toolCallId) this.toolCalls.delete(toolCallId);
       return;
     }
     if (msg.method === "session/update") {
@@ -285,25 +245,6 @@ export class AcpClient {
     if (!update) return;
     if (this.activeGen !== this.generation) return;
     const kind = String(update.sessionUpdate ?? update.session_update ?? "");
-    if (kind === "tool_call" || kind === "tool_call_update") {
-      const toolCallId = typeof update.toolCallId === "string"
-        ? update.toolCallId
-        : typeof update.tool_call_id === "string"
-          ? update.tool_call_id
-          : null;
-      if (toolCallId) {
-        const previous = this.toolCalls.get(toolCallId) ?? {};
-        const locations = toolCallLocations(update);
-        const rawInput = toolCallRawInput(update.rawInput ?? update.raw_input);
-        this.toolCalls.set(toolCallId, {
-          ...previous,
-          ...(typeof update.kind === "string" ? { kind: update.kind } : {}),
-          ...(typeof update.title === "string" ? { title: update.title } : {}),
-          ...(locations ? { locations } : {}),
-          ...(rawInput ? { rawInput } : {}),
-        });
-      }
-    }
     if (kind === "agent_message_chunk") {
       const piece = extractText(update.content);
       if (!piece) return;
@@ -421,7 +362,6 @@ export class AcpClient {
     this.streaming = false;
     this.openMessageId = null;
     this.gotIdle = false;
-    this.toolCalls.clear();
     const id = this.nextId++;
     this.promptId = id;
     const rpc = new Promise((resolve, reject) => {
@@ -480,7 +420,6 @@ export class AcpClient {
     this.messageText = "";
     this.turnText = "";
     this.openMessageId = null;
-    this.toolCalls.clear();
     this.activeHandlers = null;
     const abort = this.abortPrompt;
     this.abortPrompt = null;
