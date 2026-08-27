@@ -9,9 +9,11 @@ import {
 } from "../src/lib/chat-chronology";
 
 function message(overrides: Partial<ChronologyMessage> = {}): ChronologyMessage {
+  const role = overrides.role ?? "assistant";
   return {
     id: "message",
-    role: "assistant",
+    role,
+    senderId: role === "user" ? "you" : "bot-ada",
     kind: "text",
     createdAt: "2026-08-27T10:00:00.000Z",
     ...overrides,
@@ -40,7 +42,7 @@ describe("Chat chronology", () => {
       "separate",
       "separate",
       "separate",
-      "compact",
+      "separate",
     ]);
     assert.deepEqual(chronology.map((item) => item.tail), [
       null,
@@ -48,7 +50,7 @@ describe("Chat chronology", () => {
       "outgoing",
       null,
       "outgoing",
-      null,
+      "outgoing",
       "outgoing",
     ]);
     assert.deepEqual(chronology.map((item) => item.burst), [
@@ -57,8 +59,8 @@ describe("Chat chronology", () => {
       "only",
       null,
       "only",
-      "start",
-      "end",
+      "only",
+      "only",
     ]);
   });
 
@@ -89,6 +91,31 @@ describe("Chat chronology", () => {
       "incoming",
       "incoming",
     ]);
+  });
+
+  test("same-role messages from different Channel senders close the visual burst", () => {
+    const messages = [
+      {
+        id: "ada",
+        role: "assistant" as const,
+        senderId: "bot-ada",
+        kind: "text",
+        createdAt: "2026-08-27T10:00:00.000Z",
+      },
+      {
+        id: "bob",
+        role: "assistant" as const,
+        senderId: "bot-bob",
+        kind: "text",
+        createdAt: "2026-08-27T10:01:00.000Z",
+      },
+    ];
+
+    const chronology = buildChatChronology(messages);
+
+    assert.deepEqual(chronology.map((item) => item.spacing), ["separate", "separate"]);
+    assert.deepEqual(chronology.map((item) => item.burst), ["only", "only"]);
+    assert.deepEqual(chronology.map((item) => item.tail), ["incoming", "incoming"]);
   });
 
   test("labels only the first visible item of each local calendar day", () => {

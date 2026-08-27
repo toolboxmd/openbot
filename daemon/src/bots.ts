@@ -133,8 +133,7 @@ type Bot = {
   eyesMode: EyesMode;
   needsYou: { reason: "login"; hint: string } | null;
   permission: BotPermission | null;
-  openAssistantId: string | null;
-  openAssistantCheckpoint: { id: string; text: string } | null;
+  pendingAssistant: { text: string; messageId?: string } | null;
   assistantMessageIds: Map<string, string>;
   activeUserId: string | null;
   turnSeq: number;
@@ -415,11 +414,9 @@ export class BotStore {
     const channelId = this.channelId(bot.id);
     const beforeInterrupt = this.home.listMessages(channelId);
     const replyTarget = this.resolveReplyTarget(beforeInterrupt, replyTo);
-    if (bot.write && bot.openAssistantId && replyTarget?.id === bot.openAssistantId) {
-      throw Object.assign(new Error("cannot reply to an unfinished response"), { status: 409 });
-    }
     const attached = await this.ensureClient(bot);
     const client = attached.client;
+    const turnSeq = ++bot.turnSeq;
 
     if (bot.write) {
       try {
@@ -427,26 +424,17 @@ export class BotStore {
       } catch {
         /* local cancel still proceeds */
       }
-      if (bot.openAssistantId) {
-        if (bot.openAssistantCheckpoint?.id === bot.openAssistantId) {
-          this.home.updateMessageText(bot.openAssistantId, bot.openAssistantCheckpoint.text);
-        } else {
-          this.home.deleteMessage(bot.openAssistantId);
-        }
-      }
-      bot.openAssistantId = null;
-      bot.openAssistantCheckpoint = null;
+      bot.pendingAssistant = null;
     }
     bot.assistantMessageIds.clear();
 
     const prior = this.home.listMessages(channelId);
     const history = attached.skipHistory ? "" : channelHistory(prior, bot.name);
 
-    bot.turnSeq += 1;
-    const turnSeq = bot.turnSeq;
     const userMessage: PublicMessage = {
       id: crypto.randomUUID(),
       role: "user",
+      senderId: HUMAN_MEMBER_ID,
       text: trimmed,
       createdAt: nowIso(),
       receipt: "sent",
@@ -454,12 +442,10 @@ export class BotStore {
     if (replyTarget) userMessage.replyTo = replyTarget.id;
     this.home.appendMessage(channelId, {
       ...userMessage,
-      senderId: HUMAN_MEMBER_ID,
       recipientBotId: bot.id,
     });
     bot.activeUserId = userMessage.id;
-    bot.openAssistantId = null;
-    bot.openAssistantCheckpoint = null;
+    bot.pendingAssistant = null;
     bot.write = true;
     bot.eyesMode = "write";
     bot.permission = null;
@@ -501,8 +487,7 @@ export class BotStore {
         }
       } finally {
         if (turnSeq !== bot.turnSeq) return;
-        bot.openAssistantId = null;
-        bot.openAssistantCheckpoint = null;
+        bot.pendingAssistant = null;
         bot.assistantMessageIds.clear();
         bot.activeUserId = null;
         bot.write = false;
@@ -582,8 +567,7 @@ export class BotStore {
       eyesMode: "idle",
       needsYou: null,
       permission: null,
-      openAssistantId: null,
-      openAssistantCheckpoint: null,
+      pendingAssistant: null,
       assistantMessageIds: new Map(),
       activeUserId: null,
       turnSeq: 0,
@@ -713,55 +697,41 @@ export class BotStore {
   }
 
   private pushAssistant(bot: Bot, channelId: string, text: string): void {
-    bot.openAssistantId = null;
-    bot.openAssistantCheckpoint = null;
+    bot.pendingAssistant = null;
     const message: PublicMessage = {
       id: crypto.randomUUID(),
       role: "assistant",
+      senderId: bot.id,
       text: capTalkBubble(text),
       createdAt: nowIso(),
     };
-    this.home.appendMessage(channelId, { ...message, senderId: bot.id });
+    this.home.appendMessage(channelId, message);
   }
 
   private applyAssistant(bot: Bot, channelId: string, text: string, delta?: AssistantDelta): void {
     const capped = capTalkBubble(text);
     const protocolMessageId = delta?.messageId;
+    if (!delta?.done) {
+      bot.pendingAssistant = {
+        text: capped,
+        ...(protocolMessageId ? { messageId: protocolMessageId } : {}),
+      };
+      return;
+    }
+    bot.pendingAssistant = null;
     const existingMessageId = protocolMessageId
       ? bot.assistantMessageIds.get(protocolMessageId)
       : undefined;
-    if (existingMessageId) {
-      if (!delta?.done && bot.openAssistantId !== existingMessageId) {
-        const completed = this.home.getMessage(channelId, existingMessageId);
-        bot.openAssistantCheckpoint = completed
-          ? { id: existingMessageId, text: completed.text }
-          : null;
-      }
-      this.home.updateMessageText(existingMessageId, capped);
-      bot.openAssistantId = delta?.done ? null : existingMessageId;
-      if (delta?.done) bot.openAssistantCheckpoint = null;
-      return;
-    }
-    const startNew = Boolean(delta?.start) || !bot.openAssistantId;
-    if (startNew) {
-      const id = crypto.randomUUID();
-      this.home.appendMessage(channelId, {
-        id,
-        role: "assistant",
-        text: capped,
-        createdAt: nowIso(),
-        senderId: bot.id,
-      });
-      bot.openAssistantId = id;
-      bot.openAssistantCheckpoint = null;
-      if (protocolMessageId) bot.assistantMessageIds.set(protocolMessageId, id);
-    } else if (bot.openAssistantId) {
-      this.home.updateMessageText(bot.openAssistantId, capped);
-    }
-    if (delta?.done) {
-      bot.openAssistantId = null;
-      bot.openAssistantCheckpoint = null;
-    }
+    if (existingMessageId) return;
+    const id = crypto.randomUUID();
+    this.home.appendMessage(channelId, {
+      id,
+      role: "assistant",
+      senderId: bot.id,
+      text: capped,
+      createdAt: nowIso(),
+    });
+    if (protocolMessageId) bot.assistantMessageIds.set(protocolMessageId, id);
   }
 
   private setUserReceipt(bot: Bot, channelId: string, next: MessageReceipt): void {
@@ -775,12 +745,7 @@ export class BotStore {
   }
 
   private fillAssistant(bot: Bot, channelId: string, text: string): void {
-    if (bot.openAssistantId) {
-      this.home.updateMessageText(bot.openAssistantId, text);
-      bot.openAssistantId = null;
-      bot.openAssistantCheckpoint = null;
-      return;
-    }
+    bot.pendingAssistant = null;
     this.pushAssistant(bot, channelId, text);
   }
 

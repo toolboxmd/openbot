@@ -85,6 +85,7 @@ export class AcpClient {
   private messageText = "";
   private streaming = false;
   private openMessageId: string | null = null;
+  private nonTextBoundary = false;
   private idleResolvers: Array<() => void> = [];
   private gotIdle = false;
   private generation = 0;
@@ -159,11 +160,13 @@ export class AcpClient {
     this.streaming = false;
     const text = this.messageText;
     if (text) {
+      this.turnText += text;
       (this.activeHandlers ?? this.handlers).onAssistant?.(text, {
         done: true,
         ...(this.openMessageId ? { messageId: this.openMessageId } : {}),
       });
     }
+    this.nonTextBoundary = false;
   }
 
   private onLine(line: string): void {
@@ -249,32 +252,39 @@ export class AcpClient {
       const piece = extractText(update.content);
       if (!piece) return;
       const messageId = readMessageId(update);
-      const start = messageId !== undefined ? shouldStartBubble(this.openMessageId, messageId) : !this.streaming;
+      const startsIdentifiedMessage = messageId !== undefined
+        && shouldStartBubble(this.openMessageId, messageId);
+      const startsAnonymousMessage = messageId === undefined
+        && this.streaming
+        && this.nonTextBoundary;
+      if (this.streaming && (startsIdentifiedMessage || startsAnonymousMessage)) {
+        this.finishStreamingMessage();
+      }
+      const start = !this.streaming;
       if (start) {
         this.messageText = "";
-        if (messageId === undefined) this.openMessageId = null;
+        this.openMessageId = messageId ?? null;
       }
       if (messageId !== undefined) this.openMessageId = messageId;
       this.streaming = true;
+      this.nonTextBoundary = false;
       this.messageText += piece;
-      this.turnText += piece;
-      (this.activeHandlers ?? this.handlers).onAssistant?.(
-        this.messageText,
-        messageId !== undefined
-          ? { ...(start ? { start: true } : {}), messageId }
-          : start
-            ? { start: true }
-            : undefined,
-      );
       return;
     }
     if (kind === "agent_message") {
       const piece = extractText(update.content);
       if (!piece) return;
+      const messageId = readMessageId(update);
+      const completesOpenStream = this.streaming && (
+        messageId !== undefined
+          ? this.openMessageId === messageId
+          : this.openMessageId === null && !this.nonTextBoundary
+      );
+      if (this.streaming && !completesOpenStream) this.finishStreamingMessage();
       this.streaming = false;
+      this.nonTextBoundary = false;
       this.messageText = piece;
       this.turnText += piece;
-      const messageId = readMessageId(update);
       this.openMessageId = messageId ?? null;
       (this.activeHandlers ?? this.handlers).onAssistant?.(piece, {
         start: true,
@@ -284,7 +294,7 @@ export class AcpClient {
       return;
     }
     if (kind === "tool_call" || kind === "agent_thought_chunk") {
-      this.finishStreamingMessage();
+      if (this.streaming) this.nonTextBoundary = true;
       return;
     }
     if (kind === "state_update") {
@@ -335,6 +345,7 @@ export class AcpClient {
     this.turnText = "";
     this.messageText = "";
     this.openMessageId = null;
+    this.nonTextBoundary = false;
     const result = (await this.request(method, {
       sessionId,
       cwd: this.cwd,
@@ -361,6 +372,7 @@ export class AcpClient {
     this.messageText = "";
     this.streaming = false;
     this.openMessageId = null;
+    this.nonTextBoundary = false;
     this.gotIdle = false;
     const id = this.nextId++;
     this.promptId = id;
@@ -420,6 +432,7 @@ export class AcpClient {
     this.messageText = "";
     this.turnText = "";
     this.openMessageId = null;
+    this.nonTextBoundary = false;
     this.activeHandlers = null;
     const abort = this.abortPrompt;
     this.abortPrompt = null;
