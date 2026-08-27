@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.2] - 2026-08-28
+
+### Changed
+
+- Make PWA async state selection-safe and failure-visible
+
 ## [0.10.1] - 2026-08-27
 
 ### Changed

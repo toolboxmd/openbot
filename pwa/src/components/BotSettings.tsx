@@ -20,6 +20,7 @@ import {
 } from "@/lib/bot-settings";
 import type { FaceShape } from "@/lib/face";
 import { connectedFocusTarget } from "@/lib/first-use";
+import { createLatestRequestScope } from "@/lib/async-state";
 import {
   getAllBotsAgents,
   getThisBotAgents,
@@ -97,7 +98,11 @@ export function BotSettings({
   onOpenChange: (open: boolean) => void;
   openerRef: RefObject<HTMLButtonElement | null>;
   fallbackFocusRef: RefObject<HTMLElement | null>;
-  onBotMutation: (botId: string, request: () => Promise<Bot>) => Promise<Bot>;
+  onBotMutation: (
+    botId: string,
+    request: () => Promise<Bot>,
+    signal?: AbortSignal,
+  ) => Promise<Bot>;
   onRetryHarnesses: () => void;
   onOpenComputer: () => void;
   section: BotSettingsSection;
@@ -111,33 +116,48 @@ export function BotSettings({
   const [saving, setSaving] = useState<SaveTarget | null>(null);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
+  const instructionsRequestRef = useRef(createLatestRequestScope());
+  const saveRequestRef = useRef(createLatestRequestScope());
   const connections = selectableAiConnections(harnesses);
 
   useEffect(() => {
+    instructionsRequestRef.current.cancel();
+    saveRequestRef.current.cancel();
+    setAllInstructions("");
+    setSavedAllInstructions("");
+    setBotInstructions("");
+    setSavedBotInstructions("");
+    setSaving(null);
+    setFeedback(null);
+    setInstructionsState(open ? "loading" : "idle");
     if (!open) return;
-    let cancelled = false;
-    setInstructionsState("loading");
-    void Promise.all([getAllBotsAgents(), getThisBotAgents(bot.id)])
-      .then(([all, own]) => {
-        if (cancelled) return;
-        setAllInstructions(all);
-        setSavedAllInstructions(all);
-        setBotInstructions(own);
-        setSavedBotInstructions(own);
-        setInstructionsState("ready");
-      })
-      .catch((error) => {
-        if (cancelled) return;
-        setFeedback({
-          id: Date.now(),
-          title: "Could not load instructions",
-          description: errorMessage(error, "Try again after reopening Bot Settings."),
-          error: true,
-        });
-        setInstructionsState("error");
-      });
+    void instructionsRequestRef.current.run(
+      (signal) => Promise.all([
+        getAllBotsAgents(signal),
+        getThisBotAgents(bot.id, signal),
+      ]),
+      {
+        success([all, own]) {
+          setAllInstructions(all);
+          setSavedAllInstructions(all);
+          setBotInstructions(own);
+          setSavedBotInstructions(own);
+          setInstructionsState("ready");
+        },
+        failure(error) {
+          setFeedback({
+            id: Date.now(),
+            title: "Could not load instructions",
+            description: errorMessage(error, "Try again after reopening Bot Settings."),
+            error: true,
+          });
+          setInstructionsState("error");
+        },
+      },
+    );
     return () => {
-      cancelled = true;
+      instructionsRequestRef.current.cancel();
+      saveRequestRef.current.cancel();
     };
   }, [bot.id, open]);
 
@@ -168,51 +188,60 @@ export function BotSettings({
 
   async function chooseConnection(value: string) {
     if (value === bot.harness || !connections.some((connection) => connection.id === value)) return;
-    setSaving("ai");
-    try {
-      const updated = await onBotMutation(bot.id, () => pickHarness(bot.id, value));
-      showSaved("AI connection saved", `${updated.name} will use the selected connection for new Sessions.`);
-    } catch (error) {
-      showSaveError(error, "Could not save the AI connection.");
-    } finally {
-      setSaving(null);
-    }
+    await saveRequestRef.current.run(
+      (signal) => onBotMutation(bot.id, () => pickHarness(bot.id, value, signal), signal),
+      {
+        pending: () => setSaving("ai"),
+        success: (updated) => showSaved(
+          "AI connection saved",
+          `${updated.name} will use the selected connection for new Sessions.`,
+        ),
+        failure: (error) => showSaveError(error, "Could not save the AI connection."),
+        settled: () => setSaving(null),
+      },
+    );
   }
 
   async function chooseEnvironment(value: string) {
     if (value !== "isolated" && value !== "host") return;
     if (value === (bot.configMode ?? "isolated")) return;
-    setSaving("environment");
-    try {
-      const updated = await onBotMutation(bot.id, () => setConfigMode(bot.id, value));
-      showSaved("Environment saved", `${updated.name} will use ${value === "host" ? "Host" : "Isolated"} mode.`);
-    } catch (error) {
-      showSaveError(error, "Could not save the environment.");
-    } finally {
-      setSaving(null);
-    }
+    await saveRequestRef.current.run(
+      (signal) => onBotMutation(bot.id, () => setConfigMode(bot.id, value, signal), signal),
+      {
+        pending: () => setSaving("environment"),
+        success: (updated) => showSaved(
+          "Environment saved",
+          `${updated.name} will use ${value === "host" ? "Host" : "Isolated"} mode.`,
+        ),
+        failure: (error) => showSaveError(error, "Could not save the environment."),
+        settled: () => setSaving(null),
+      },
+    );
   }
 
   async function saveInstructions(scope: "all" | "bot") {
     const target = scope === "all" ? "all-instructions" : "bot-instructions";
-    setSaving(target);
-    try {
-      if (scope === "all") {
-        const saved = await putAllBotsAgents(allInstructions);
-        setAllInstructions(saved);
-        setSavedAllInstructions(saved);
-        showSaved("Instructions saved", "Shared instructions now apply to all Bots.");
-      } else {
-        const saved = await putThisBotAgents(bot.id, botInstructions);
-        setBotInstructions(saved);
-        setSavedBotInstructions(saved);
-        showSaved("Instructions saved", `Instructions for ${bot.name} were updated.`);
-      }
-    } catch (error) {
-      showSaveError(error, "Could not save the instructions.");
-    } finally {
-      setSaving(null);
-    }
+    await saveRequestRef.current.run(
+      (signal) => scope === "all"
+        ? putAllBotsAgents(allInstructions, signal)
+        : putThisBotAgents(bot.id, botInstructions, signal),
+      {
+        pending: () => setSaving(target),
+        success(saved) {
+          if (scope === "all") {
+            setAllInstructions(saved);
+            setSavedAllInstructions(saved);
+            showSaved("Instructions saved", "Shared instructions now apply to all Bots.");
+            return;
+          }
+          setBotInstructions(saved);
+          setSavedBotInstructions(saved);
+          showSaved("Instructions saved", `Instructions for ${bot.name} were updated.`);
+        },
+        failure: (error) => showSaveError(error, "Could not save the instructions."),
+        settled: () => setSaving(null),
+      },
+    );
   }
 
   function openComputer() {
