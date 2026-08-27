@@ -58,6 +58,12 @@ import {
 import { computerPaneIsOpen } from "@/lib/ui-preferences";
 import { appSettingsRequested } from "@/lib/app-settings";
 import {
+  createKeyedRequestScope,
+  createLatestRequestScope,
+  isAbortError,
+  runWithAuthoritativeRefresh,
+} from "@/lib/async-state";
+import {
   acceptOrderedSnapshots,
   botDraftKey,
   buildChatInbox,
@@ -357,6 +363,7 @@ export function Messenger() {
   const chatRegionRef = useRef<HTMLElement | null>(null);
   const pluginsReturnTargetRef = useRef<PluginsReturnTarget | null>(null);
   const botSettingsOpenerRef = useRef<HTMLButtonElement | null>(null);
+  const mountedRef = useRef(true);
   const activeIdRef = useRef<string | null>(null);
   const activeGroupIdRef = useRef<string | null>(null);
   const draftRevisionsRef = useRef<Record<string, number>>({});
@@ -372,6 +379,18 @@ export function Messenger() {
   const latestChannelSnapshotsRef = useRef(new Map<string, Channel>());
   const channelListAppliedSequenceRef = useRef(0);
   const botSettingsNavigationRef = useRef(0);
+  const selectionGenerationRef = useRef(0);
+  const botDetailRequestRef = useRef(createLatestRequestScope());
+  const channelDetailRequestRef = useRef(createLatestRequestScope());
+  const routeBotRequestRef = useRef(createLatestRequestScope());
+  const channelListRequestRef = useRef(createLatestRequestScope());
+  const harnessListRequestRef = useRef(createLatestRequestScope());
+  const createBotRequestRef = useRef(createLatestRequestScope());
+  const cardActionRequestRef = useRef(createKeyedRequestScope<string>());
+  const readReceiptControllersRef = useRef(new Map<string, AbortController>());
+  const sendRequestControllerRef = useRef<AbortController | null>(null);
+  const reactionRequestControllerRef = useRef<AbortController | null>(null);
+  const sendRequestGenerationRef = useRef(0);
   const previousGlobalRouteRef = useRef(globalRoute);
   const appSettingsOpenRef = useRef(appSettingsOpen);
   const newBotOpenRef = useRef(newBotOpen);
@@ -491,13 +510,43 @@ export function Messenger() {
     if (activeDraftKey) storeDraft(activeDraftKey, text);
   }
 
-  function activateBot(bot: Bot) {
+  function cancelCardActions() {
+    cardActionRequestRef.current.cancelAll();
+    setPendingCardIds(new Set());
+  }
+
+  function beginSelection(): number {
+    selectionGenerationRef.current += 1;
+    sendRequestGenerationRef.current += 1;
+    botDetailRequestRef.current.cancel();
+    channelDetailRequestRef.current.cancel();
+    routeBotRequestRef.current.cancel();
+    sendRequestControllerRef.current?.abort();
+    sendRequestControllerRef.current = null;
+    reactionRequestControllerRef.current?.abort();
+    reactionRequestControllerRef.current = null;
+    cancelCardActions();
+    for (const controller of readReceiptControllersRef.current.values()) controller.abort();
+    readReceiptControllersRef.current.clear();
+    setBusy(false);
+    setError(null);
+    return selectionGenerationRef.current;
+  }
+
+  function selectionIsCurrent(generation: number, botId?: string): boolean {
+    return generation === selectionGenerationRef.current
+      && (botId === undefined || activeIdRef.current === botId);
+  }
+
+  function activateBot(bot: Bot, generation: number): boolean {
+    if (generation !== selectionGenerationRef.current) return false;
     activeIdRef.current = bot.id;
     activeGroupIdRef.current = null;
     setActiveId(bot.id);
     setActive(bot);
     setActiveDetailErrorId(null);
     setActiveGroup(null);
+    return true;
   }
 
   function nextBotSnapshotSequence(): number {
@@ -555,11 +604,19 @@ export function Messenger() {
     return resolved;
   }
 
-  async function performBotMutation(botId: string, request: () => Promise<Bot>): Promise<Bot> {
+  async function performBotMutation(
+    botId: string,
+    request: () => Promise<Bot>,
+    signal?: AbortSignal,
+    requestIsCurrent: () => boolean = () => true,
+  ): Promise<Bot> {
     botMutationCountsRef.current.set(botId, (botMutationCountsRef.current.get(botId) ?? 0) + 1);
     inboxMutationGenerationRef.current += 1;
     try {
       const { snapshot, sequence } = await reserveSnapshotRequest(nextBotSnapshotSequence, request);
+      if (signal?.aborted || !requestIsCurrent()) {
+        return latestBotSnapshotsRef.current.get(botId) ?? snapshot;
+      }
       return mergeBot(snapshot, sequence, true, true)
         ?? latestBotSnapshotsRef.current.get(botId)
         ?? snapshot;
@@ -656,9 +713,20 @@ export function Messenger() {
       blockingDialog: blockingChatSurfaceIsOpen(),
       openingBlockingDialog,
     })) return;
-    void markBotRead(bot.id, bot.activity.cursor)
-      .then((activity) => applyBotActivity(bot.id, activity))
-      .catch(() => undefined);
+    const selectionGeneration = selectionGenerationRef.current;
+    readReceiptControllersRef.current.get(bot.id)?.abort();
+    const controller = new AbortController();
+    readReceiptControllersRef.current.set(bot.id, controller);
+    void markBotRead(bot.id, bot.activity.cursor, controller.signal)
+      .then((activity) => {
+        if (selectionIsCurrent(selectionGeneration, bot.id)) applyBotActivity(bot.id, activity);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (readReceiptControllersRef.current.get(bot.id) === controller) {
+          readReceiptControllersRef.current.delete(bot.id);
+        }
+      });
   }
 
   useEffect(() => {
@@ -669,11 +737,13 @@ export function Messenger() {
   }, []);
 
   useEffect(() => {
+    mountedRef.current = true;
     let cancelled = false;
+    const controller = new AbortController();
     const navigation = ++botSettingsNavigationRef.current;
     const listSequence = nextBotSnapshotSequence();
     const channelListSequence = nextChannelSnapshotSequence();
-    void listBots()
+    void listBots(controller.signal)
       .then((data) => {
         if (cancelled) return;
         const acceptedBots = mergeBotSummaries(data.bots, listSequence);
@@ -686,26 +756,33 @@ export function Messenger() {
         }
         const selected = requestedBot ?? acceptedBots[0];
         if (!selected) return;
-        activateBot(selected);
-        const detailSequence = nextBotSnapshotSequence();
-        void getBot(selected.id)
-          .then((bot) => {
-            if (cancelled) return;
-            const merged = mergeBot(bot, detailSequence);
-            if (merged) maybeMarkBotRead(merged, requestedSettings?.botId === bot.id);
-            if (navigation !== botSettingsNavigationRef.current) return;
-            if (requestedSettings?.botId === bot.id) {
-              setBotSettingsSection(requestedSettings.section);
-              setBotSettingsOpen(true);
-            }
-          })
-          .catch(() => {
-            if (cancelled) return;
-            if (activeIdRef.current === selected.id) setActiveDetailErrorId(selected.id);
-            if (navigation !== botSettingsNavigationRef.current) return;
-            setBotSettingsOpen(false);
-            if (requestedSettings) clearBotSettingsLocation();
-          });
+        const selectionGeneration = beginSelection();
+        if (!activateBot(selected, selectionGeneration)) return;
+        void botDetailRequestRef.current.run(
+          (signal) => reserveSnapshotRequest(
+            nextBotSnapshotSequence,
+            () => getBot(selected.id, signal),
+          ),
+          {
+            success({ snapshot, sequence }) {
+              if (cancelled || !selectionIsCurrent(selectionGeneration, selected.id)) return;
+              const merged = mergeBot(snapshot, sequence);
+              if (merged) maybeMarkBotRead(merged, requestedSettings?.botId === snapshot.id);
+              if (navigation !== botSettingsNavigationRef.current) return;
+              if (requestedSettings?.botId === snapshot.id) {
+                setBotSettingsSection(requestedSettings.section);
+                setBotSettingsOpen(true);
+              }
+            },
+            failure() {
+              if (cancelled || !selectionIsCurrent(selectionGeneration, selected.id)) return;
+              setActiveDetailErrorId(selected.id);
+              if (navigation !== botSettingsNavigationRef.current) return;
+              setBotSettingsOpen(false);
+              if (requestedSettings) clearBotSettingsLocation();
+            },
+          },
+        );
       })
       .catch(() => {
         if (!cancelled) {
@@ -713,7 +790,7 @@ export function Messenger() {
           setBotsReady(true);
         }
       });
-    void listChannels()
+    void listChannels(controller.signal)
       .then((data) => {
         if (cancelled) return;
         mergeChannelSummaries(data.channels, channelListSequence);
@@ -721,7 +798,7 @@ export function Messenger() {
       .catch(() => {
         if (!cancelled) failChannelList(channelListSequence);
       });
-    void listHarnesses()
+    void listHarnesses(controller.signal)
       .then((data) => {
         if (cancelled) return;
         setHarnesses(data.harnesses);
@@ -732,6 +809,25 @@ export function Messenger() {
       });
     return () => {
       cancelled = true;
+      mountedRef.current = false;
+      selectionGenerationRef.current += 1;
+      sendRequestGenerationRef.current += 1;
+      controller.abort();
+      botDetailRequestRef.current.cancel();
+      channelDetailRequestRef.current.cancel();
+      routeBotRequestRef.current.cancel();
+      channelListRequestRef.current.cancel();
+      harnessListRequestRef.current.cancel();
+      createBotRequestRef.current.cancel();
+      sendRequestControllerRef.current?.abort();
+      sendRequestControllerRef.current = null;
+      reactionRequestControllerRef.current?.abort();
+      reactionRequestControllerRef.current = null;
+      cardActionRequestRef.current.cancelAll();
+      for (const readController of readReceiptControllersRef.current.values()) {
+        readController.abort();
+      }
+      readReceiptControllersRef.current.clear();
     };
   }, []);
 
@@ -744,13 +840,14 @@ export function Messenger() {
     if (!botsReady) return;
     let cancelled = false;
     let inFlight = false;
+    const controller = new AbortController();
     const refresh = () => {
       if (inFlight) return;
       inFlight = true;
       const mutationGeneration = inboxMutationGenerationRef.current;
       const botSnapshotSequence = nextBotSnapshotSequence();
       const channelSnapshotSequence = nextChannelSnapshotSequence();
-      void listInbox()
+      void listInbox(controller.signal)
         .then((data) => {
           if (cancelled) return;
           if (mutationGeneration === inboxMutationGenerationRef.current) {
@@ -766,6 +863,7 @@ export function Messenger() {
     const timer = window.setInterval(refresh, 1_000);
     return () => {
       cancelled = true;
+      controller.abort();
       window.clearInterval(timer);
     };
   }, [botsReady]);
@@ -776,38 +874,58 @@ export function Messenger() {
       const navigation = ++botSettingsNavigationRef.current;
       const requested = parseBotSettingsHash(window.location.hash);
       if (!requested) {
+        routeBotRequestRef.current.cancel();
         setBotSettingsOpen(false);
         if (botSettingsLocationCandidate(window.location.hash)) clearBotSettingsLocation();
         return;
       }
       if (requested.botId === activeIdRef.current) {
+        routeBotRequestRef.current.cancel();
         setBotSettingsSection(requested.section);
         setMobileSurface("chat");
         setBotSettingsOpen(true);
         return;
       }
       setBotSettingsOpen(false);
-      const snapshotSequence = nextBotSnapshotSequence();
-      void getBot(requested.botId)
-        .then((bot) => {
-          if (cancelled || navigation !== botSettingsNavigationRef.current) return;
-          const selected = mergeBot(bot, snapshotSequence) ?? latestBotSnapshotsRef.current.get(bot.id);
-          if (!selected) return;
-          activateBot(selected);
-          setBotSettingsSection(requested.section);
-          setMobileSurface("chat");
-          setBotSettingsOpen(true);
-        })
-        .catch(() => {
-          if (cancelled || navigation !== botSettingsNavigationRef.current) return;
-          setBotSettingsOpen(false);
-          clearBotSettingsLocation();
-        });
+      const selectionGeneration = beginSelection();
+      void routeBotRequestRef.current.run(
+        (signal) => reserveSnapshotRequest(
+          nextBotSnapshotSequence,
+          () => getBot(requested.botId, signal),
+        ),
+        {
+          success({ snapshot, sequence }) {
+            if (
+              cancelled
+              || navigation !== botSettingsNavigationRef.current
+              || selectionGeneration !== selectionGenerationRef.current
+            ) return;
+            const selected = mergeBot(snapshot, sequence)
+              ?? latestBotSnapshotsRef.current.get(snapshot.id);
+            if (!selected) return;
+            if (!activateBot(selected, selectionGeneration)) return;
+            setBotSettingsSection(requested.section);
+            setMobileSurface("chat");
+            setBotSettingsOpen(true);
+          },
+          failure() {
+            if (
+              cancelled
+              || navigation !== botSettingsNavigationRef.current
+              || selectionGeneration !== selectionGenerationRef.current
+            ) return;
+            setError("Could not open Bot Settings. Try again.");
+            setBotSettingsOpen(false);
+            clearBotSettingsLocation();
+          },
+        },
+      );
     };
     window.addEventListener("hashchange", syncBotSettingsLocation);
     window.addEventListener("popstate", syncBotSettingsLocation);
     return () => {
       cancelled = true;
+      routeBotRequestRef.current.cancel();
       window.removeEventListener("hashchange", syncBotSettingsLocation);
       window.removeEventListener("popstate", syncBotSettingsLocation);
     };
@@ -820,6 +938,7 @@ export function Messenger() {
   useEffect(() => {
     const syncGlobalRoute = () => {
       const next = globalRouteFromHash(window.location.hash);
+      if (next !== globalRouteRef.current) beginSelection();
       setAppSettingsOpen(appSettingsRequested(window.location.hash));
       if (
         previousGlobalRouteRef.current === "plugins" &&
@@ -915,13 +1034,17 @@ export function Messenger() {
     if (!activeId) return;
     let cancelled = false;
     let inFlight = false;
+    const controller = new AbortController();
     const tick = () => {
       if (inFlight || botMutationPending(activeId)) return;
       inFlight = true;
+      const selectionGeneration = selectionGenerationRef.current;
       const snapshotSequence = nextBotSnapshotSequence();
-      void getBot(activeId)
+      void getBot(activeId, controller.signal)
         .then((bot) => {
-          const merged = cancelled ? null : mergeBot(bot, snapshotSequence);
+          const merged = cancelled || !selectionIsCurrent(selectionGeneration, activeId)
+            ? null
+            : mergeBot(bot, snapshotSequence);
           if (merged) {
             maybeMarkBotRead(merged);
           }
@@ -934,6 +1057,7 @@ export function Messenger() {
     const timer = window.setInterval(tick, 600);
     return () => {
       cancelled = true;
+      controller.abort();
       window.clearInterval(timer);
     };
   }, [activeId, blockingChatSurfaceOpen, globalRoute, mobileSurface, visibleComputerOpen]);
@@ -943,10 +1067,12 @@ export function Messenger() {
   }, [active?.activity.unread, blockingChatSurfaceOpen, globalRoute, mobileSurface, visibleComputerOpen]);
 
   async function createOrderedBot(name: string): Promise<Bot> {
+    const identity = createBotRequestRef.current.begin();
     const { snapshot, sequence } = await reserveSnapshotRequest(
       nextBotSnapshotSequence,
-      () => createBot(name),
+      () => createBot(name, identity.signal),
     );
+    if (!identity.isCurrent()) throw identity.signal.reason ?? new DOMException("Aborted", "AbortError");
     createdBotSequencesRef.current.set(snapshot.id, sequence);
     return snapshot;
   }
@@ -966,7 +1092,8 @@ export function Messenger() {
     setError(null);
     setBots((rows) => [...rows.filter((row) => row.id !== remembered.id), remembered]);
     setBotsReady(true);
-    activateBot(remembered);
+    const selectionGeneration = beginSelection();
+    activateBot(remembered, selectionGeneration);
     setMobileSurface("chat");
   }
 
@@ -981,6 +1108,7 @@ export function Messenger() {
   }
 
   function openPlugins(returnTarget: PluginsReturnTarget) {
+    beginSelection();
     pluginsReturnTargetRef.current = returnTarget;
     botSettingsNavigationRef.current += 1;
     setBotSettingsOpen(false);
@@ -1011,33 +1139,51 @@ export function Messenger() {
   function retryActiveChat() {
     const botId = activeIdRef.current;
     if (!botId) return;
+    const selectionGeneration = selectionGenerationRef.current;
     setActiveDetailErrorId(null);
-    const snapshotSequence = nextBotSnapshotSequence();
-    void getBot(botId)
-      .then((detail) => mergeBot(detail, snapshotSequence))
-      .catch(() => {
-        if (activeIdRef.current === botId) setActiveDetailErrorId(botId);
-      });
+    void botDetailRequestRef.current.run(
+      (signal) => reserveSnapshotRequest(
+        nextBotSnapshotSequence,
+        () => getBot(botId, signal),
+      ),
+      {
+        success({ snapshot, sequence }) {
+          if (selectionIsCurrent(selectionGeneration, botId)) mergeBot(snapshot, sequence);
+        },
+        failure() {
+          if (selectionIsCurrent(selectionGeneration, botId)) setActiveDetailErrorId(botId);
+        },
+      },
+    );
   }
 
   function retryChannels() {
-    setChannelsState("loading");
     const snapshotSequence = nextChannelSnapshotSequence();
-    void listChannels()
-      .then((data) => {
-        mergeChannelSummaries(data.channels, snapshotSequence);
-      })
-      .catch(() => failChannelList(snapshotSequence));
+    void channelListRequestRef.current.run(
+      async (signal) => ({
+        snapshot: await listChannels(signal),
+        sequence: snapshotSequence,
+      }),
+      {
+        pending: () => setChannelsState("loading"),
+        success: ({ snapshot, sequence }) => mergeChannelSummaries(snapshot.channels, sequence),
+        failure: () => failChannelList(snapshotSequence),
+      },
+    );
   }
 
   function retryHarnesses() {
-    setHarnessesState("loading");
-    void listHarnesses()
-      .then((data) => {
-        setHarnesses(data.harnesses);
-        setHarnessesState("ready");
-      })
-      .catch(() => setHarnessesState("error"));
+    void harnessListRequestRef.current.run(
+      (signal) => listHarnesses(signal),
+      {
+        pending: () => setHarnessesState("loading"),
+        success(data) {
+          setHarnesses(data.harnesses);
+          setHarnessesState("ready");
+        },
+        failure: () => setHarnessesState("error"),
+      },
+    );
   }
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
@@ -1061,21 +1207,38 @@ export function Messenger() {
     const targetId = replyTo?.id;
     const draftKey = botDraftKey(botId);
     const clearedRevision = storeDraft(draftKey, "");
+    const selectionGeneration = selectionGenerationRef.current;
+    const requestGeneration = ++sendRequestGenerationRef.current;
+    sendRequestControllerRef.current?.abort();
+    const controller = new AbortController();
+    sendRequestControllerRef.current = controller;
     setBusy(true);
     setError(null);
     try {
-      await performBotMutation(botId, () => sendMessage(botId, text, targetId));
-      if (activeIdRef.current === botId) setReplyTo(null);
+      await performBotMutation(
+        botId,
+        () => sendMessage(botId, text, targetId, controller.signal),
+        controller.signal,
+        () => selectionIsCurrent(selectionGeneration, botId),
+      );
+      if (selectionIsCurrent(selectionGeneration, botId)) setReplyTo(null);
     } catch (err) {
-      if (shouldRestoreFailedDraft(draftRevisionsRef.current[draftKey] ?? 0, clearedRevision)) {
+      if (isAbortError(err, controller.signal)) return;
+      if (
+        mountedRef.current
+        && shouldRestoreFailedDraft(draftRevisionsRef.current[draftKey] ?? 0, clearedRevision)
+      ) {
         storeDraft(draftKey, submittedDraft);
       }
-      if (activeIdRef.current === botId) {
+      if (selectionIsCurrent(selectionGeneration, botId)) {
         const message = err instanceof Error ? err.message : "Could not send.";
         if (!isCancelledMessage(message)) setError(message);
       }
     } finally {
-      setBusy(false);
+      if (sendRequestControllerRef.current === controller) {
+        sendRequestControllerRef.current = null;
+      }
+      if (sendRequestGenerationRef.current === requestGeneration) setBusy(false);
     }
   }
 
@@ -1086,51 +1249,75 @@ export function Messenger() {
   ) {
     if (!activeId) return;
     const botId = activeId;
+    const selectionGeneration = selectionGenerationRef.current;
+    if (action.command.kind === "open-computer") {
+      openComputerFor(botId);
+      return;
+    }
     const initiatingCard = messageBubbleRefs.current.get(messageId) ?? null;
+    const actionKey = `${selectionGeneration}:${botId}:${messageId}`;
+    const identity = cardActionRequestRef.current.begin(actionKey);
     setCardPending(messageId, true);
     setError(null);
     try {
-      if (action.command.kind === "permission") {
-        const optionId = action.command.optionId;
-        await performBotMutation(botId, () =>
-          answerPermission(botId, messageId, optionId));
-      } else if (action.command.kind === "host-grant") {
-        if (!duration) throw new Error("Choose how long this Host grant should last.");
-        const access = action.command.access;
-        await performBotMutation(botId, () =>
-          answerHostGrant(botId, messageId, access, duration));
-      } else if (action.command.kind === "retry-message") {
-        await performBotMutation(botId, () => retryTranscriptCard(botId, messageId));
-      } else if (action.command.kind === "open-computer") {
-        openComputerFor(botId);
-      } else if (action.command.kind === "resolve-needs-you") {
-        const eventId = action.command.eventId;
-        const resolution = action.command.resolution;
-        await performBotMutation(botId, () =>
-          resolveNeedsYouCard(botId, messageId, eventId, resolution));
-      }
-    } catch (err) {
-      if (activeIdRef.current === botId) {
-        try {
-          const { snapshot: authoritative, sequence } = await reserveSnapshotRequest(
-            nextBotSnapshotSequence,
-            () => getBot(botId),
-          );
-          if (activeIdRef.current === botId) {
-            mergeBot(authoritative, sequence);
+      const result = await runWithAuthoritativeRefresh(
+        async (signal) => {
+          if (action.command.kind === "permission") {
+            const optionId = action.command.optionId;
+            return performBotMutation(
+              botId,
+              () => answerPermission(botId, messageId, optionId, signal),
+              signal,
+            );
           }
-        } catch {
-          // Keep the current snapshot when the authoritative refresh also fails.
-        }
-        if (activeIdRef.current === botId) {
-          setError(err instanceof Error ? err.message : "Could not complete this action.");
-        }
+          if (action.command.kind === "host-grant") {
+            if (!duration) throw new Error("Choose how long this Host grant should last.");
+            const access = action.command.access;
+            return performBotMutation(
+              botId,
+              () => answerHostGrant(botId, messageId, access, duration, signal),
+              signal,
+            );
+          }
+          if (action.command.kind === "retry-message") {
+            return performBotMutation(
+              botId,
+              () => retryTranscriptCard(botId, messageId, signal),
+              signal,
+            );
+          }
+          if (action.command.kind === "resolve-needs-you") {
+            const eventId = action.command.eventId;
+            const resolution = action.command.resolution;
+            return performBotMutation(
+              botId,
+              () => resolveNeedsYouCard(botId, messageId, eventId, resolution, signal),
+              signal,
+            );
+          }
+          throw new Error("Could not complete this action.");
+        },
+        (signal) => reserveSnapshotRequest(
+          nextBotSnapshotSequence,
+          () => getBot(botId, signal),
+        ),
+        identity.signal,
+      );
+      if (!selectionIsCurrent(selectionGeneration, botId) || result.ok) return;
+      if (result.authoritative) {
+        mergeBot(result.authoritative.snapshot, result.authoritative.sequence);
+      }
+      setError(result.error instanceof Error ? result.error.message : "Could not complete this action.");
+    } catch (err) {
+      if (!isAbortError(err, identity.signal) && selectionIsCurrent(selectionGeneration, botId)) {
+        setError(err instanceof Error ? err.message : "Could not complete this action.");
       }
     } finally {
-      setCardPending(messageId, false);
-      if (activeIdRef.current === botId) {
+      const ownsPendingState = identity.finish();
+      if (ownsPendingState && selectionIsCurrent(selectionGeneration, botId)) {
+        setCardPending(messageId, false);
         window.requestAnimationFrame(() => {
-          if (activeIdRef.current !== botId) return;
+          if (activeIdRef.current !== botId || !selectionIsCurrent(selectionGeneration, botId)) return;
           const activeElement = document.activeElement;
           const focusStayedWithCard = Boolean(
             initiatingCard && activeElement && initiatingCard.contains(activeElement),
@@ -1156,15 +1343,28 @@ export function Messenger() {
   async function onReact(messageId: string, emoji: string) {
     if (!activeId) return;
     const botId = activeId;
+    const selectionGeneration = selectionGenerationRef.current;
+    reactionRequestControllerRef.current?.abort();
+    const controller = new AbortController();
+    reactionRequestControllerRef.current = controller;
     try {
-      await performBotMutation(botId, () => toggleReaction(botId, messageId, emoji));
-      if (activeIdRef.current === botId) {
+      await performBotMutation(
+        botId,
+        () => toggleReaction(botId, messageId, emoji, controller.signal),
+        controller.signal,
+        () => selectionIsCurrent(selectionGeneration, botId),
+      );
+      if (selectionIsCurrent(selectionGeneration, botId)) {
         setReactingId(null);
         setActionMessageId(null);
       }
     } catch (err) {
-      if (activeIdRef.current === botId) {
+      if (!isAbortError(err, controller.signal) && selectionIsCurrent(selectionGeneration, botId)) {
         setError(err instanceof Error ? err.message : "Could not react.");
+      }
+    } finally {
+      if (reactionRequestControllerRef.current === controller) {
+        reactionRequestControllerRef.current = null;
       }
     }
   }
@@ -1509,39 +1709,60 @@ export function Messenger() {
     botSettingsNavigationRef.current += 1;
     setBotSettingsOpen(false);
     if (parseBotSettingsHash(window.location.hash)) clearBotSettingsLocation();
-    activateBot(bot);
+    const selectionGeneration = beginSelection();
+    if (!activateBot(bot, selectionGeneration)) return;
     setMobileSurface("chat");
-    const snapshotSequence = nextBotSnapshotSequence();
-    void getBot(bot.id)
-      .then((detail) => {
-        const merged = mergeBot(detail, snapshotSequence);
-        if (merged) maybeMarkBotRead(merged);
-      })
-      .catch(() => {
-        if (activeIdRef.current === bot.id) setActiveDetailErrorId(bot.id);
-      });
+    void botDetailRequestRef.current.run(
+      (signal) => reserveSnapshotRequest(
+        nextBotSnapshotSequence,
+        () => getBot(bot.id, signal),
+      ),
+      {
+        success({ snapshot, sequence }) {
+          if (!selectionIsCurrent(selectionGeneration, bot.id)) return;
+          const merged = mergeBot(snapshot, sequence);
+          if (merged) maybeMarkBotRead(merged);
+        },
+        failure() {
+          if (selectionIsCurrent(selectionGeneration, bot.id)) setActiveDetailErrorId(bot.id);
+        },
+      },
+    );
   }
 
   function openGroup(channel: Channel) {
     botSettingsNavigationRef.current += 1;
     setBotSettingsOpen(false);
     if (parseBotSettingsHash(window.location.hash)) clearBotSettingsLocation();
+    const selectionGeneration = beginSelection();
     activeIdRef.current = null;
     activeGroupIdRef.current = channel.id;
     setActiveId(null);
     setActive(null);
     setActiveGroup(channel);
     setMobileSurface("chat");
-    const snapshotSequence = nextChannelSnapshotSequence();
-    void getChannel(channel.id)
-      .then((detail) => {
-        mergeChannel(detail, snapshotSequence);
-      })
-      .catch(() => undefined);
+    void channelDetailRequestRef.current.run(
+      (signal) => reserveSnapshotRequest(
+        nextChannelSnapshotSequence,
+        () => getChannel(channel.id, signal),
+      ),
+      {
+        success({ snapshot, sequence }) {
+          if (
+            selectionGeneration === selectionGenerationRef.current
+            && activeGroupIdRef.current === channel.id
+          ) mergeChannel(snapshot, sequence);
+        },
+        failure() {
+          // The selected group summary remains visible when detail is temporarily unavailable.
+        },
+      },
+    );
   }
 
   function openBotSettings(event: MouseEvent<HTMLButtonElement>) {
     if (!activeId) return;
+    beginSelection();
     botSettingsNavigationRef.current += 1;
     botSettingsOpenerRef.current = event.currentTarget;
     setBotSettingsSection("ai");
@@ -1571,8 +1792,12 @@ export function Messenger() {
     );
   }
 
-  async function applyBotMutation(botId: string, request: () => Promise<Bot>): Promise<Bot> {
-    return performBotMutation(botId, request);
+  async function applyBotMutation(
+    botId: string,
+    request: () => Promise<Bot>,
+    signal?: AbortSignal,
+  ): Promise<Bot> {
+    return performBotMutation(botId, request, signal);
   }
 
   function openComputerFor(botId: string) {
@@ -2177,6 +2402,7 @@ export function Messenger() {
                 botId={activeId}
                 expanded
                 onClose={closeComputer}
+                onFailure={setError}
                 showChatButton={false}
               />
             </div>

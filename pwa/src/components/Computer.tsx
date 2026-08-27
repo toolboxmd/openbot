@@ -2,6 +2,7 @@ import { getComputer, setComputerZoom, type Computer } from "@/lib/session";
 import { startComputerZoomSync } from "@/lib/computer-zoom";
 import { Button } from "@/components/ui/button";
 import { MessageSquare } from "lucide-react";
+import { createLatestRequestScope } from "@/lib/async-state";
 import { cn } from "@/lib/utils";
 import { useEffect, useRef, useState } from "react";
 
@@ -24,35 +25,55 @@ export function ComputerScreen({
   botId,
   expanded,
   onClose,
+  onFailure,
   showChatButton = true,
 }: {
   botId: string | null;
   expanded: boolean;
   onClose: () => void;
+  onFailure?: (message: string) => void;
   showChatButton?: boolean;
 }) {
   const [computer, setComputer] = useState<Computer | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loadedBotId, setLoadedBotId] = useState<string | null | undefined>(undefined);
   const frameRef = useRef<HTMLIFrameElement | null>(null);
+  const computerRequestRef = useRef(createLatestRequestScope());
+  const dismissRequestRef = useRef(createLatestRequestScope());
 
   useEffect(() => {
-    let cancelled = false;
-    void getComputer(botId)
-      .then((data) => {
-        if (!cancelled) setComputer(data);
-      })
-      .catch(() => {
-        if (!cancelled) setError("Could not open Computer.");
-      });
-    const tick = window.setInterval(() => {
-      void getComputer(botId)
-        .then((data) => {
-          if (!cancelled) setComputer(data);
-        })
-        .catch(() => undefined);
-    }, 1500);
+    computerRequestRef.current.cancel();
+    dismissRequestRef.current.cancel();
+    setComputer(null);
+    setError(null);
+    setLoadedBotId(undefined);
+    let inFlight = false;
+    async function refresh(showFailure: boolean) {
+      if (inFlight) return;
+      inFlight = true;
+      await computerRequestRef.current.run(
+        (signal) => getComputer(botId, signal),
+        {
+          success(data) {
+            setComputer(data);
+            setError(null);
+            setLoadedBotId(botId);
+          },
+          failure() {
+            if (showFailure) {
+              setError("Could not open Computer.");
+              setLoadedBotId(botId);
+            }
+          },
+        },
+      );
+      inFlight = false;
+    }
+    void refresh(true);
+    const tick = window.setInterval(() => void refresh(false), 1500);
     return () => {
-      cancelled = true;
+      computerRequestRef.current.cancel();
+      dismissRequestRef.current.cancel();
       window.clearInterval(tick);
     };
   }, [botId]);
@@ -60,6 +81,8 @@ export function ComputerScreen({
   useEffect(() => {
     return startComputerZoomSync(botId, expanded, setComputerZoom, (data) => {
       setComputer(data);
+      setError(null);
+      setLoadedBotId(botId);
     });
   }, [botId, expanded]);
 
@@ -98,19 +121,26 @@ export function ComputerScreen({
   }, [expanded, botId, computer?.path]);
 
   async function dismiss() {
-    await setComputerZoom(botId, false).catch(() => undefined);
-    onClose();
+    await dismissRequestRef.current.run(
+      (signal) => setComputerZoom(botId, false, signal),
+      {
+        success: onClose,
+        failure: () => onFailure?.("Could not close Computer. Try again."),
+      },
+    );
   }
 
   const viewOnly = !expanded;
-  const path = computer?.path ?? (botId ? `/screen/${botId}/` : "/screen/");
+  const currentComputer = loadedBotId === botId ? computer : null;
+  const currentError = loadedBotId === botId ? error : null;
+  const path = currentComputer?.path ?? (botId ? `/screen/${botId}/` : "/screen/");
 
-  if (error && !computer) {
-    return <p className="px-6 text-sm text-muted-foreground">{error}</p>;
+  if (currentError && !currentComputer) {
+    return <p className="px-6 text-sm text-muted-foreground" role="alert">{currentError}</p>;
   }
 
-  if (!computer) {
-    return <p className="px-6 text-sm text-muted-foreground">Opening Computer…</p>;
+  if (!currentComputer) {
+    return <p className="px-6 text-sm text-muted-foreground" role="status">Opening Computer…</p>;
   }
 
   return (

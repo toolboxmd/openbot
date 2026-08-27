@@ -1,4 +1,4 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { ArrowRight } from "lucide-react";
 import { Eyes } from "@/components/Eyes";
@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { createLatestRequestScope } from "@/lib/async-state";
 import { unlock } from "@/lib/session";
 
 type Props = {
@@ -16,18 +17,34 @@ export function PasswordGate({ onUnlocked }: Props) {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const unlockRequestRef = useRef(createLatestRequestScope());
+
+  useEffect(() => () => unlockRequestRef.current.cancel(), []);
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setPending(true);
-    setError(null);
-    const result = await unlock(password);
-    setPending(false);
-    if (!result.ok) {
-      setError(result.error);
-      return;
-    }
-    onUnlocked();
+    await unlockRequestRef.current.run(
+      (signal) => unlock(password, signal),
+      {
+        pending() {
+          setPending(true);
+          setError(null);
+        },
+        success(result) {
+          if (!result.ok) {
+            setError(result.error);
+            return;
+          }
+          onUnlocked();
+        },
+        failure() {
+          setError("Could not unlock OpenBot. Try again.");
+        },
+        settled() {
+          setPending(false);
+        },
+      },
+    );
   }
 
   return (

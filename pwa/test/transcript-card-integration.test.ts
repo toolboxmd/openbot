@@ -14,13 +14,13 @@ describe("Transcript Card integration", () => {
 
   test("routes only stored Card actions through their working Talk or retry seam", () => {
     assert.match(source, /action\.command\.kind === "permission"/);
-    assert.match(source, /answerPermission\(botId, messageId, optionId\)/);
+    assert.match(source, /answerPermission\(botId, messageId, optionId, signal\)/);
     assert.match(source, /action\.command\.kind === "host-grant"/);
-    assert.match(source, /answerHostGrant\(botId, messageId, access, duration/);
+    assert.match(source, /answerHostGrant\(botId, messageId, access, duration, signal\)/);
     assert.match(source, /action\.command\.kind === "retry-message"/);
-    assert.match(source, /retryTranscriptCard\(botId, messageId\)/);
+    assert.match(source, /retryTranscriptCard\(botId, messageId, signal\)/);
     assert.match(source, /action\.command\.kind === "resolve-needs-you"/);
-    assert.match(source, /resolveNeedsYouCard\(botId, messageId, eventId, resolution\)/);
+    assert.match(source, /resolveNeedsYouCard\(botId, messageId, eventId, resolution, signal\)/);
   });
 
   test("routes the Card and Chat header to the same selected Bot Computer", () => {
@@ -34,6 +34,7 @@ describe("Transcript Card integration", () => {
     const start = source.indexOf("async function onCardAction");
     const end = source.indexOf("async function onReact", start);
     const handler = source.slice(start, end);
+    assert.match(handler, /const selectionGeneration = selectionGenerationRef\.current/);
     assert.match(handler, /setCardPending\(messageId, true\)/);
     assert.match(handler, /setCardPending\(messageId, false\)/);
     assert.doesNotMatch(handler, /setBusy\(/);
@@ -43,10 +44,20 @@ describe("Transcript Card integration", () => {
     assert.match(handler, /focusStayedWithCard \|\| focusNeedsRecovery/);
     assert.match(handler, /activeIdRef\.current !== botId/);
     assert.match(handler, /messageBubbleRefs\.current\.get\(messageId\)\?\.focus\(\)/);
-    assert.match(handler, /getBot\(botId\)/);
+    assert.match(handler, /getBot\(botId, signal\)/);
+    assert.match(handler, /ownsPendingState && selectionIsCurrent\(selectionGeneration, botId\)/);
     assert.match(source, /<ToastProvider/);
     assert.match(source, /<ToastTitle>Action not completed<\/ToastTitle>/);
     assert.match(source, /<ToastViewport/);
     assert.doesNotMatch(source, /<p className="px-6 pb-2 text-center text-sm text-destructive" role="alert">/);
+  });
+
+  test("keeps a stale Channel retry failure behind a newer poll snapshot", () => {
+    const start = source.indexOf("function retryChannels");
+    const end = source.indexOf("function retryHarnesses", start);
+    const handler = source.slice(start, end);
+    assert.match(handler, /const snapshotSequence = nextChannelSnapshotSequence\(\)/);
+    assert.match(handler, /failure: \(\) => failChannelList\(snapshotSequence\)/);
+    assert.doesNotMatch(handler, /failure[\s\S]*nextChannelSnapshotSequence\(\)/);
   });
 });
