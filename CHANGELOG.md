@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.0] - 2026-08-27
+
+### Added
+
+- Add the recent-activity Chat inbox
+
 ## [0.5.0] - 2026-08-27
 
 ### Added

@@ -84,7 +84,7 @@ export function BotSettings({
   onOpenChange,
   openerRef,
   fallbackFocusRef,
-  onBotChange,
+  onBotMutation,
   onRetryHarnesses,
   onOpenComputer,
   section,
@@ -97,7 +97,7 @@ export function BotSettings({
   onOpenChange: (open: boolean) => void;
   openerRef: RefObject<HTMLButtonElement | null>;
   fallbackFocusRef: RefObject<HTMLElement | null>;
-  onBotChange: (bot: Bot) => void;
+  onBotMutation: (botId: string, request: () => Promise<Bot>) => Promise<Bot>;
   onRetryHarnesses: () => void;
   onOpenComputer: () => void;
   section: BotSettingsSection;
@@ -170,8 +170,7 @@ export function BotSettings({
     if (value === bot.harness || !connections.some((connection) => connection.id === value)) return;
     setSaving("ai");
     try {
-      const updated = await pickHarness(bot.id, value);
-      onBotChange(updated);
+      const updated = await onBotMutation(bot.id, () => pickHarness(bot.id, value));
       showSaved("AI connection saved", `${updated.name} will use the selected connection for new Sessions.`);
     } catch (error) {
       showSaveError(error, "Could not save the AI connection.");
@@ -185,8 +184,7 @@ export function BotSettings({
     if (value === (bot.configMode ?? "isolated")) return;
     setSaving("environment");
     try {
-      const updated = await setConfigMode(bot.id, value);
-      onBotChange(updated);
+      const updated = await onBotMutation(bot.id, () => setConfigMode(bot.id, value));
       showSaved("Environment saved", `${updated.name} will use ${value === "host" ? "Host" : "Isolated"} mode.`);
     } catch (error) {
       showSaveError(error, "Could not save the environment.");

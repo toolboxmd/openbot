@@ -14,7 +14,7 @@ import {
   type HostGrantDuration,
 } from "./harness-home.ts";
 
-export const HOME_SCHEMA_VERSION = 2;
+export const HOME_SCHEMA_VERSION = 3;
 export const HUMAN_MEMBER_ID = "you";
 
 export type MessageReceipt = "sent" | "delivered" | "read";
@@ -72,12 +72,83 @@ export type StoredChannel = {
   messages: TranscriptMessage[];
 };
 
+export type ChannelCursor = {
+  sequence: number;
+  revision: number;
+};
+
 export type NewMessage = TranscriptMessage & {
   senderId: string;
   recipientBotId?: string;
 };
 
+export type ChannelActivity = {
+  latestText: string | null;
+  lastActivityAt: string;
+  unread: boolean;
+  cursor: ChannelCursor;
+};
+
+export type StoredChannelSummary = Omit<StoredChannel, "messages"> & {
+  activity: ChannelActivity;
+};
+
 type SqlRow = Record<string, unknown>;
+
+const CHANNEL_SUMMARY_SELECT = `SELECT
+  channels.id,
+  channels.kind,
+  channels.title,
+  channels.created_at,
+  (
+    SELECT substr(messages.text, 1, 512)
+    FROM messages
+    WHERE messages.channel_id = channels.id
+      AND messages.kind = 'text'
+      AND trim(messages.text) <> ''
+    ORDER BY messages.sequence DESC
+    LIMIT 1
+  ) AS latest_text,
+  COALESCE((
+    SELECT messages.created_at
+    FROM messages
+    WHERE messages.channel_id = channels.id
+      AND messages.kind = 'text'
+      AND trim(messages.text) <> ''
+    ORDER BY messages.sequence DESC
+    LIMIT 1
+  ), channels.created_at) AS last_activity_at,
+  COALESCE((
+    SELECT messages.sequence
+    FROM messages
+    WHERE messages.channel_id = channels.id
+    ORDER BY messages.sequence DESC
+    LIMIT 1
+  ), 0) AS cursor_sequence,
+  COALESCE((
+    SELECT messages.revision
+    FROM messages
+    WHERE messages.channel_id = channels.id
+    ORDER BY messages.sequence DESC
+    LIMIT 1
+  ), 0) AS cursor_revision,
+  EXISTS(
+    SELECT 1
+    FROM messages
+    LEFT JOIN channel_reads ON channel_reads.channel_id = messages.channel_id
+    WHERE messages.channel_id = channels.id
+      AND messages.kind = 'text'
+      AND messages.sender_kind = 'bot'
+      AND trim(messages.text) <> ''
+      AND (
+        messages.sequence > COALESCE(channel_reads.last_read_sequence, 0)
+        OR (
+          messages.sequence = COALESCE(channel_reads.last_read_sequence, 0)
+          AND messages.revision > COALESCE(channel_reads.last_read_revision, 0)
+        )
+      )
+  ) AS unread
+FROM channels`;
 
 export function defaultHomeDir(env: NodeJS.ProcessEnv = process.env): string {
   const configured = env.OPENBOT_HOME?.trim();
@@ -136,6 +207,50 @@ export class HomeStore {
     });
   }
 
+  listChannelSummaries(): StoredChannelSummary[] {
+    const rows = this.db
+      .prepare(`${CHANNEL_SUMMARY_SELECT} ORDER BY channels.created_at, channels.id`)
+      .all() as SqlRow[];
+    const membersByChannel = new Map<string, ChannelMember[]>();
+    const memberRows = this.db
+      .prepare(
+        `SELECT channel_id, member_kind, member_id
+         FROM channel_members
+         ORDER BY channel_id, position, member_id`,
+      )
+      .all() as SqlRow[];
+    for (const row of memberRows) {
+      if (typeof row.channel_id !== "string") continue;
+      const member = reviveMember(row)[0];
+      if (!member) continue;
+      const members = membersByChannel.get(row.channel_id) ?? [];
+      members.push(member);
+      membersByChannel.set(row.channel_id, members);
+    }
+    return rows.flatMap((row) => {
+      const members = typeof row.id === "string" ? membersByChannel.get(row.id) ?? [] : [];
+      const summary = this.reviveChannelSummary(row, members);
+      return summary ? [summary] : [];
+    });
+  }
+
+  getChannelSummary(id: string): StoredChannelSummary | null {
+    const row = this.db
+      .prepare(`${CHANNEL_SUMMARY_SELECT} WHERE channels.id = ?`)
+      .get(id) as SqlRow | undefined;
+    if (!row) return null;
+    const members = this.db
+      .prepare(
+        `SELECT member_kind, member_id
+         FROM channel_members
+         WHERE channel_id = ?
+         ORDER BY position, member_id`,
+      )
+      .all(id)
+      .flatMap((member) => reviveMember(member as SqlRow));
+    return this.reviveChannelSummary(row, members);
+  }
+
   listMessages(channelId: string): TranscriptMessage[] {
     return this.db
       .prepare(
@@ -178,6 +293,72 @@ export class HomeStore {
       .get(id) as SqlRow | undefined;
     if (!row) return null;
     return this.reviveChannel(row);
+  }
+
+  channelActivity(channelId: string): ChannelActivity {
+    const summary = this.getChannelSummary(channelId);
+    if (!summary) {
+      throw Object.assign(new Error("Channel not found"), { status: 404 });
+    }
+    return summary.activity;
+  }
+
+  markChannelRead(channelId: string, cursor: ChannelCursor, updatedAt = new Date().toISOString()): void {
+    if (this.closed) return;
+    if (
+      !Number.isSafeInteger(cursor.sequence)
+      || cursor.sequence < 0
+      || !Number.isSafeInteger(cursor.revision)
+      || cursor.revision < 0
+    ) {
+      throw Object.assign(new Error("invalid Channel cursor"), { status: 400 });
+    }
+    const channel = this.db.prepare("SELECT 1 AS found FROM channels WHERE id = ?").get(channelId) as SqlRow | undefined;
+    if (channel?.found !== 1) throw Object.assign(new Error("Channel not found"), { status: 404 });
+    if (cursor.sequence === 0 && cursor.revision !== 0) {
+      throw Object.assign(new Error("invalid Channel cursor"), { status: 400 });
+    }
+    if (cursor.sequence > 0) {
+      const message = this.db
+        .prepare("SELECT revision FROM messages WHERE channel_id = ? AND sequence = ?")
+        .get(channelId, cursor.sequence) as SqlRow | undefined;
+      if (
+        typeof message?.revision !== "number"
+        || cursor.revision === 0
+        || cursor.revision > message.revision
+      ) {
+        throw Object.assign(new Error("invalid Channel cursor"), { status: 400 });
+      }
+    }
+    this.db
+      .prepare(
+        `INSERT INTO channel_reads (channel_id, last_read_sequence, last_read_revision, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(channel_id)
+         DO UPDATE SET
+           last_read_sequence = CASE
+             WHEN excluded.last_read_sequence > channel_reads.last_read_sequence
+             THEN excluded.last_read_sequence
+             ELSE channel_reads.last_read_sequence
+           END,
+           last_read_revision = CASE
+             WHEN excluded.last_read_sequence > channel_reads.last_read_sequence
+             THEN excluded.last_read_revision
+             WHEN excluded.last_read_sequence = channel_reads.last_read_sequence
+             THEN MAX(excluded.last_read_revision, channel_reads.last_read_revision)
+             ELSE channel_reads.last_read_revision
+           END,
+           updated_at = CASE
+             WHEN excluded.last_read_sequence > channel_reads.last_read_sequence
+               OR (
+                 excluded.last_read_sequence = channel_reads.last_read_sequence
+                 AND excluded.last_read_revision > channel_reads.last_read_revision
+               )
+             THEN excluded.updated_at
+             ELSE channel_reads.updated_at
+           END`,
+      )
+      .run(channelId, cursor.sequence, cursor.revision, updatedAt);
   }
 
   createGroup(input: { title?: string | null; memberBotIds: string[] }): StoredChannel {
@@ -391,7 +572,7 @@ export class HomeStore {
 
   updateMessageText(messageId: string, text: string): void {
     if (this.closed) return;
-    this.db.prepare("UPDATE messages SET text = ? WHERE id = ?").run(text, messageId);
+    this.db.prepare("UPDATE messages SET text = ?, revision = revision + 1 WHERE id = ?").run(text, messageId);
   }
 
   setReceipt(messageId: string, recipientBotId: string, receipt: MessageReceipt, updatedAt: string): void {
@@ -468,6 +649,7 @@ export class HomeStore {
 
         CREATE TABLE messages (
           sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          revision INTEGER NOT NULL DEFAULT 1,
           id TEXT NOT NULL UNIQUE,
           channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
           kind TEXT NOT NULL DEFAULT 'text',
@@ -515,6 +697,13 @@ export class HomeStore {
           PRIMARY KEY (bot_id, channel_id)
         );
 
+        CREATE TABLE channel_reads (
+          channel_id TEXT PRIMARY KEY REFERENCES channels(id) ON DELETE CASCADE,
+          last_read_sequence INTEGER NOT NULL DEFAULT 0,
+          last_read_revision INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE host_grants (
           id TEXT PRIMARY KEY,
           path TEXT NOT NULL,
@@ -524,7 +713,8 @@ export class HomeStore {
           created_at TEXT NOT NULL
         );
         `);
-      } else if (version === 1) {
+      }
+      if (version === 1) {
         this.db.exec(`
           ALTER TABLE bots ADD COLUMN config_mode TEXT NOT NULL DEFAULT 'isolated';
           CREATE TABLE IF NOT EXISTS host_grants (
@@ -536,6 +726,36 @@ export class HomeStore {
             created_at TEXT NOT NULL
           );
         `);
+      }
+      if (version <= 2) {
+        if (version > 0 && !tableHasColumn(this.db, "messages", "revision")) {
+          this.db.exec("ALTER TABLE messages ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;");
+        }
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS channel_reads (
+            channel_id TEXT PRIMARY KEY REFERENCES channels(id) ON DELETE CASCADE,
+            last_read_sequence INTEGER NOT NULL DEFAULT 0,
+            last_read_revision INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+          );
+        `);
+        if (version > 0) {
+          this.db.exec(`
+            INSERT INTO channel_reads (channel_id, last_read_sequence, last_read_revision, updated_at)
+            SELECT
+              channels.id,
+              COALESCE(messages.sequence, 0),
+              COALESCE(messages.revision, 0),
+              COALESCE(messages.created_at, channels.created_at)
+            FROM channels
+            LEFT JOIN messages ON messages.sequence = (
+              SELECT MAX(latest.sequence)
+              FROM messages AS latest
+              WHERE latest.channel_id = channels.id
+            )
+            ON CONFLICT(channel_id) DO NOTHING;
+          `);
+        }
       }
       this.db.exec(`PRAGMA user_version = ${HOME_SCHEMA_VERSION};`);
     });
@@ -556,6 +776,32 @@ export class HomeStore {
       createdAt: row.created_at,
       members,
       messages: this.listMessages(row.id),
+    };
+  }
+
+  private reviveChannelSummary(row: SqlRow, members: ChannelMember[]): StoredChannelSummary | null {
+    if (
+      typeof row.id !== "string"
+      || !isChannelKind(row.kind)
+      || typeof row.created_at !== "string"
+      || typeof row.last_activity_at !== "string"
+      || typeof row.cursor_sequence !== "number"
+      || typeof row.cursor_revision !== "number"
+    ) {
+      return null;
+    }
+    return {
+      id: row.id,
+      kind: row.kind,
+      title: typeof row.title === "string" ? row.title : null,
+      createdAt: row.created_at,
+      members,
+      activity: {
+        latestText: typeof row.latest_text === "string" ? row.latest_text : null,
+        lastActivityAt: row.last_activity_at,
+        unread: row.unread === 1,
+        cursor: { sequence: row.cursor_sequence, revision: row.cursor_revision },
+      },
     };
   }
 
@@ -697,6 +943,11 @@ function readSchemaVersion(database: DatabaseSync): number {
     throw new Error("talk.sqlite has an invalid schema version");
   }
   return version;
+}
+
+function tableHasColumn(database: DatabaseSync, table: string, column: string): boolean {
+  const rows = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>;
+  return rows.some((row) => row.name === column);
 }
 
 function newerSchemaError(version: number): Error {

@@ -1,5 +1,5 @@
 import { FormEvent, Fragment, useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
-import { ArrowUp, Menu, MessageSquare, Monitor, Plug, Plus, Reply, Settings, Smile, X } from "lucide-react";
+import { ArrowUp, Menu, MessageSquare, Monitor, Plug, Plus, Reply, Search, Settings, Smile, X } from "lucide-react";
 import { AppSettings } from "@/components/AppSettings";
 import { BotSettings } from "@/components/BotSettings";
 import { ComputerScreen } from "@/components/Computer";
@@ -25,6 +25,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Separator } from "@/components/ui/separator";
+import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
@@ -33,7 +34,6 @@ import {
   botMembers,
   composerSendEnabled,
   groupDisplayTitle,
-  sidebarGroups,
   type Channel,
 } from "@/lib/channels";
 import { HostGrantCard } from "@/components/HostGrantCard";
@@ -44,6 +44,30 @@ import {
   type BotSettingsSection,
 } from "@/lib/bot-settings";
 import { computerPaneIsOpen } from "@/lib/ui-preferences";
+import { appearanceSettingsRequested } from "@/lib/app-settings";
+import {
+  acceptOrderedSnapshots,
+  botDraftKey,
+  buildChatInbox,
+  canAcknowledgeChatRead,
+  channelDraftKey,
+  chatSurfaceIsVisible,
+  filterChatInbox,
+  formatRelativeActivityTime,
+  inboxAnnouncement,
+  inboxEyesMode,
+  listSnapshotIsCurrent,
+  mergeInboxSnapshots,
+  observedActivityAfterRead,
+  readChatDrafts,
+  reserveSnapshotRequest,
+  resolveSnapshotMembership,
+  setChatDraft,
+  shouldRestoreFailedDraft,
+  writeChatDrafts,
+  type ChatDrafts,
+  type ChatInboxRow,
+} from "@/lib/chat-inbox";
 import {
   botListViewState,
   canSendDirectMessage,
@@ -67,6 +91,8 @@ import {
   listBots,
   listChannels,
   listHarnesses,
+  listInbox,
+  markBotRead,
   sendMessage,
   toggleReaction,
   type Bot,
@@ -264,7 +290,16 @@ function HoverActions({
 }
 
 export function Messenger() {
-  const [draft, setDraft] = useState("");
+  const [drafts, setDrafts] = useState<ChatDrafts>(() => {
+    try {
+      return readChatDrafts(window.localStorage);
+    } catch {
+      return {};
+    }
+  });
+  const [inboxQuery, setInboxQuery] = useState("");
+  const [inboxNow, setInboxNow] = useState(() => new Date());
+  const [inboxLive, setInboxLive] = useState({ serial: 0, text: "" });
   const [bots, setBots] = useState<Bot[]>([]);
   const [botsReady, setBotsReady] = useState(false);
   const [botsLoadError, setBotsLoadError] = useState(false);
@@ -278,7 +313,10 @@ export function Messenger() {
   const [activeGroup, setActiveGroup] = useState<Channel | null>(null);
   const [mobileSurface, setMobileSurface] = useState<MobileSurface>("chat");
   const [globalRoute, setGlobalRoute] = useState<GlobalRoute>(() => globalRouteFromHash(window.location.hash));
-  const [newBotOpen, setNewBotOpen] = useState(false);
+  const [appSettingsOpen, setAppSettingsOpenState] = useState(() => appearanceSettingsRequested(window.location.hash));
+  const [newBotOpen, setNewBotOpenState] = useState(false);
+  const [botSettingsOpen, setBotSettingsOpenState] = useState(false);
+  const [botSettingsSection, setBotSettingsSection] = useState<BotSettingsSection>("ai");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
@@ -288,6 +326,7 @@ export function Messenger() {
   const computerButtonRef = useRef<HTMLButtonElement | null>(null);
   const closeComputerButtonRef = useRef<HTMLButtonElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const inboxSearchRef = useRef<HTMLInputElement | null>(null);
   const createMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
   const newBotOpenerRef = useRef<HTMLButtonElement | null>(null);
   const newBotDestinationRef = useRef<HTMLButtonElement | null>(null);
@@ -301,17 +340,81 @@ export function Messenger() {
   const botSettingsOpenerRef = useRef<HTMLButtonElement | null>(null);
   const activeIdRef = useRef<string | null>(null);
   const activeGroupIdRef = useRef<string | null>(null);
+  const draftRevisionsRef = useRef<Record<string, number>>({});
+  const previousInboxRowsRef = useRef<ChatInboxRow[] | null>(null);
+  const inboxMutationGenerationRef = useRef(0);
+  const botSnapshotSequenceRef = useRef(0);
+  const botSnapshotAppliedRef = useRef(new Map<string, number>());
+  const latestBotSnapshotsRef = useRef(new Map<string, Bot>());
+  const createdBotSequencesRef = useRef(new Map<string, number>());
+  const botMutationCountsRef = useRef(new Map<string, number>());
+  const channelSnapshotSequenceRef = useRef(0);
+  const channelSnapshotAppliedRef = useRef(new Map<string, number>());
+  const latestChannelSnapshotsRef = useRef(new Map<string, Channel>());
+  const channelListAppliedSequenceRef = useRef(0);
   const botSettingsNavigationRef = useRef(0);
   const previousGlobalRouteRef = useRef(globalRoute);
-  const [botSettingsOpen, setBotSettingsOpen] = useState(false);
-  const [botSettingsSection, setBotSettingsSection] = useState<BotSettingsSection>("ai");
+  const appSettingsOpenRef = useRef(appSettingsOpen);
+  const newBotOpenRef = useRef(newBotOpen);
+  const botSettingsOpenRef = useRef(botSettingsOpen);
+  const globalRouteRef = useRef(globalRoute);
+  const mobileSurfaceRef = useRef(mobileSurface);
   const { preferences, updateComputerPane } = useUiPreferences();
   const computerOpen = computerPaneIsOpen(preferences, activeId);
   const visibleComputerOpen = computerVisibleDuringPluginsReturn({
     computerOpen,
     returnTarget: pluginsReturnTargetRef.current,
   });
+  const visibleComputerOpenRef = useRef(visibleComputerOpen);
+  globalRouteRef.current = globalRoute;
+  mobileSurfaceRef.current = mobileSurface;
+  visibleComputerOpenRef.current = visibleComputerOpen;
+  const blockingChatSurfaceOpen = appSettingsOpen || botSettingsOpen || newBotOpen;
   const composerKind = activeGroup ? "group" : active?.messages !== undefined ? "direct" : null;
+  const activeDraftKey = activeGroup
+    ? channelDraftKey(activeGroup.id)
+    : activeId
+      ? botDraftKey(activeId)
+      : null;
+  const draft = activeDraftKey ? drafts[activeDraftKey] ?? "" : "";
+
+  function setAppSettingsOpen(next: boolean) {
+    appSettingsOpenRef.current = next;
+    setAppSettingsOpenState(next);
+  }
+
+  function setNewBotOpen(next: boolean) {
+    newBotOpenRef.current = next;
+    setNewBotOpenState(next);
+  }
+
+  function setBotSettingsOpen(next: boolean) {
+    botSettingsOpenRef.current = next;
+    setBotSettingsOpenState(next);
+  }
+
+  function blockingChatSurfaceIsOpen(): boolean {
+    return appSettingsOpenRef.current || newBotOpenRef.current || botSettingsOpenRef.current;
+  }
+
+  function storeDraft(key: string, text: string): number {
+    const revision = (draftRevisionsRef.current[key] ?? 0) + 1;
+    draftRevisionsRef.current[key] = revision;
+    setDrafts((current) => {
+      const next = setChatDraft(current, key, text);
+      try {
+        writeChatDrafts(window.localStorage, next);
+      } catch {
+        // The in-memory draft still works when browser storage is unavailable.
+      }
+      return next;
+    });
+    return revision;
+  }
+
+  function setDraft(text: string) {
+    if (activeDraftKey) storeDraft(activeDraftKey, text);
+  }
 
   function activateBot(bot: Bot) {
     activeIdRef.current = bot.id;
@@ -322,35 +425,192 @@ export function Messenger() {
     setActiveGroup(null);
   }
 
-  function mergeBot(bot: Bot) {
-    setBots((rows) => rows.map((row) => (row.id === bot.id ? { ...row, ...bot } : row)));
-    if (activeIdRef.current === bot.id) {
-      setActive(bot);
-      if (bot.messages !== undefined) setActiveDetailErrorId(null);
+  function nextBotSnapshotSequence(): number {
+    botSnapshotSequenceRef.current += 1;
+    return botSnapshotSequenceRef.current;
+  }
+
+  function rememberBotSnapshot(bot: Bot): Bot {
+    const current = latestBotSnapshotsRef.current.get(bot.id);
+    const remembered = current ? mergeInboxSnapshots([current], [bot])[0] ?? bot : bot;
+    latestBotSnapshotsRef.current.set(bot.id, remembered);
+    return remembered;
+  }
+
+  function botMutationPending(botId: string): boolean {
+    return (botMutationCountsRef.current.get(botId) ?? 0) > 0;
+  }
+
+  function mergeBot(
+    bot: Bot,
+    snapshotSequence: number,
+    invalidateInbox = false,
+    ownedMutation = false,
+  ): Bot | null {
+    if (!ownedMutation && botMutationPending(bot.id)) return null;
+    const accepted = acceptOrderedSnapshots(botSnapshotAppliedRef.current, [bot], snapshotSequence)[0];
+    if (!accepted) return null;
+    const remembered = rememberBotSnapshot(accepted);
+    if (invalidateInbox) inboxMutationGenerationRef.current += 1;
+    setBots((rows) => rows.map((row) => (
+      row.id === remembered.id ? mergeInboxSnapshots([row], [remembered])[0] ?? remembered : row
+    )));
+    if (activeIdRef.current === remembered.id) {
+      setActive((current) => current
+        ? mergeInboxSnapshots([current], [remembered])[0] ?? remembered
+        : remembered);
+      if (remembered.messages !== undefined) setActiveDetailErrorId(null);
     }
+    return remembered;
+  }
+
+  function mergeBotSummaries(next: Bot[], snapshotSequence: number): Bot[] {
+    const eligible = next.filter((bot) => !botMutationPending(bot.id));
+    const accepted = acceptOrderedSnapshots(botSnapshotAppliedRef.current, eligible, snapshotSequence)
+      .map(rememberBotSnapshot);
+    const resolved = resolveSnapshotMembership(eligible, accepted, latestBotSnapshotsRef.current);
+    setBots((current) => mergeInboxSnapshots(current, resolved));
+    setActive((current) => {
+      if (!current) return current;
+      const summary = resolved.find((bot) => bot.id === current.id);
+      if (!summary) return current;
+      const merged = mergeInboxSnapshots([current], [summary])[0] ?? current;
+      return { ...merged, messages: current.messages };
+    });
+    return resolved;
+  }
+
+  async function performBotMutation(botId: string, request: () => Promise<Bot>): Promise<Bot> {
+    botMutationCountsRef.current.set(botId, (botMutationCountsRef.current.get(botId) ?? 0) + 1);
+    inboxMutationGenerationRef.current += 1;
+    try {
+      const { snapshot, sequence } = await reserveSnapshotRequest(nextBotSnapshotSequence, request);
+      return mergeBot(snapshot, sequence, true, true)
+        ?? latestBotSnapshotsRef.current.get(botId)
+        ?? snapshot;
+    } finally {
+      const remaining = (botMutationCountsRef.current.get(botId) ?? 1) - 1;
+      if (remaining > 0) botMutationCountsRef.current.set(botId, remaining);
+      else botMutationCountsRef.current.delete(botId);
+    }
+  }
+
+  function nextChannelSnapshotSequence(): number {
+    channelSnapshotSequenceRef.current += 1;
+    return channelSnapshotSequenceRef.current;
+  }
+
+  function rememberChannelSnapshot(channel: Channel): Channel {
+    const current = latestChannelSnapshotsRef.current.get(channel.id);
+    const remembered = current ? mergeInboxSnapshots([current], [channel])[0] ?? channel : channel;
+    latestChannelSnapshotsRef.current.set(channel.id, remembered);
+    return remembered;
+  }
+
+  function mergeChannel(channel: Channel, snapshotSequence: number): Channel | null {
+    const accepted = acceptOrderedSnapshots(channelSnapshotAppliedRef.current, [channel], snapshotSequence)[0];
+    if (!accepted) return null;
+    const remembered = rememberChannelSnapshot(accepted);
+    setChannels((current) => current.map((row) => (
+      row.id === remembered.id ? mergeInboxSnapshots([row], [remembered])[0] ?? remembered : row
+    )));
+    if (activeGroupIdRef.current === remembered.id) {
+      setActiveGroup((current) => current
+        ? mergeInboxSnapshots([current], [remembered])[0] ?? remembered
+        : remembered);
+    }
+    return remembered;
+  }
+
+  function mergeChannelSummaries(next: Channel[], snapshotSequence: number): Channel[] | null {
+    if (!listSnapshotIsCurrent(channelListAppliedSequenceRef.current, snapshotSequence)) return null;
+    channelListAppliedSequenceRef.current = snapshotSequence;
+    const accepted = acceptOrderedSnapshots(channelSnapshotAppliedRef.current, next, snapshotSequence)
+      .map(rememberChannelSnapshot);
+    const resolved = resolveSnapshotMembership(next, accepted, latestChannelSnapshotsRef.current);
+    setChannels((current) => mergeInboxSnapshots(current, resolved));
+    setActiveGroup((current) => {
+      if (!current) return current;
+      const summary = resolved.find((channel) => channel.id === current.id);
+      return summary ? mergeInboxSnapshots([current], [summary])[0] ?? current : current;
+    });
+    setChannelsState("ready");
+    return resolved;
+  }
+
+  function failChannelList(snapshotSequence: number) {
+    if (!listSnapshotIsCurrent(channelListAppliedSequenceRef.current, snapshotSequence)) return;
+    channelListAppliedSequenceRef.current = snapshotSequence;
+    setChannelsState("error");
+  }
+
+  function applyBotActivity(botId: string, activity: Bot["activity"]) {
+    inboxMutationGenerationRef.current += 1;
+    const remembered = latestBotSnapshotsRef.current.get(botId);
+    if (remembered) {
+      latestBotSnapshotsRef.current.set(botId, {
+        ...remembered,
+        activity: observedActivityAfterRead(remembered.activity, activity),
+      });
+    }
+    setBots((current) => current.map((bot) => (bot.id === botId
+      ? { ...bot, activity: observedActivityAfterRead(bot.activity, activity) }
+      : bot)));
+    setActive((current) => (current?.id === botId
+      ? { ...current, activity: observedActivityAfterRead(current.activity, activity) }
+      : current));
+  }
+
+  function chatIsVisible(): boolean {
+    return chatSurfaceIsVisible({
+      route: globalRouteRef.current,
+      desktop: window.matchMedia("(min-width: 48rem)").matches,
+      mobileSurface: mobileSurfaceRef.current,
+      computerVisible: visibleComputerOpenRef.current,
+      documentVisible: document.visibilityState === "visible",
+      blockingDialog: blockingChatSurfaceIsOpen(),
+    });
+  }
+
+  function maybeMarkBotRead(bot: Bot, openingBlockingDialog = false) {
+    if (!canAcknowledgeChatRead({
+      hasTranscript: bot.messages !== undefined,
+      unread: bot.activity.unread,
+      surfaceVisible: chatIsVisible(),
+      active: activeIdRef.current === bot.id,
+      blockingDialog: blockingChatSurfaceIsOpen(),
+      openingBlockingDialog,
+    })) return;
+    void markBotRead(bot.id, bot.activity.cursor)
+      .then((activity) => applyBotActivity(bot.id, activity))
+      .catch(() => undefined);
   }
 
   useEffect(() => {
     let cancelled = false;
     const navigation = ++botSettingsNavigationRef.current;
+    const listSequence = nextBotSnapshotSequence();
+    const channelListSequence = nextChannelSnapshotSequence();
     void listBots()
       .then((data) => {
         if (cancelled) return;
-        setBots(data.bots);
+        const acceptedBots = mergeBotSummaries(data.bots, listSequence);
         setBotsLoadError(false);
         setBotsReady(true);
         const requestedSettings = parseBotSettingsHash(window.location.hash);
-        const requestedBot = data.bots.find((bot) => bot.id === requestedSettings?.botId);
+        const requestedBot = acceptedBots.find((bot) => bot.id === requestedSettings?.botId);
         if ((requestedSettings && !requestedBot) || (!requestedSettings && botSettingsLocationCandidate(window.location.hash))) {
           clearBotSettingsLocation();
         }
-        const selected = requestedBot ?? data.bots[0];
+        const selected = requestedBot ?? acceptedBots[0];
         if (!selected) return;
         activateBot(selected);
+        const detailSequence = nextBotSnapshotSequence();
         void getBot(selected.id)
           .then((bot) => {
             if (cancelled) return;
-            mergeBot(bot);
+            const merged = mergeBot(bot, detailSequence);
+            if (merged) maybeMarkBotRead(merged, requestedSettings?.botId === bot.id);
             if (navigation !== botSettingsNavigationRef.current) return;
             if (requestedSettings?.botId === bot.id) {
               setBotSettingsSection(requestedSettings.section);
@@ -374,11 +634,10 @@ export function Messenger() {
     void listChannels()
       .then((data) => {
         if (cancelled) return;
-        setChannels(data.channels);
-        setChannelsState("ready");
+        mergeChannelSummaries(data.channels, channelListSequence);
       })
       .catch(() => {
-        if (!cancelled) setChannelsState("error");
+        if (!cancelled) failChannelList(channelListSequence);
       });
     void listHarnesses()
       .then((data) => {
@@ -393,6 +652,41 @@ export function Messenger() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setInboxNow(new Date()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!botsReady) return;
+    let cancelled = false;
+    let inFlight = false;
+    const refresh = () => {
+      if (inFlight) return;
+      inFlight = true;
+      const mutationGeneration = inboxMutationGenerationRef.current;
+      const botSnapshotSequence = nextBotSnapshotSequence();
+      const channelSnapshotSequence = nextChannelSnapshotSequence();
+      void listInbox()
+        .then((data) => {
+          if (cancelled) return;
+          if (mutationGeneration === inboxMutationGenerationRef.current) {
+            mergeBotSummaries(data.bots, botSnapshotSequence);
+          }
+          mergeChannelSummaries(data.channels, channelSnapshotSequence);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          inFlight = false;
+        });
+    };
+    const timer = window.setInterval(refresh, 1_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [botsReady]);
 
   useEffect(() => {
     let cancelled = false;
@@ -411,10 +705,13 @@ export function Messenger() {
         return;
       }
       setBotSettingsOpen(false);
+      const snapshotSequence = nextBotSnapshotSequence();
       void getBot(requested.botId)
         .then((bot) => {
           if (cancelled || navigation !== botSettingsNavigationRef.current) return;
-          activateBot(bot);
+          const selected = mergeBot(bot, snapshotSequence) ?? latestBotSnapshotsRef.current.get(bot.id);
+          if (!selected) return;
+          activateBot(selected);
           setBotSettingsSection(requested.section);
           setMobileSurface("chat");
           setBotSettingsOpen(true);
@@ -441,6 +738,7 @@ export function Messenger() {
   useEffect(() => {
     const syncGlobalRoute = () => {
       const next = globalRouteFromHash(window.location.hash);
+      setAppSettingsOpen(appearanceSettingsRequested(window.location.hash));
       if (
         previousGlobalRouteRef.current === "plugins" &&
         next === "chat" &&
@@ -526,27 +824,59 @@ export function Messenger() {
   useEffect(() => {
     if (!activeId) return;
     let cancelled = false;
-    const tick = window.setInterval(() => {
+    let inFlight = false;
+    const tick = () => {
+      if (inFlight || botMutationPending(activeId)) return;
+      inFlight = true;
+      const snapshotSequence = nextBotSnapshotSequence();
       void getBot(activeId)
         .then((bot) => {
-          if (!cancelled) mergeBot(bot);
+          const merged = cancelled ? null : mergeBot(bot, snapshotSequence);
+          if (merged) {
+            maybeMarkBotRead(merged);
+          }
         })
-        .catch(() => undefined);
-    }, 600);
+        .catch(() => undefined)
+        .finally(() => {
+          inFlight = false;
+        });
+    };
+    const timer = window.setInterval(tick, 600);
     return () => {
       cancelled = true;
-      window.clearInterval(tick);
+      window.clearInterval(timer);
     };
-  }, [activeId]);
+  }, [activeId, blockingChatSurfaceOpen, globalRoute, mobileSurface, visibleComputerOpen]);
+
+  useEffect(() => {
+    if (active) maybeMarkBotRead(active);
+  }, [active?.activity.unread, blockingChatSurfaceOpen, globalRoute, mobileSurface, visibleComputerOpen]);
+
+  async function createOrderedBot(name: string): Promise<Bot> {
+    const { snapshot, sequence } = await reserveSnapshotRequest(
+      nextBotSnapshotSequence,
+      () => createBot(name),
+    );
+    createdBotSequencesRef.current.set(snapshot.id, sequence);
+    return snapshot;
+  }
 
   function openCreatedBot(bot: Bot) {
+    inboxMutationGenerationRef.current += 1;
+    const snapshotSequence = createdBotSequencesRef.current.get(bot.id) ?? nextBotSnapshotSequence();
+    createdBotSequencesRef.current.delete(bot.id);
+    const accepted = acceptOrderedSnapshots(botSnapshotAppliedRef.current, [bot], snapshotSequence)[0];
+    const remembered = accepted
+      ? rememberBotSnapshot(accepted)
+      : latestBotSnapshotsRef.current.get(bot.id);
+    if (!remembered) return;
     botSettingsNavigationRef.current += 1;
     setBotSettingsOpen(false);
     if (parseBotSettingsHash(window.location.hash)) clearBotSettingsLocation();
     setError(null);
-    setBots((rows) => [...rows.filter((row) => row.id !== bot.id), bot]);
+    setBots((rows) => [...rows.filter((row) => row.id !== remembered.id), remembered]);
     setBotsReady(true);
-    activateBot(bot);
+    activateBot(remembered);
     setMobileSurface("chat");
   }
 
@@ -592,8 +922,9 @@ export function Messenger() {
     const botId = activeIdRef.current;
     if (!botId) return;
     setActiveDetailErrorId(null);
+    const snapshotSequence = nextBotSnapshotSequence();
     void getBot(botId)
-      .then((detail) => mergeBot(detail))
+      .then((detail) => mergeBot(detail, snapshotSequence))
       .catch(() => {
         if (activeIdRef.current === botId) setActiveDetailErrorId(botId);
       });
@@ -601,12 +932,12 @@ export function Messenger() {
 
   function retryChannels() {
     setChannelsState("loading");
+    const snapshotSequence = nextChannelSnapshotSequence();
     void listChannels()
       .then((data) => {
-        setChannels(data.channels);
-        setChannelsState("ready");
+        mergeChannelSummaries(data.channels, snapshotSequence);
       })
-      .catch(() => setChannelsState("error"));
+      .catch(() => failChannelList(snapshotSequence));
   }
 
   function retryHarnesses() {
@@ -635,18 +966,21 @@ export function Messenger() {
       return;
     }
     const botId = activeId;
-    const text = draft.trim();
+    const submittedDraft = draft;
+    const text = submittedDraft.trim();
     const targetId = replyTo?.id;
-    setDraft("");
+    const draftKey = botDraftKey(botId);
+    const clearedRevision = storeDraft(draftKey, "");
     setBusy(true);
     setError(null);
     try {
-      const bot = await sendMessage(botId, text, targetId);
-      mergeBot(bot);
+      await performBotMutation(botId, () => sendMessage(botId, text, targetId));
       if (activeIdRef.current === botId) setReplyTo(null);
     } catch (err) {
+      if (shouldRestoreFailedDraft(draftRevisionsRef.current[draftKey] ?? 0, clearedRevision)) {
+        storeDraft(draftKey, submittedDraft);
+      }
       if (activeIdRef.current === botId) {
-        setDraft(text);
         const message = err instanceof Error ? err.message : "Could not send.";
         if (!isCancelledMessage(message)) setError(message);
       }
@@ -660,8 +994,7 @@ export function Messenger() {
     const botId = activeId;
     setBusy(true);
     try {
-      const bot = await answerPermission(botId, optionId);
-      mergeBot(bot);
+      await performBotMutation(botId, () => answerPermission(botId, optionId));
     } finally {
       setBusy(false);
     }
@@ -672,8 +1005,7 @@ export function Messenger() {
     const botId = activeId;
     setBusy(true);
     try {
-      const bot = await answerHostGrant(botId, access, duration);
-      mergeBot(bot);
+      await performBotMutation(botId, () => answerHostGrant(botId, access, duration));
     } finally {
       setBusy(false);
     }
@@ -683,8 +1015,7 @@ export function Messenger() {
     if (!activeId) return;
     const botId = activeId;
     try {
-      const bot = await toggleReaction(botId, messageId, emoji);
-      mergeBot(bot);
+      await performBotMutation(botId, () => toggleReaction(botId, messageId, emoji));
       if (activeIdRef.current === botId) setReactingId(null);
     } catch (err) {
       if (activeIdRef.current === botId) {
@@ -817,11 +1148,28 @@ export function Messenger() {
     : null;
   const visible = messages.filter((message) => message.text.length > 0);
   const writing = isWorkingMode(active?.eyes.mode);
-  const sidebarMode = (bot: Bot): FaceMode =>
-    isWorkingMode(bot.eyes.mode) ? "idle" : (bot.eyes.mode as FaceMode);
+  const inboxRows = buildChatInbox({ bots, channels, drafts });
+  const filteredInboxRows = filterChatInbox(inboxRows, inboxQuery);
+  const inboxRowsSignature = inboxRows
+    .map((row) => `${row.key}\u0000${row.signal ?? ""}\u0000${row.activityAt}\u0000${row.preview}`)
+    .join("\u0001");
+  useEffect(() => {
+    const announcement = inboxAnnouncement(previousInboxRowsRef.current, inboxRows);
+    previousInboxRowsRef.current = inboxRows;
+    if (announcement) {
+      setInboxLive((current) => ({ serial: current.serial + 1, text: announcement }));
+    }
+  }, [inboxRowsSignature]);
+  const inboxBots = new Map(bots.map((bot) => [bot.id, bot]));
+  const inboxChannels = new Map(channels.map((channel) => [channel.id, channel]));
 
   function focusOnNextFrame(ref: { current: HTMLElement | null }) {
     window.requestAnimationFrame(() => ref.current?.focus());
+  }
+
+  function clearInboxSearch() {
+    setInboxQuery("");
+    focusOnNextFrame(inboxSearchRef);
   }
 
   function openChats() {
@@ -840,8 +1188,12 @@ export function Messenger() {
     if (parseBotSettingsHash(window.location.hash)) clearBotSettingsLocation();
     activateBot(bot);
     setMobileSurface("chat");
+    const snapshotSequence = nextBotSnapshotSequence();
     void getBot(bot.id)
-      .then((detail) => mergeBot(detail))
+      .then((detail) => {
+        const merged = mergeBot(detail, snapshotSequence);
+        if (merged) maybeMarkBotRead(merged);
+      })
       .catch(() => {
         if (activeIdRef.current === bot.id) setActiveDetailErrorId(bot.id);
       });
@@ -857,9 +1209,10 @@ export function Messenger() {
     setActive(null);
     setActiveGroup(channel);
     setMobileSurface("chat");
+    const snapshotSequence = nextChannelSnapshotSequence();
     void getChannel(channel.id)
       .then((detail) => {
-        if (activeGroupIdRef.current === channel.id) setActiveGroup(detail);
+        mergeChannel(detail, snapshotSequence);
       })
       .catch(() => undefined);
   }
@@ -895,8 +1248,8 @@ export function Messenger() {
     );
   }
 
-  function applyBotUpdate(bot: Bot) {
-    mergeBot(bot);
+  async function applyBotMutation(botId: string, request: () => Promise<Bot>): Promise<Bot> {
+    return performBotMutation(botId, request);
   }
 
   function openComputer() {
@@ -952,6 +1305,9 @@ export function Messenger() {
 
   return (
     <>
+      <p className="sr-only" aria-live="polite" aria-atomic="true">
+        <span key={inboxLive.serial}>{inboxLive.text}</span>
+      </p>
       <MessengerShell
         mobileSurface={mobileSurface}
         chatRef={chatRegionRef}
@@ -962,10 +1318,7 @@ export function Messenger() {
               <Eyes size={32} className="aspect-square shrink-0" />
               <div className="min-w-0">
                 <p className="truncate text-sm font-semibold">OpenBot</p>
-                <p className="flex items-center gap-1 text-xs text-muted-foreground">
-                  <Monitor className="size-3" />
-                  This Computer
-                </p>
+                <p className="text-xs text-muted-foreground">Chats</p>
               </div>
             </div>
             <div className="flex items-center gap-1">
@@ -1012,6 +1365,44 @@ export function Messenger() {
               </Tooltip>
             </div>
           </div>
+          <div className="px-3 pb-3">
+            <div className="relative">
+              <Search
+                aria-hidden
+                className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+              />
+              <Input
+                ref={inboxSearchRef}
+                type="text"
+                value={inboxQuery}
+                onChange={(event) => setInboxQuery(event.target.value)}
+                aria-label="Search Chats"
+                aria-describedby="chat-search-scope"
+                placeholder="Search Chats"
+                className="h-[var(--touch-min)] rounded-[var(--radius-control)] bg-background/75 pl-9 pr-10"
+              />
+              {inboxQuery ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      aria-label="Clear Chat search"
+                      onClick={clearInboxSearch}
+                      className="absolute right-0 top-1/2 min-h-[var(--touch-min)] min-w-[var(--touch-min)] -translate-y-1/2 rounded-[var(--radius-control)] text-muted-foreground hover:text-foreground"
+                    >
+                      <X className="size-[var(--icon-default)]" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Clear Chat search</TooltipContent>
+                </Tooltip>
+              ) : null}
+            </div>
+            <span id="chat-search-scope" className="sr-only">
+              Filters current Chats by visible name and latest preview.
+            </span>
+          </div>
           <Separator />
         <div className="flex-1 overflow-y-auto px-3 py-3">
           {channelsState === "loading" ? (
@@ -1032,52 +1423,119 @@ export function Messenger() {
               </Button>
             </div>
           ) : null}
-          <ul className="space-y-1">
-              {bots.map((bot) => (
-                <li key={bot.id}>
-                  <button
-                    type="button"
-                    onClick={() => openBot(bot)}
-                    className={cn(
-                      "flex w-full items-center gap-2 rounded-2xl px-3 py-2 text-left text-sm hover:bg-sidebar-accent",
-                      activeId === bot.id && !activeGroup && "bg-sidebar-accent",
-                    )}
-                  >
-                    <Eyes
-                      name={bot.name}
-                      color={bot.eyes.color}
-                      shape={bot.eyes.shape as FaceShape}
-                      mode={sidebarMode(bot)}
-                      size={28}
-                      className="aspect-square shrink-0"
-                    />
-                    {bot.name}
-                  </button>
-                </li>
-              ))}
-              {sidebarGroups(channels).map((channel) => (
-                <li key={channel.id}>
-                  <button
-                    type="button"
-                    data-testid="group-channel-row"
-                    onClick={() => openGroup(channel)}
-                    className={cn(
-                      "flex w-full items-center gap-2 rounded-2xl px-3 py-2 text-left text-sm hover:bg-sidebar-accent",
-                      activeGroup?.id === channel.id && "bg-sidebar-accent",
-                    )}
-                  >
-                    <StackedEyes
-                      faces={botMembers(channel).map((member) => ({
-                        name: member.name,
-                        color: member.eyes?.color,
-                        shape: member.eyes?.shape,
-                      }))}
-                    />
-                    <span className="truncate">{groupDisplayTitle(channel)}</span>
-                  </button>
-                </li>
-              ))}
-          </ul>
+          {filteredInboxRows.length === 0 ? (
+            <div className="px-3 py-8 text-center text-sm text-muted-foreground" role="status">
+              <p>{inboxQuery.trim() ? "No Chats match this search." : "No Chats yet."}</p>
+              {inboxQuery.trim() ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={clearInboxSearch}
+                  className="min-h-[var(--touch-min)] min-w-[var(--touch-min)]"
+                >
+                  Clear search
+                </Button>
+              ) : null}
+            </div>
+          ) : (
+            <ul className="space-y-1" aria-label="Chats">
+              {filteredInboxRows.map((row: ChatInboxRow) => {
+                const bot = row.kind === "bot" ? inboxBots.get(row.id) : undefined;
+                const channel = row.kind === "group" ? inboxChannels.get(row.id) : undefined;
+                if ((!bot && row.kind === "bot") || (!channel && row.kind === "group")) return null;
+                const selected = row.kind === "bot"
+                  ? activeId === row.id && !activeGroup
+                  : activeGroup?.id === row.id;
+                const relativeTime = formatRelativeActivityTime(row.activityAt, inboxNow);
+                const signalLabel = row.signal === "waiting"
+                  ? "Waiting for you"
+                  : row.signal === "unread"
+                    ? "Unread"
+                    : row.signal === "working"
+                      ? "Working"
+                      : null;
+                const ordinaryPreview = row.draftPreview ?? (row.preview || "No messages yet");
+                const accessiblePreview = signalLabel
+                  ? `${signalLabel}${row.preview ? `, ${row.preview}` : ""}`
+                  : row.draftPreview
+                    ? `Draft, ${row.draftPreview}`
+                    : ordinaryPreview;
+                return (
+                  <li key={row.key}>
+                    <button
+                      type="button"
+                      data-testid={row.kind === "group" ? "group-channel-row" : "chat-inbox-row"}
+                      data-inbox-signal={row.signal ?? "ordinary"}
+                      aria-current={selected ? "page" : undefined}
+                      aria-label={`${row.name}, ${accessiblePreview}, ${relativeTime}`}
+                      onClick={() => (bot ? openBot(bot) : channel ? openGroup(channel) : undefined)}
+                      className={cn(
+                        "flex h-[4.5rem] w-full items-center gap-3 rounded-[var(--radius-control)] px-3 text-left hover:bg-sidebar-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                        selected && "bg-sidebar-accent",
+                      )}
+                    >
+                      {bot ? (
+                        <Eyes
+                          name={bot.name}
+                          color={bot.eyes.color}
+                          shape={bot.eyes.shape as FaceShape}
+                          mode={inboxEyesMode(row.signal, bot.eyes.mode as FaceMode)}
+                          size={32}
+                          className="aspect-square shrink-0"
+                        />
+                      ) : channel ? (
+                        <StackedEyes
+                          faces={botMembers(channel).map((member) => ({
+                            name: member.name,
+                            color: member.eyes?.color,
+                            shape: member.eyes?.shape,
+                          }))}
+                          size={30}
+                        />
+                      ) : null}
+                      <span className="min-w-0 flex-1">
+                        <span className="flex items-baseline gap-2">
+                          <span className={cn("min-w-0 flex-1 truncate text-sm", row.signal === "unread" && "font-semibold")}>
+                            {row.name}
+                          </span>
+                          <time
+                            dateTime={row.activityAt}
+                            title={new Date(row.activityAt).toLocaleString()}
+                            className="shrink-0 text-[11px] text-muted-foreground"
+                          >
+                            {relativeTime}
+                          </time>
+                        </span>
+                        <span className="mt-0.5 flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+                          {signalLabel ? (
+                            <span
+                              className={cn(
+                                "shrink-0 font-medium",
+                                row.signal === "waiting" && "text-warning",
+                                row.signal === "unread" && "text-info",
+                                row.signal === "working" && "text-foreground",
+                              )}
+                            >
+                              {signalLabel}
+                            </span>
+                          ) : row.draftPreview ? (
+                            <span className="shrink-0 font-medium text-destructive">Draft</span>
+                          ) : null}
+                          {(signalLabel && row.preview) || row.draftPreview ? (
+                            <span aria-hidden className="shrink-0">·</span>
+                          ) : null}
+                          <span className="min-w-0 flex-1 truncate">
+                            {signalLabel ? row.preview : ordinaryPreview}
+                          </span>
+                        </span>
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
         </div>
         <div className="grid gap-1 border-t border-sidebar-border p-3">
           <Button
@@ -1090,7 +1548,7 @@ export function Messenger() {
             <Plug />
             Plugins
           </Button>
-          <AppSettings />
+          <AppSettings open={appSettingsOpen} onOpenChange={setAppSettingsOpen} />
         </div>
         </>
       }
@@ -1420,7 +1878,7 @@ export function Messenger() {
         onOpenChange={setNewBotOpen}
         openerRef={newBotOpenerRef}
         destinationRef={newBotDestinationRef}
-        onCreate={createBot}
+        onCreate={createOrderedBot}
         onCreated={openCreatedBot}
       />
       {active && !activeGroup ? (
@@ -1433,7 +1891,7 @@ export function Messenger() {
           onOpenChange={setBotSettingsOpenFromDialog}
           openerRef={botSettingsOpenerRef}
           fallbackFocusRef={newBotDestinationRef}
-          onBotChange={applyBotUpdate}
+          onBotMutation={applyBotMutation}
           onRetryHarnesses={retryHarnesses}
           onOpenComputer={openComputer}
           section={botSettingsSection}

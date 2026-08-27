@@ -13,6 +13,12 @@ export type Channel = {
   title: string | null;
   createdAt: string;
   members: ChannelMember[];
+  activity: {
+    latestText: string | null;
+    lastActivityAt: string;
+    unread: boolean;
+    cursor: { sequence: number; revision: number };
+  };
 };
 
 export function isSidebarChannel(kind: ChannelKind): boolean {

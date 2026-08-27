@@ -36,6 +36,12 @@ export type Bot = {
     hostGrant?: { path: string; requested?: "read" | "read-write" };
   } | null;
   needsYou: { reason: "login"; hint: string } | null;
+  activity: {
+    latestText: string | null;
+    lastActivityAt: string;
+    unread: boolean;
+    cursor: { sequence: number; revision: number };
+  };
   messages?: Array<{
     id: string;
     role: "user" | "assistant";
@@ -49,6 +55,7 @@ export type Bot = {
 };
 
 export type BotList = { bots: Bot[] };
+export type InboxSnapshot = BotList & { channels: Channel[] };
 
 export type { Channel, ChannelKind, ChannelMember } from "./channels";
 
@@ -90,6 +97,12 @@ export async function listBots(): Promise<BotList> {
   return (await res.json()) as BotList;
 }
 
+export async function listInbox(): Promise<InboxSnapshot> {
+  const res = await fetch("/api/inbox", { credentials: "same-origin" });
+  if (!res.ok) throw new Error("session expired");
+  return (await res.json()) as InboxSnapshot;
+}
+
 export async function createBot(name: string): Promise<Bot> {
   const res = await fetch("/api/bots", {
     method: "POST",
@@ -109,6 +122,33 @@ export async function getBot(id: string): Promise<Bot> {
     throw new Error("Bot not found");
   }
   return (await res.json()) as Bot;
+}
+
+export async function markBotRead(id: string, cursor: Bot["activity"]["cursor"]): Promise<Bot["activity"]> {
+  const res = await fetch(`/api/bots/${encodeURIComponent(id)}/read`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ cursor }),
+  });
+  if (!res.ok) throw new Error("Could not mark Chat read.");
+  const body = (await res.json()) as { activity: Bot["activity"] };
+  return body.activity;
+}
+
+export async function markChannelRead(
+  id: string,
+  cursor: Channel["activity"]["cursor"],
+): Promise<Channel["activity"]> {
+  const res = await fetch(`/api/channels/${encodeURIComponent(id)}/read`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ cursor }),
+  });
+  if (!res.ok) throw new Error("Could not mark Chat read.");
+  const body = (await res.json()) as { activity: Channel["activity"] };
+  return body.activity;
 }
 
 export type Harness = { id: string; name: string; bin: string; talk: boolean };

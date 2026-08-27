@@ -104,10 +104,10 @@ describe("PWA group sidebar helpers", () => {
     const stacked = readFileSync(join(ROOT, "pwa/src/components/StackedEyes.tsx"), "utf8");
     const channels = readFileSync(join(ROOT, "pwa/src/lib/channels.ts"), "utf8");
     assert.match(stacked, /data-testid=["']stacked-eyes["']/);
-    assert.match(messenger, /data-testid=["']group-channel-row["']/);
+    assert.match(messenger, /group-channel-row/);
     assert.match(messenger, /data-testid=["']group-members["']/);
     assert.match(messenger, /StackedEyes/);
-    assert.match(messenger, /sidebarGroups/);
+    assert.match(messenger, /buildChatInbox/);
     assert.match(channels, /bot-to-bot/);
     assert.match(channels, /kind === "group"/);
     assert.match(messenger, /composerSendEnabled/);

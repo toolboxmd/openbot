@@ -5,7 +5,7 @@ import http from "node:http";
 import https from "node:https";
 import path from "node:path";
 import { BotStore, type BotStoreDeps } from "./bots.ts";
-import { defaultHomeDir, defaultWorkspaceDir } from "./home.ts";
+import { defaultHomeDir, defaultWorkspaceDir, type ChannelCursor } from "./home.ts";
 import { NoopComputerRuntime, type ComputerRuntime } from "./computer.ts";
 import { kasmUpdateWrite } from "./kasm.ts";
 
@@ -93,6 +93,17 @@ function readBody(req: http.IncomingMessage): Promise<string> {
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
+}
+
+function readChannelCursor(value: unknown): ChannelCursor {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { sequence: Number.NaN, revision: Number.NaN };
+  }
+  const cursor = value as Record<string, unknown>;
+  return {
+    sequence: typeof cursor.sequence === "number" ? cursor.sequence : Number.NaN,
+    revision: typeof cursor.revision === "number" ? cursor.revision : Number.NaN,
+  };
 }
 
 function sendJson(
@@ -520,6 +531,15 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         return;
       }
 
+      if (url.pathname === "/api/inbox" && method === "GET") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        sendJson(res, 200, store.inbox());
+        return;
+      }
+
       if (url.pathname === "/api/bots" && method === "POST") {
         if (!hasSession(req, key)) {
           sendJson(res, 401, { error: "unauthenticated" });
@@ -594,6 +614,30 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         return;
       }
 
+      const channelReadMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/read$/);
+      if (channelReadMatch && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        let body: Record<string, unknown> = {};
+        try {
+          const raw = await readBody(req);
+          body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        const cursor = readChannelCursor(body.cursor);
+        try {
+          const activity = store.markChannelRead(decodeURIComponent(channelReadMatch[1]), cursor);
+          sendJson(res, 200, { activity });
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
       const channelMatch = url.pathname.match(/^\/api\/channels\/([^/]+)$/);
       if (channelMatch && method === "GET") {
         if (!hasSession(req, key)) {
@@ -631,6 +675,30 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
             emoji,
           );
           sendJson(res, 200, bot);
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
+      const botReadMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/read$/);
+      if (botReadMatch && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        let body: Record<string, unknown> = {};
+        try {
+          const raw = await readBody(req);
+          body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        const cursor = readChannelCursor(body.cursor);
+        try {
+          const activity = store.markBotRead(decodeURIComponent(botReadMatch[1]), cursor);
+          sendJson(res, 200, { activity });
         } catch (err) {
           sendStoreError(res, err);
         }

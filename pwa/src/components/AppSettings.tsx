@@ -14,6 +14,7 @@ import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Separator } from "@/components/ui/separator";
 import { Toast, ToastDescription, ToastProvider, ToastTitle, ToastViewport } from "@/components/ui/toast";
+import { APPEARANCE_SETTINGS_HASH, appearanceSettingsRequested } from "@/lib/app-settings";
 import type { ThemePreference } from "@/lib/ui-preferences";
 import { cn } from "@/lib/utils";
 
@@ -50,29 +51,37 @@ type Feedback = {
   error: boolean;
 };
 
-const APPEARANCE_SETTINGS_HASH = "#settings/appearance";
-
-function appearanceSettingsRequested() {
-  return window.location.hash === APPEARANCE_SETTINGS_HASH;
-}
-
-export function AppSettings({ className }: { className?: string }) {
+export function AppSettings({
+  className,
+  open: controlledOpen,
+  onOpenChange,
+}: {
+  className?: string;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+}) {
   const { preferences, effectiveTheme, updateTheme } = useUiPreferences();
-  const [open, setOpen] = useState(appearanceSettingsRequested);
+  const [localOpen, setLocalOpen] = useState(() => appearanceSettingsRequested(window.location.hash));
   const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const open = controlledOpen ?? localOpen;
 
   useEffect(() => {
-    const syncWithLocation = () => setOpen(appearanceSettingsRequested());
+    const syncWithLocation = () => {
+      const next = appearanceSettingsRequested(window.location.hash);
+      if (onOpenChange) onOpenChange(next);
+      else setLocalOpen(next);
+    };
     window.addEventListener("hashchange", syncWithLocation);
     window.addEventListener("popstate", syncWithLocation);
     return () => {
       window.removeEventListener("hashchange", syncWithLocation);
       window.removeEventListener("popstate", syncWithLocation);
     };
-  }, []);
+  }, [onOpenChange]);
 
   function setAppSettingsOpen(next: boolean) {
-    setOpen(next);
+    if (onOpenChange) onOpenChange(next);
+    else setLocalOpen(next);
     const suffix = next ? APPEARANCE_SETTINGS_HASH : "";
     window.history.replaceState(
       window.history.state,

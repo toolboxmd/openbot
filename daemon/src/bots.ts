@@ -14,11 +14,14 @@ import {
   HUMAN_MEMBER_ID,
   HomeStore,
   defaultWorkspaceDir,
+  type ChannelActivity,
+  type ChannelCursor,
   type ChannelKind,
   type ChannelMember,
   type MessageReceipt,
   type StoredBot,
   type StoredChannel,
+  type StoredChannelSummary,
   type TranscriptMessage,
 } from "./home.ts";
 import {
@@ -81,6 +84,7 @@ export type PublicBot = {
   display: number | null;
   permission: PublicPermission | null;
   needsYou: { reason: "login"; hint: string } | null;
+  activity: ChannelActivity;
   messages?: PublicMessage[];
 };
 
@@ -95,6 +99,12 @@ export type PublicChannel = {
   title: string | null;
   createdAt: string;
   members: PublicChannelMember[];
+  activity: ChannelActivity;
+};
+
+export type PublicInbox = {
+  bots: PublicBot[];
+  channels: PublicChannel[];
 };
 
 export type AcpSession = {
@@ -200,12 +210,24 @@ export class BotStore {
   }
 
   list(): PublicBot[] {
-    return [...this.bots.values()].map((bot) => this.toPublic(bot, false));
+    return this.publicBotSummaries(this.home.listChannelSummaries());
   }
 
   get(id: string): PublicBot | null {
     const bot = this.bots.get(id);
     return bot ? this.toPublic(bot, true) : null;
+  }
+
+  inbox(): PublicInbox {
+    const summaries = this.home.listChannelSummaries();
+    const storedBots = this.home.listBots();
+    const byId = new Map(storedBots.map((bot) => [bot.id, bot]));
+    return {
+      bots: this.publicBotSummaries(summaries),
+      channels: summaries
+        .filter((channel) => channel.kind !== "bot-to-bot")
+        .map((channel) => this.toPublicChannel(channel, byId)),
+    };
   }
 
   messages(id: string): {
@@ -234,16 +256,34 @@ export class BotStore {
   }
 
   listChannels(): PublicChannel[] {
+    const storedBots = this.home.listBots();
+    const byId = new Map(storedBots.map((bot) => [bot.id, bot]));
     return this.home
-      .listChannels()
+      .listChannelSummaries()
       .filter((channel) => channel.kind !== "bot-to-bot")
-      .map((channel) => this.toPublicChannel(channel));
+      .map((channel) => this.toPublicChannel(channel, byId));
   }
 
   getChannel(id: string): PublicChannel | null {
-    const channel = this.home.getChannel(id);
+    const channel = this.home.getChannelSummary(id);
     if (!channel) return null;
     return this.toPublicChannel(channel);
+  }
+
+  markBotRead(id: string, cursor: ChannelCursor): ChannelActivity {
+    this.require(id);
+    const channelId = this.channelId(id);
+    this.home.markChannelRead(channelId, cursor);
+    return this.home.channelActivity(channelId);
+  }
+
+  markChannelRead(id: string, cursor: ChannelCursor): ChannelActivity {
+    const channel = this.home.getChannelSummary(id);
+    if (!channel || channel.kind === "bot-to-bot") {
+      throw Object.assign(new Error("Channel not found"), { status: 404 });
+    }
+    this.home.markChannelRead(id, cursor);
+    return this.home.channelActivity(id);
   }
 
   async create(name: string): Promise<PublicBot> {
@@ -739,9 +779,10 @@ export class BotStore {
     });
   }
 
-  private toPublicChannel(channel: StoredChannel): PublicChannel {
-    const bots = this.home.listBots();
-    const byId = new Map(bots.map((bot) => [bot.id, bot]));
+  private toPublicChannel(
+    channel: StoredChannel | StoredChannelSummary,
+    byId = new Map(this.home.listBots().map((bot) => [bot.id, bot])),
+  ): PublicChannel {
     return {
       id: channel.id,
       kind: channel.kind,
@@ -762,10 +803,21 @@ export class BotStore {
         }
         return out;
       }),
+      activity: "activity" in channel ? channel.activity : this.home.channelActivity(channel.id),
     };
   }
 
-  private toPublic(bot: Bot, withMessages: boolean): PublicBot {
+  private publicBotSummaries(summaries: StoredChannelSummary[]): PublicBot[] {
+    const activityByBot = new Map<string, ChannelActivity>();
+    for (const channel of summaries) {
+      if (channel.kind !== "direct") continue;
+      const bot = channel.members.find((member) => member.kind === "bot");
+      if (bot) activityByBot.set(bot.id, channel.activity);
+    }
+    return [...this.bots.values()].map((bot) => this.toPublic(bot, false, activityByBot.get(bot.id)));
+  }
+
+  private toPublic(bot: Bot, withMessages: boolean, activity?: ChannelActivity): PublicBot {
     const mode: EyesMode = bot.write ? "write" : bot.eyesMode;
     const out: PublicBot = {
       id: bot.id,
@@ -778,6 +830,7 @@ export class BotStore {
       display: bot.display?.display ?? null,
       permission: publicPermission(bot.permission),
       needsYou: bot.needsYou,
+      activity: activity ?? this.home.channelActivity(this.channelId(bot.id)),
     };
     if (withMessages) out.messages = this.transcript(bot.id);
     return out;
