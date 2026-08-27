@@ -419,8 +419,16 @@ describe("BotStore Isolated cwd and env", () => {
     store.close();
   });
 
-  test("in-jail path auto-allows; out-of-jail becomes a Host grant Card", async () => {
+  test("normal v1 permissions ignore path heuristics in Isolated and Host modes", async () => {
     const homeDir = await tempHome();
+    const preexistingPath = "/tmp/preexisting-openbot-grant.txt";
+    const seeded = new HomeStore(homeDir);
+    seeded.addHostGrant({
+      path: preexistingPath,
+      access: "read-write",
+      duration: "until-revoked",
+    });
+    seeded.close();
     const fake = recordingFake();
     const store = new BotStore(homeDir, {
       listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
@@ -428,117 +436,40 @@ describe("BotStore Isolated cwd and env", () => {
     });
     const ada = await store.create("Ada");
     await store.pickHarness(ada.id, "codex");
-    await store.send(ada.id, "hi");
-    await waitUntil(() => fake.spawned.length > 0);
     const botDir = join(homeDir, "workspace", "bots", ada.id);
-    fake.fire({
-      rpcId: 11,
-      title: "Write file",
-      options: allowDenyOptions,
-      locations: [{ path: join(botDir, "note.txt") }],
-      toolKind: "edit",
-    });
-    assert.deepEqual(fake.answered, ["allow-once"]);
-    assert.equal(store.get(ada.id)?.permission, null);
+    let rpcId = 10;
+    const assertGeneric = async (prompt: Omit<PermissionPrompt, "rpcId" | "options">) => {
+      rpcId += 1;
+      fake.fire({ ...prompt, rpcId, options: allowDenyOptions });
+      await waitUntil(() => store.get(ada.id)?.permission !== null);
+      const permission = store.get(ada.id)?.permission;
+      assert.equal(permission?.hostGrant, undefined);
+      assert.deepEqual(permission?.options.map((option) => option.optionId), ["allow-once", "reject-once"]);
+      await store.answerPermission(ada.id, "reject-once", permission?.cardId ?? "");
+    };
 
-    fake.fire({
-      rpcId: 12,
-      title: "Write file",
-      options: allowDenyOptions,
-      locations: [{ path: "/tmp/outside-ada.txt" }],
-      toolKind: "edit",
-    });
-    const pending = store.get(ada.id)?.permission;
-    assert.ok(pending?.hostGrant);
-    assert.equal(pending?.hostGrant?.path, "/tmp/outside-ada.txt");
-    store.answerHostGrant(ada.id, "read-write", "session", pending?.cardId ?? "");
-    assert.deepEqual(fake.answered, ["allow-once", "allow-once"]);
-    const grants = store.listHostGrants();
-    assert.equal(grants.some((grant) => grant.path === "/tmp/outside-ada.txt"), true);
-
-    const ben = await store.create("Ben");
-    await store.pickHarness(ben.id, "codex");
-    await store.send(ben.id, "hi");
-    await waitUntil(() => fake.spawned.length > 1);
-    fake.fire({
-      rpcId: 13,
-      title: "Write file",
-      options: allowDenyOptions,
-      locations: [{ path: "/tmp/outside-ada.txt" }],
-      toolKind: "edit",
-    });
-    assert.equal(store.get(ben.id)?.permission, null);
-    assert.ok(fake.answered.includes("allow-once"));
-    store.close();
-  });
-
-  test("Isolated docker exec Screen /workspace path auto-allows; Host does not", async () => {
-    const homeDir = await tempHome();
-    const fake = recordingFake();
-    const store = new BotStore(homeDir, {
-      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
-      spawnAcp: fake.spawnAcp,
-    });
-    const ada = await store.create("Ada");
-    await store.pickHarness(ada.id, "codex");
-    await store.send(ada.id, "hi");
-    await waitUntil(() => fake.spawned.length > 0);
-    fake.fire({
-      rpcId: 30,
-      title: "Exec",
-      options: allowDenyOptions,
-      locations: [{ path: "/workspace/bots/$OPENBOT_BOT_ID" }],
-      toolKind: "execute",
-    });
-    assert.deepEqual(fake.answered, ["allow-once"]);
-    assert.equal(store.get(ada.id)?.permission, null);
-
-    await store.setConfigMode(ada.id, "host");
-    await store.send(ada.id, "hi");
-    await waitUntil(() => fake.spawned.length > 1);
-    fake.fire({
-      rpcId: 31,
-      title: "Exec",
-      options: allowDenyOptions,
-      locations: [{ path: "/workspace/secret.txt" }],
-      toolKind: "execute",
-    });
-    const pending = store.get(ada.id)?.permission;
-    assert.ok(pending?.hostGrant);
-    assert.equal(pending?.hostGrant?.path, "/workspace/secret.txt");
-    store.close();
-  });
-
-  test("Deny keeps the jail", async () => {
-    const homeDir = await tempHome();
-    const fake = recordingFake();
-    const store = new BotStore(homeDir, {
-      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
-      spawnAcp: fake.spawnAcp,
-    });
-    const ada = await store.create("Ada");
-    await store.pickHarness(ada.id, "codex");
-    await store.send(ada.id, "hi");
-    await waitUntil(() => fake.spawned.length > 0);
-    fake.fire({
-      rpcId: 20,
-      title: "Write file",
-      options: allowDenyOptions,
-      locations: [{ path: "/tmp/denied.txt" }],
-      toolKind: "edit",
-    });
-    const pending = store.get(ada.id)?.permission;
-    store.answerHostGrant(ada.id, "deny", "session", pending?.cardId ?? "");
-    assert.ok(fake.answered.includes("reject-once"));
-    fake.fire({
-      rpcId: 21,
-      title: "Write file",
-      options: allowDenyOptions,
-      locations: [{ path: "/tmp/denied.txt" }],
-      toolKind: "edit",
-    });
-    assert.equal(store.get(ada.id)?.permission, null);
-    assert.equal(fake.answered.filter((id) => id === "reject-once").length, 2);
+    for (const mode of ["isolated", "host"] as const) {
+      if (mode === "host") await store.setConfigMode(ada.id, "host");
+      await store.send(ada.id, `${mode} permission matrix`);
+      await waitUntil(() => fake.spawned.length >= (mode === "isolated" ? 1 : 2));
+      await assertGeneric({
+        title: "Path-bearing",
+        locations: [{ path: mode === "isolated" ? join(botDir, "note.txt") : "/workspace/secret.txt" }],
+        toolKind: "edit",
+      });
+      await assertGeneric({
+        title: "Pathless command",
+        rawInput: { command: "printf pathless" },
+        toolKind: "execute",
+      });
+      await assertGeneric({
+        title: "Preexisting grant",
+        locations: [{ path: preexistingPath }],
+        toolKind: "edit",
+      });
+    }
+    assert.equal(fake.answered.filter((id) => id === "reject-once").length, 6);
+    assert.deepEqual(store.listHostGrants().map((grant) => grant.path), [preexistingPath]);
     store.close();
   });
 });

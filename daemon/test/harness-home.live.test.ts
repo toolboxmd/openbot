@@ -36,12 +36,6 @@ async function liveHomeDir(): Promise<string> {
   return mkdtemp(join(LIVE_ROOT, "home-"));
 }
 
-function liveOutsidePath(name: string): string {
-  const dir = join(LIVE_ROOT, "outside");
-  mkdirSync(dir, { recursive: true });
-  return join(dir, name);
-}
-
 async function emptyPwa(): Promise<string> {
   const pwaDir = await mkdtemp(join(tmpdir(), "openbot-hh-live-pwa-"));
   await writeFile(join(pwaDir, "index.html"), `<!doctype html><title>OpenBot</title>`);
@@ -61,7 +55,16 @@ async function login(url: string): Promise<string> {
   return cookie;
 }
 
-type PublicMessage = { id: string; role: "user" | "assistant"; text: string; kind?: string };
+type PublicMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  kind?: string;
+  card?: {
+    status?: { tone?: string; label?: string };
+    actions?: unknown[];
+  };
+};
 
 type PublicBot = {
   id: string;
@@ -108,7 +111,7 @@ async function pollIdle(url: string, cookie: string, botId: string, timeoutMs = 
   throw new Error(`timed out waiting for idle; last=${JSON.stringify(last)}`);
 }
 
-async function pollHostGrant(
+async function pollPermissionCard(
   url: string,
   cookie: string,
   botId: string,
@@ -118,13 +121,15 @@ async function pollHostGrant(
   let last: PublicBot | null = null;
   while (Date.now() - start < timeoutMs) {
     last = await getBot(url, cookie, botId);
-    if (last.permission?.hostGrant?.path) return last.permission;
+    if (last.permission?.cardId && last.permission.options?.length && !last.permission.hostGrant) {
+      return last.permission;
+    }
     if (last.write === false && last.permission == null) {
-      throw new Error(`Turn went idle without a Host grant card; last=${JSON.stringify(last)}`);
+      throw new Error(`Turn went idle without a permission Card; last=${JSON.stringify(last)}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 400));
   }
-  throw new Error(`timed out waiting for Host grant; last=${JSON.stringify(last)}`);
+  throw new Error(`timed out waiting for permission Card; last=${JSON.stringify(last)}`);
 }
 
 async function createBot(url: string, cookie: string, name: string): Promise<string> {
@@ -357,81 +362,45 @@ describe("Live Codex Isolated Harness Home", () => {
   );
 
   test(
-    "Host grant Read and write this Session is Computer-wide; Deny keeps the jail",
+    "real Harness permission is one durable generic Card resolved by its exact provider option",
     { timeout: 900_000 },
     async () => {
-      const token = `HH58G-${Date.now()}`;
-      const allowPath = liveOutsidePath(`openbot-grant-${token}.txt`);
-      const denyPath = liveOutsidePath(`openbot-deny-${token}.txt`);
       const homeDir = await liveHomeDir();
       const box = await openBox(homeDir);
       try {
         const cookie = await login(box.url);
         const adaId = await createBot(box.url, cookie, "Ada");
-        const benId = await createBot(box.url, cookie, "Ben");
 
         await postText(
           box.url,
           cookie,
           adaId,
-          `Write the exact text GRANTED-${token} into the file ${allowPath}. Use that absolute path. Reply with done when the file exists.`,
+          "Use the shell tool to run pwd. Request permission before running it, then wait for my choice.",
         );
-        const grant = await pollHostGrant(box.url, cookie, adaId);
-        assert.ok(grant.hostGrant?.path);
-        assert.match(grant.hostGrant.path, /openbot-grant-/);
+        const permission = await pollPermissionCard(box.url, cookie, adaId);
+        assert.ok(permission.cardId);
+        assert.equal(permission.hostGrant, undefined);
+        const option = permission.options?.find((candidate) => /allow/i.test(candidate.name))
+          ?? permission.options?.at(0);
+        assert.ok(option?.optionId);
+        const pendingBot = await getBot(box.url, cookie, adaId);
+        const pendingCard = pendingBot.messages?.find((message) => message.id === permission.cardId);
+        assert.equal(pendingCard?.kind, "card");
+        assert.equal(pendingCard?.card?.status?.tone, "waiting");
+
         const answered = await fetch(`${box.url}/api/bots/${adaId}/permissions`, {
           method: "POST",
           headers: { cookie, "content-type": "application/json" },
-          body: JSON.stringify({ cardId: grant.cardId, access: "read-write", duration: "session" }),
+          body: JSON.stringify({ cardId: permission.cardId, optionId: option.optionId }),
         });
         assert.ok(answered.ok, await answered.text());
-        const adaIdle = await pollIdle(box.url, cookie, adaId);
-        assert.equal(existsSync(allowPath), true, `Ada did not write ${allowPath}; ${assistantText(adaIdle.messages ?? [])}`);
-        assert.match(readFileSync(allowPath, "utf8"), new RegExp(`GRANTED-${token}`));
-
-        await postText(
-          box.url,
-          cookie,
-          benId,
-          `Append BEN-${token} to ${allowPath}. Reply with done. Do not ask me if a Host grant already exists.`,
-        );
-        const benStart = Date.now();
-        let benSawCard = false;
-        while (Date.now() - benStart < POLL_MS) {
-          const ben = await getBot(box.url, cookie, benId);
-          if (ben.permission?.hostGrant) {
-            benSawCard = true;
-            break;
-          }
-          if (ben.write === false) break;
-          await new Promise((resolve) => setTimeout(resolve, 400));
-        }
-        assert.equal(benSawCard, false, "Ben must reuse Ada's this-Session Host grant without a second card");
-        await pollIdle(box.url, cookie, benId);
-        assert.match(readFileSync(allowPath, "utf8"), new RegExp(`BEN-${token}`));
-
-        await postText(
-          box.url,
-          cookie,
-          adaId,
-          `Write the exact text DENIED-${token} into the file ${denyPath}. Use that absolute path.`,
-        );
-        const denyCard = await pollHostGrant(box.url, cookie, adaId);
-        assert.ok(denyCard.hostGrant?.path);
-        const denied = await fetch(`${box.url}/api/bots/${adaId}/permissions`, {
-          method: "POST",
-          headers: { cookie, "content-type": "application/json" },
-          body: JSON.stringify({ cardId: denyCard.cardId, access: "deny", duration: "session" }),
-        });
-        assert.ok(denied.ok, await denied.text());
         await pollIdle(box.url, cookie, adaId);
-        if (existsSync(denyPath)) {
-          assert.doesNotMatch(readFileSync(denyPath, "utf8"), new RegExp(`DENIED-${token}`));
-        }
+        const resolvedBot = await getBot(box.url, cookie, adaId);
+        const resolvedCard = resolvedBot.messages?.find((message) => message.id === permission.cardId);
+        assert.equal(resolvedCard?.card?.status?.tone, "success");
+        assert.deepEqual(resolvedCard?.card?.actions, []);
       } finally {
         await box.close();
-        if (existsSync(allowPath)) rmSync(allowPath);
-        if (existsSync(denyPath)) rmSync(denyPath);
       }
     },
   );

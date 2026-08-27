@@ -105,7 +105,7 @@ import {
   listHarnesses,
   listInbox,
   markBotRead,
-  retryMessageInput,
+  retryTranscriptCard,
   sendMessage,
   toggleReaction,
   type Bot,
@@ -324,6 +324,7 @@ export function Messenger() {
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
   const [reactingId, setReactingId] = useState<string | null>(null);
   const [actionMessageId, setActionMessageId] = useState<string | null>(null);
+  const [pendingCardIds, setPendingCardIds] = useState<Set<string>>(() => new Set());
   const [newMessagesAvailable, setNewMessagesAvailable] = useState(false);
   const [desktopLayout, setDesktopLayout] = useState(
     () => window.matchMedia(TRANSCRIPT_DESKTOP_QUERY).matches,
@@ -893,6 +894,7 @@ export function Messenger() {
     setReplyTo(null);
     setReactingId(null);
     setActionMessageId(null);
+    setPendingCardIds(new Set());
   }, [activeId]);
 
   useEffect(() => {
@@ -1083,7 +1085,8 @@ export function Messenger() {
   ) {
     if (!activeId) return;
     const botId = activeId;
-    setBusy(true);
+    const initiatingCard = messageBubbleRefs.current.get(messageId) ?? null;
+    setCardPending(messageId, true);
     setError(null);
     try {
       if (action.command.kind === "permission") {
@@ -1096,22 +1099,50 @@ export function Messenger() {
         await performBotMutation(botId, () =>
           answerHostGrant(botId, messageId, access, duration));
       } else if (action.command.kind === "retry-message") {
-        const sourceMessageId = action.command.messageId;
-        const source = active?.messages?.find((message) => message.id === sourceMessageId);
-        if (!source || source.role !== "user" || (source.kind && source.kind !== "text")) {
-          throw new Error("The original message is no longer available.");
-        }
-        const retry = retryMessageInput(source);
-        await performBotMutation(botId, () => sendMessage(botId, retry.text, retry.replyTo));
+        await performBotMutation(botId, () => retryTranscriptCard(botId, messageId));
       }
-      window.requestAnimationFrame(() => messageBubbleRefs.current.get(messageId)?.focus());
     } catch (err) {
       if (activeIdRef.current === botId) {
-        setError(err instanceof Error ? err.message : "Could not complete this action.");
+        try {
+          const { snapshot: authoritative, sequence } = await reserveSnapshotRequest(
+            nextBotSnapshotSequence,
+            () => getBot(botId),
+          );
+          if (activeIdRef.current === botId) {
+            mergeBot(authoritative, sequence);
+          }
+        } catch {
+          // Keep the current snapshot when the authoritative refresh also fails.
+        }
+        if (activeIdRef.current === botId) {
+          setError(err instanceof Error ? err.message : "Could not complete this action.");
+        }
       }
     } finally {
-      setBusy(false);
+      setCardPending(messageId, false);
+      if (activeIdRef.current === botId) {
+        window.requestAnimationFrame(() => {
+          if (activeIdRef.current !== botId) return;
+          const activeElement = document.activeElement;
+          const focusStayedWithCard = Boolean(
+            initiatingCard && activeElement && initiatingCard.contains(activeElement),
+          );
+          const focusNeedsRecovery = activeElement === document.body || !activeElement?.isConnected;
+          if (focusStayedWithCard || focusNeedsRecovery) {
+            messageBubbleRefs.current.get(messageId)?.focus();
+          }
+        });
+      }
     }
+  }
+
+  function setCardPending(messageId: string, pending: boolean) {
+    setPendingCardIds((current) => {
+      const next = new Set(current);
+      if (pending) next.add(messageId);
+      else next.delete(messageId);
+      return next;
+    });
   }
 
   async function onReact(messageId: string, emoji: string) {
@@ -1161,7 +1192,7 @@ export function Messenger() {
             else messageBubbleRefs.current.delete(message.id);
           }}
           card={message.card}
-          busy={busy}
+          busy={pendingCardIds.has(message.id)}
           onAction={(action, duration) => void onCardAction(message.id, action, duration)}
         />
       );

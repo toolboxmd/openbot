@@ -80,6 +80,7 @@ export class AcpClient {
   private nextId = 1;
   private pending = new Map<RpcId, Pending>();
   private closed = false;
+  private transportError: Error | null = null;
   private sessionId: string | null = null;
   private turnText = "";
   private messageText = "";
@@ -113,8 +114,18 @@ export class AcpClient {
     out.on("line", (line) => this.onLine(line));
     const err = readline.createInterface({ input: this.child.stderr });
     err.on("line", (line) => this.handlers.onStderr?.(line));
+    this.child.stdin.on("error", (writeError) => {
+      this.transportError = writeError;
+      this.failAll(writeError);
+    });
+    this.child.on("error", (err) => {
+      this.transportError = err;
+      this.failAll(err);
+    });
     this.child.on("exit", () => {
-      this.failAll(new Error("ACP child exited"));
+      const err = new Error("ACP child exited");
+      this.transportError = err;
+      this.failAll(err);
     });
   }
 
@@ -124,6 +135,19 @@ export class AcpClient {
 
   private send(obj: unknown): void {
     this.child.stdin.write(`${JSON.stringify(obj)}\n`);
+  }
+
+  private sendConfirmed(obj: unknown): Promise<void> {
+    if (this.transportError) return Promise.reject(this.transportError);
+    if (this.closed || this.child.stdin.destroyed) {
+      return Promise.reject(new Error("ACP transport is closed"));
+    }
+    return new Promise((resolve, reject) => {
+      this.child.stdin.write(`${JSON.stringify(obj)}\n`, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
   }
 
   private request(method: string, params: unknown): Promise<unknown> {
@@ -455,13 +479,13 @@ export class AcpClient {
     }
   }
 
-  respondPermission(rpcId: RpcId, optionId: string): void {
-    this.pendingPermissions.delete(rpcId);
-    this.send({
+  async respondPermission(rpcId: RpcId, optionId: string): Promise<void> {
+    await this.sendConfirmed({
       jsonrpc: "2.0",
       id: rpcId,
       result: { outcome: { outcome: "selected", optionId } },
     });
+    this.pendingPermissions.delete(rpcId);
   }
 
   close(): void {

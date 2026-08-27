@@ -28,16 +28,12 @@ import {
   botWorkspaceDir,
   ensureBotWorkspace,
   ensureHarnessHome,
-  extractPermissionPath,
   isConfigMode,
   isHostGrantAccess,
   isHostGrantDuration,
-  isInsideWorkspace,
-  isInsideScreenWorkspace,
   pickAllowOption,
   pickRejectOption,
   readAgentsFile,
-  requestedAccessFromKind,
   thisBotAgentsPath,
   writeAgentsFile,
   allBotsAgentsPath,
@@ -82,7 +78,7 @@ export type PublicPermission = {
   cardId?: string;
   title: string;
   description?: string;
-  options: Array<{ optionId: string; name: string; kind?: string }>;
+  options: Array<{ optionId: string; name: string }>;
   hostGrant?: PublicHostGrant;
 };
 
@@ -128,7 +124,7 @@ export type AcpSession = {
   resumeSession?(sessionId: string): Promise<unknown>;
   prompt(text: string, handlers?: AcpHandlers): Promise<string>;
   cancel(): void;
-  respondPermission(rpcId: PermissionPrompt["rpcId"], optionId: string): void;
+  respondPermission(rpcId: PermissionPrompt["rpcId"], optionId: string): void | Promise<void>;
 };
 
 type BotPermission = PermissionPrompt & PublicPermission;
@@ -150,6 +146,8 @@ type Bot = {
   assistantMessageIds: Map<string, string>;
   activeUserId: string | null;
   turnSeq: number;
+  startingTurn: boolean;
+  permissionQueue: Promise<void>;
   client: AcpSession | null;
 };
 
@@ -169,12 +167,7 @@ function publicPermission(p: BotPermission | null): PublicPermission | null {
   const safeOptions = permissionCard.actions.flatMap((action) => {
     if (action.command.kind !== "permission") return [];
     const optionId = action.command.optionId;
-    const source = p.options.find((option) => option.optionId === optionId);
-    return [{
-      optionId,
-      name: action.label,
-      ...(source?.kind ? { kind: source.kind } : {}),
-    }];
+    return [{ optionId, name: action.label }];
   });
   const out: PublicPermission = {
     title: card.title,
@@ -372,6 +365,7 @@ export class BotStore {
     if (bot.harness === harness) return this.toPublic(bot, true);
 
     this.home.setHarness(bot.id, harness);
+    bot.turnSeq += 1;
     this.expireActivePermission(bot);
     bot.client?.close();
     bot.client = null;
@@ -387,6 +381,7 @@ export class BotStore {
     if (!isConfigMode(configMode)) throw Object.assign(new Error("unknown config mode"), { status: 400 });
     if (bot.configMode === configMode) return this.toPublic(bot, true);
     this.home.setConfigMode(bot.id, configMode);
+    bot.turnSeq += 1;
     this.expireActivePermission(bot);
     bot.client?.close();
     bot.client = null;
@@ -443,15 +438,31 @@ export class BotStore {
     if (bot.harness !== "codex") {
       throw Object.assign(new Error("Talk spawn is Codex-only in this slice"), { status: 400 });
     }
+    if (bot.startingTurn) {
+      throw Object.assign(new Error("wait for the current message to start"), { status: 409 });
+    }
 
     const channelId = this.channelId(bot.id);
     const beforeInterrupt = this.home.listMessages(channelId);
     const replyTarget = this.resolveReplyTarget(beforeInterrupt, replyTo);
+    const startTurnSeq = bot.turnSeq;
+    bot.startingTurn = true;
     let attached: { client: AcpSession; skipHistory: boolean };
     try {
       attached = await this.ensureClient(bot);
+      if (startTurnSeq !== bot.turnSeq) {
+        attached.client.close();
+        if (bot.client === attached.client) bot.client = null;
+        this.home.setSessionId(bot.id, channelId, null);
+        throw Object.assign(new Error("message start was replaced"), { status: 409 });
+      }
     } catch (err) {
+      if (startTurnSeq !== bot.turnSeq) {
+        throw Object.assign(new Error("message start was replaced"), { status: 409 });
+      }
       return this.recordClientFailure(bot, channelId, trimmed, replyTarget, err);
+    } finally {
+      bot.startingTurn = false;
     }
     const client = attached.client;
     const turnSeq = ++bot.turnSeq;
@@ -493,7 +504,7 @@ export class BotStore {
         const reply = await client.prompt(talkPrompt(trimmed, replyTarget?.text, history), {
           onPermission: (prompt) => {
             if (turnSeq !== bot.turnSeq) return;
-            this.handlePermission(bot, client, prompt);
+            this.queuePermission(bot, client, prompt, turnSeq);
           },
           onAssistant: (assistantText, delta) => {
             if (turnSeq !== bot.turnSeq) return;
@@ -554,7 +565,9 @@ export class BotStore {
   async retryCard(id: string, cardId: string): Promise<PublicBot> {
     const bot = this.require(id);
     if (!cardId) throw Object.assign(new Error("cardId is required"), { status: 400 });
-    if (bot.write) throw Object.assign(new Error("wait for the current message to finish"), { status: 409 });
+    if (bot.write || bot.startingTurn) {
+      throw Object.assign(new Error("wait for the current message to finish"), { status: 409 });
+    }
     const message = this.home.getMessage(this.channelId(bot.id), cardId);
     if (!message?.card || message.card.kind !== "bot-failure") {
       throw Object.assign(new Error("failure Card not found"), { status: 404 });
@@ -579,78 +592,115 @@ export class BotStore {
     }
   }
 
-  answerPermission(id: string, optionId: string, cardId: string): PublicBot {
+  async answerPermission(id: string, optionId: string, cardId: string): Promise<PublicBot> {
     const bot = this.require(id);
-    if (!bot.permission || !bot.client) {
-      throw Object.assign(new Error("no permission prompt"), { status: 409 });
-    }
-    if (!optionId) throw Object.assign(new Error("optionId is required"), { status: 400 });
-    const activeCardId = bot.permission.cardId;
-    if (!activeCardId) throw Object.assign(new Error("permission Card not found"), { status: 409 });
-    if (!cardId) throw Object.assign(new Error("cardId is required"), { status: 400 });
-    if (cardId !== activeCardId) {
-      throw Object.assign(new Error("permission Card is no longer active"), { status: 409 });
-    }
-    const message = this.home.getMessage(this.channelId(bot.id), activeCardId);
-    if (!message?.card || message.card.kind !== "permission") {
-      throw Object.assign(new Error("permission Card not found"), { status: 409 });
-    }
-    const resolvedCard = resolvedPermissionCard(message.card, optionId);
-    const rpcId = bot.permission.rpcId;
-    const client = bot.client;
-    this.home.updateMessageCard(message.id, resolvedCard);
-    bot.permission = null;
-    bot.eyesMode = bot.write ? "write" : "idle";
-    try {
-      client.respondPermission(rpcId, optionId);
-    } catch {
-      client.close();
-      bot.client = null;
-      throw Object.assign(new Error("Permission could not be sent to the Harness"), { status: 409 });
-    }
-    return this.toPublic(bot, true);
+    return this.enqueuePermission(bot, async () => {
+      if (!bot.permission || !bot.client) {
+        throw Object.assign(new Error("no permission prompt"), { status: 409 });
+      }
+      if (!optionId) throw Object.assign(new Error("optionId is required"), { status: 400 });
+      const activeCardId = bot.permission.cardId;
+      if (!activeCardId) throw Object.assign(new Error("permission Card not found"), { status: 409 });
+      if (!cardId) throw Object.assign(new Error("cardId is required"), { status: 400 });
+      if (cardId !== activeCardId) {
+        throw Object.assign(new Error("permission Card is no longer active"), { status: 409 });
+      }
+      const message = this.home.getMessage(this.channelId(bot.id), activeCardId);
+      if (!message?.card || message.card.kind !== "permission") {
+        throw Object.assign(new Error("permission Card not found"), { status: 409 });
+      }
+      const resolvedCard = resolvedPermissionCard(message.card, optionId);
+      const activePermission = bot.permission;
+      if (!activePermission.options.some((option) => option.optionId === optionId)) {
+        throw Object.assign(new Error("permission choice is not available"), { status: 409 });
+      }
+      const permissionTurnSeq = bot.turnSeq;
+      const sourceMessageId = bot.activeUserId;
+      const rpcId = activePermission.rpcId;
+      const client = bot.client;
+      try {
+        await client.respondPermission(rpcId, optionId);
+      } catch {
+        if (
+          bot.turnSeq !== permissionTurnSeq
+          || bot.permission !== activePermission
+          || bot.client !== client
+        ) {
+          throw Object.assign(new Error("permission Card is no longer active"), { status: 409 });
+        }
+        this.failPermissionDelivery(bot, message.id, client, sourceMessageId);
+      }
+      if (
+        bot.turnSeq !== permissionTurnSeq
+        || bot.permission !== activePermission
+        || bot.client !== client
+      ) {
+        throw Object.assign(new Error("permission Card is no longer active"), { status: 409 });
+      }
+      this.home.updateMessageCard(message.id, resolvedCard);
+      bot.permission = null;
+      bot.eyesMode = bot.write ? "write" : "idle";
+      return this.toPublic(bot, true);
+    });
   }
 
-  answerHostGrant(id: string, access: string, duration: string, cardId: string): PublicBot {
+  async answerHostGrant(id: string, access: string, duration: string, cardId: string): Promise<PublicBot> {
     const bot = this.require(id);
-    if (!bot.permission?.hostGrant || !bot.client) {
-      throw Object.assign(new Error("no Host grant prompt"), { status: 409 });
-    }
-    if (!isHostGrantAccess(access)) throw Object.assign(new Error("access is required"), { status: 400 });
-    if (!isHostGrantDuration(duration)) throw Object.assign(new Error("duration is required"), { status: 400 });
-    const activeCardId = bot.permission.cardId;
-    if (!activeCardId) throw Object.assign(new Error("Host grant Card not found"), { status: 409 });
-    if (!cardId) throw Object.assign(new Error("cardId is required"), { status: 400 });
-    if (cardId !== activeCardId) {
-      throw Object.assign(new Error("Host grant Card is no longer active"), { status: 409 });
-    }
-    const message = this.home.getMessage(this.channelId(bot.id), activeCardId);
-    if (!message?.card || message.card.kind !== "host-grant") {
-      throw Object.assign(new Error("Host grant Card not found"), { status: 409 });
-    }
-    const resolvedCard = resolvedHostGrantCard(message.card, access, duration);
-    const requestPath = bot.permission.hostGrant.path;
-    const rpcId = bot.permission.rpcId;
-    const options = bot.permission.options;
-    const optionId =
-      access === "deny" ? pickRejectOption(options) : pickAllowOption(options);
-    if (!optionId) throw Object.assign(new Error("no matching permission option"), { status: 409 });
-    const client = bot.client;
-    this.home.resolveHostGrantCard(message.id, resolvedCard, {
-      path: requestPath,
-      access,
-      duration,
+    return this.enqueuePermission(bot, async () => {
+      if (!bot.permission?.hostGrant || !bot.client) {
+        throw Object.assign(new Error("no Host grant prompt"), { status: 409 });
+      }
+      if (!isHostGrantAccess(access)) throw Object.assign(new Error("access is required"), { status: 400 });
+      if (!isHostGrantDuration(duration)) throw Object.assign(new Error("duration is required"), { status: 400 });
+      const activeCardId = bot.permission.cardId;
+      if (!activeCardId) throw Object.assign(new Error("Host grant Card not found"), { status: 409 });
+      if (!cardId) throw Object.assign(new Error("cardId is required"), { status: 400 });
+      if (cardId !== activeCardId) {
+        throw Object.assign(new Error("Host grant Card is no longer active"), { status: 409 });
+      }
+      const message = this.home.getMessage(this.channelId(bot.id), activeCardId);
+      if (!message?.card || message.card.kind !== "host-grant") {
+        throw Object.assign(new Error("Host grant Card not found"), { status: 409 });
+      }
+      const resolvedCard = resolvedHostGrantCard(message.card, access, duration);
+      const activePermission = bot.permission;
+      const permissionTurnSeq = bot.turnSeq;
+      const sourceMessageId = bot.activeUserId;
+      const requestPath = activePermission.hostGrant!.path;
+      const rpcId = activePermission.rpcId;
+      const options = activePermission.options;
+      const optionId =
+        access === "deny" ? pickRejectOption(options) : pickAllowOption(options);
+      if (!optionId) throw Object.assign(new Error("no matching permission option"), { status: 409 });
+      const client = bot.client;
+      try {
+        await client.respondPermission(rpcId, optionId);
+      } catch {
+        if (
+          bot.turnSeq !== permissionTurnSeq
+          || bot.permission !== activePermission
+          || bot.client !== client
+        ) {
+          throw Object.assign(new Error("Host grant Card is no longer active"), { status: 409 });
+        }
+        this.failPermissionDelivery(bot, message.id, client, sourceMessageId);
+      }
+      if (
+        bot.turnSeq !== permissionTurnSeq
+        || bot.permission !== activePermission
+        || bot.client !== client
+      ) {
+        throw Object.assign(new Error("Host grant Card is no longer active"), { status: 409 });
+      }
+      this.home.resolveHostGrantCard(message.id, resolvedCard, {
+        path: requestPath,
+        access,
+        duration,
+      });
+      bot.permission = null;
+      bot.eyesMode = bot.write ? "write" : "idle";
+      return this.toPublic(bot, true);
     });
-    bot.permission = null;
-    bot.eyesMode = bot.write ? "write" : "idle";
-    try {
-      client.respondPermission(rpcId, optionId);
-    } catch {
-      client.close();
-      bot.client = null;
-      throw Object.assign(new Error("Host grant could not be sent to the Harness"), { status: 409 });
-    }
-    return this.toPublic(bot, true);
   }
 
   private load(): void {
@@ -678,6 +728,8 @@ export class BotStore {
       assistantMessageIds: new Map(),
       activeUserId: null,
       turnSeq: 0,
+      startingTurn: false,
+      permissionQueue: Promise.resolve(),
       client: null,
     };
   }
@@ -732,7 +784,7 @@ export class BotStore {
       client = this.spawnAcpFn(spec, cwd, {
         onPermission: (prompt) => {
           if (!client) return;
-          this.handlePermission(bot, client, prompt);
+          this.queuePermission(bot, client, prompt, bot.turnSeq);
         },
         onAssistant: (text, delta) => this.applyAssistant(bot, channelId, text, delta),
         onPromptWritten: () => this.setUserReceipt(bot, channelId, "delivered"),
@@ -905,7 +957,12 @@ export class BotStore {
     bot.permission = null;
   }
 
-  private supersedeActivePermission(bot: Bot, client: AcpSession): boolean {
+  private async supersedeActivePermission(
+    bot: Bot,
+    client: AcpSession,
+    turnSeq: number,
+  ): Promise<boolean> {
+    if (turnSeq !== bot.turnSeq || bot.client !== client) return false;
     const active = bot.permission;
     if (!active) return true;
     const reject = pickRejectOption(active.options);
@@ -920,78 +977,57 @@ export class BotStore {
       return false;
     }
     try {
-      client.respondPermission(active.rpcId, reject);
+      await client.respondPermission(active.rpcId, reject);
     } catch {
+      if (turnSeq !== bot.turnSeq || bot.client !== client || bot.permission !== active) return false;
       client.close();
       bot.client = null;
       this.expireActivePermission(bot);
       return false;
     }
+    if (turnSeq !== bot.turnSeq || bot.client !== client || bot.permission !== active) return false;
     this.expireActivePermission(bot);
     return true;
   }
 
-  private handlePermission(bot: Bot, client: AcpSession, prompt: PermissionPrompt): void {
-    if (!this.supersedeActivePermission(bot, client)) return;
-    const cwd = this.botCwd(bot.id);
-    const requestPath = extractPermissionPath(prompt, cwd);
-    const requested = requestedAccessFromKind(prompt.toolKind);
-    const inJail =
-      (requestPath && isInsideWorkspace(requestPath, this.workspaceDir))
-      || (requestPath && bot.configMode === "isolated" && isInsideScreenWorkspace(requestPath));
-    if (inJail) {
-      const allow = pickAllowOption(prompt.options);
-      if (allow) {
-        client.respondPermission(prompt.rpcId, allow);
-        return;
-      }
-    }
-    if (requestPath && !inJail) {
-      const grant = this.home.matchHostGrant(requestPath, requested);
-      if (grant) {
-        if (grant.access === "deny") {
-          const reject = pickRejectOption(prompt.options);
-          if (reject) client.respondPermission(prompt.rpcId, reject);
-        } else {
-          const allow = pickAllowOption(prompt.options);
-          if (allow) client.respondPermission(prompt.rpcId, allow);
-        }
-        if (grant.duration === "once") this.home.consumeHostGrant(grant.id);
-        return;
-      }
-      const card = hostGrantTranscriptCard(
-        requestPath,
-        requested === "read" ? "read" : "read-write",
-        prompt.options,
-      );
-      const cardId = crypto.randomUUID();
-      this.home.appendMessage(this.channelId(bot.id), {
-        id: cardId,
-        role: "assistant",
-        kind: "card",
-        card,
-        text: transcriptCardSummary(card),
-        createdAt: nowIso(),
-        senderId: bot.id,
-      });
-      bot.permission = {
-        ...prompt,
-        cardId,
-        hostGrant: { path: requestPath, requested: requested === "read" ? "read" : "read-write" },
-      };
-      bot.eyesMode = "needs-you";
-      return;
-    }
+  private queuePermission(
+    bot: Bot,
+    client: AcpSession,
+    prompt: PermissionPrompt,
+    turnSeq: number,
+  ): void {
+    void this.enqueuePermission(bot, async () => {
+      if (turnSeq !== bot.turnSeq || bot.client !== client) return;
+      await this.handlePermission(bot, client, prompt, turnSeq);
+    }).catch(() => this.abortPermissionQueue(bot, client, turnSeq));
+  }
+
+  private enqueuePermission<T>(bot: Bot, task: () => Promise<T>): Promise<T> {
+    const result = bot.permissionQueue.then(task);
+    bot.permissionQueue = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async handlePermission(
+    bot: Bot,
+    client: AcpSession,
+    prompt: PermissionPrompt,
+    turnSeq: number,
+  ): Promise<void> {
+    if (!await this.supersedeActivePermission(bot, client, turnSeq)) return;
+    if (turnSeq !== bot.turnSeq || bot.client !== client) return;
     const card = permissionTranscriptCard(prompt.toolKind, prompt.options);
     if (card.actions.length === 0) {
       const reject = pickRejectOption(prompt.options);
       try {
-        if (reject) client.respondPermission(prompt.rpcId, reject);
+        if (reject) await client.respondPermission(prompt.rpcId, reject);
         else client.cancel();
       } catch {
+        if (turnSeq !== bot.turnSeq || bot.client !== client) return;
         client.close();
         bot.client = null;
       }
+      if (turnSeq !== bot.turnSeq || bot.client !== client) return;
       const unsupported = unsupportedPermissionTranscriptCard();
       this.home.appendMessage(this.channelId(bot.id), {
         id: crypto.randomUUID(),
@@ -1018,6 +1054,53 @@ export class BotStore {
     });
     bot.permission = { ...prompt, cardId };
     bot.eyesMode = "needs-you";
+  }
+
+  private abortPermissionQueue(bot: Bot, client: AcpSession, turnSeq: number): void {
+    if (turnSeq !== bot.turnSeq || bot.client !== client) return;
+    try {
+      client.cancel();
+    } catch {
+      // Closing below is the authoritative local stop.
+    }
+    client.close();
+    bot.client = null;
+    try {
+      this.expireActivePermission(bot);
+    } catch {
+      bot.permission = null;
+    }
+    bot.turnSeq += 1;
+    bot.pendingAssistant = null;
+    bot.assistantMessageIds.clear();
+    bot.activeUserId = null;
+    bot.write = false;
+    bot.eyesMode = bot.needsYou ? "needs-you" : "idle";
+  }
+
+  private failPermissionDelivery(
+    bot: Bot,
+    cardId: string,
+    client: AcpSession,
+    sourceMessageId: string | null,
+  ): never {
+    const message = this.home.getMessage(this.channelId(bot.id), cardId);
+    if (message?.card) {
+      const failed = sourceMessageId
+        ? botFailureTranscriptCard(sourceMessageId)
+        : expiredTranscriptCard(message.card);
+      this.home.updateMessageCard(cardId, failed);
+    }
+    bot.turnSeq += 1;
+    bot.permission = null;
+    bot.pendingAssistant = null;
+    bot.assistantMessageIds.clear();
+    bot.activeUserId = null;
+    bot.write = false;
+    bot.eyesMode = bot.needsYou ? "needs-you" : "idle";
+    client.close();
+    if (bot.client === client) bot.client = null;
+    throw Object.assign(new Error("Permission could not be sent to the Harness"), { status: 409 });
   }
 
   private toPublicChannel(

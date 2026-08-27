@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.2] - 2026-08-27
+
+### Changed
+
+- Complete durable Transcript Cards, permission correlation, and retry handling for #78
+
 ## [0.9.1] - 2026-08-27
 
 ### Changed

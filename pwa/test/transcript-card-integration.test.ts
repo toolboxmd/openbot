@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, test } from "node:test";
-import { retryMessageInput } from "../src/lib/session";
 
 const source = readFileSync(new URL("../src/components/Messenger.tsx", import.meta.url), "utf8");
 
@@ -22,14 +21,6 @@ describe("Transcript Card integration", () => {
     assert.match(source, /retryTranscriptCard\(botId, messageId\)/);
   });
 
-  test("retries the original reply relationship instead of creating a root message", () => {
-    assert.deepEqual(
-      retryMessageInput({ text: "Try again", replyTo: "message-parent" }),
-      { text: "Try again", replyTo: "message-parent" },
-    );
-    assert.deepEqual(retryMessageInput({ text: "Try again" }), { text: "Try again" });
-  });
-
   test("keeps progress local and restores focus from authoritative Card state", () => {
     const start = source.indexOf("async function onCardAction");
     const end = source.indexOf("async function onReact", start);
@@ -39,6 +30,9 @@ describe("Transcript Card integration", () => {
     assert.doesNotMatch(handler, /setBusy\(/);
     assert.match(source, /busy=\{pendingCardIds\.has\(message\.id\)\}/);
     assert.match(handler, /requestAnimationFrame/);
+    assert.match(handler, /initiatingCard\.contains\(activeElement\)/);
+    assert.match(handler, /focusStayedWithCard \|\| focusNeedsRecovery/);
+    assert.match(handler, /activeIdRef\.current !== botId/);
     assert.match(handler, /messageBubbleRefs\.current\.get\(messageId\)\?\.focus\(\)/);
     assert.match(handler, /getBot\(botId\)/);
     assert.match(source, /<ToastProvider/);

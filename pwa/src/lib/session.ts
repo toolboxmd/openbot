@@ -55,7 +55,7 @@ export type Bot = {
     cardId?: string;
     title: string;
     description?: string;
-    options: Array<{ optionId: string; name: string; kind?: string }>;
+    options: Array<{ optionId: string; name: string }>;
     hostGrant?: { path: string; requested?: "read" | "read-write" };
   } | null;
   needsYou: { reason: "login"; hint: string } | null;
@@ -214,14 +214,6 @@ export async function sendMessage(botId: string, text: string, replyTo?: string)
   return (await res.json()) as Bot;
 }
 
-export function retryMessageInput(
-  message: { text: string; replyTo?: string },
-): { text: string; replyTo?: string } {
-  return message.replyTo
-    ? { text: message.text, replyTo: message.replyTo }
-    : { text: message.text };
-}
-
 export async function toggleReaction(botId: string, messageId: string, emoji: string): Promise<Bot> {
   const res = await fetch(
     `/api/bots/${encodeURIComponent(botId)}/messages/${encodeURIComponent(messageId)}/reactions`,
@@ -248,6 +240,18 @@ export async function answerPermission(botId: string, cardId: string, optionId: 
   });
   if (!res.ok) {
     throw new Error("Could not answer permission.");
+  }
+  return (await res.json()) as Bot;
+}
+
+export async function retryTranscriptCard(botId: string, cardId: string): Promise<Bot> {
+  const res = await fetch(
+    `/api/bots/${encodeURIComponent(botId)}/cards/${encodeURIComponent(cardId)}/retry`,
+    { method: "POST", credentials: "same-origin" },
+  );
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Could not retry this message.");
   }
   return (await res.json()) as Bot;
 }

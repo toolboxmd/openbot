@@ -5,13 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
 import type { AcpHandlers, PermissionPrompt } from "../src/acp.ts";
-import type { AcpSession } from "../src/bots.ts";
+import { BotStore, type AcpSession } from "../src/bots.ts";
 import { startBox, type RunningBox } from "../src/box.ts";
 import type { SpawnSpec } from "../src/harness.ts";
 import { HUMAN_MEMBER_ID, HomeStore } from "../src/home.ts";
 import {
   hostGrantTranscriptCard,
   permissionTranscriptCard,
+  resolvedHostGrantCard,
   resolvedPermissionCard,
 } from "../src/transcript-card.ts";
 
@@ -72,15 +73,28 @@ function permissionFake() {
   const answered: string[] = [];
   let settleAnswers = true;
   let responseError: Error | null = null;
+  let transportGate: Promise<void> | null = null;
+  let releaseTransport: (() => void) | null = null;
+  let initializeGate: Promise<void> | null = null;
+  let releaseInitialize: (() => void) | null = null;
+  let initializeError: Error | null = null;
+  let spawned = 0;
   let closed = 0;
   let cancelled = 0;
   const spawnAcp = (_spec: SpawnSpec, _cwd: string, next?: AcpHandlers): AcpSession => {
+    spawned += 1;
     handlers = next;
     return {
       close() {
         closed += 1;
       },
       async initialize() {
+        if (initializeError) {
+          const error = initializeError;
+          initializeError = null;
+          throw error;
+        }
+        if (initializeGate) await initializeGate;
         return {};
       },
       async newSession() {
@@ -94,10 +108,12 @@ function permissionFake() {
       cancel() {
         cancelled += 1;
       },
-      respondPermission(_rpcId, optionId) {
+      async respondPermission(_rpcId, optionId) {
         answered.push(optionId);
         if (responseError) throw responseError;
-        if (settleAnswers) settlePrompt?.("done");
+        if (transportGate) await transportGate;
+        if (responseError) throw responseError;
+        if (settleAnswers) setImmediate(() => settlePrompt?.("done"));
       },
     };
   };
@@ -110,11 +126,37 @@ function permissionFake() {
     get cancelled() {
       return cancelled;
     },
+    get spawned() {
+      return spawned;
+    },
+    failNextInitialize(error = new Error("initialize failed")) {
+      initializeError = error;
+    },
+    holdInitialize() {
+      initializeGate = new Promise((resolve) => {
+        releaseInitialize = resolve;
+      });
+    },
+    releaseInitialize() {
+      releaseInitialize?.();
+      initializeGate = null;
+      releaseInitialize = null;
+    },
     failResponses(error = new Error("permission transport closed")) {
       responseError = error;
     },
     holdResponses() {
       settleAnswers = false;
+    },
+    holdTransport() {
+      transportGate = new Promise((resolve) => {
+        releaseTransport = resolve;
+      });
+    },
+    releaseTransport() {
+      releaseTransport?.();
+      transportGate = null;
+      releaseTransport = null;
     },
     fire(prompt: PermissionPrompt) {
       handlers?.onPermission?.(prompt);
@@ -161,6 +203,54 @@ function failureFake(secret: string) {
     respondPermission() {},
   });
   return { spawnAcp };
+}
+
+function configSwitchDuringStartupFake() {
+  let initializeGate = new Promise<void>(() => undefined);
+  let releaseInitialize: (() => void) | null = null;
+  initializeGate = new Promise((resolve) => {
+    releaseInitialize = resolve;
+  });
+  let spawned = 0;
+  const createdSessions: string[] = [];
+  const loadedSessions: string[] = [];
+  const spawnAcp = (_spec: SpawnSpec, _cwd: string, _handlers?: AcpHandlers): AcpSession => {
+    spawned += 1;
+    const ordinal = spawned;
+    return {
+      close() {},
+      async initialize() {
+        if (ordinal === 1) await initializeGate;
+        return {};
+      },
+      async newSession() {
+        const sessionId = ordinal === 1 ? "isolated-stale" : "host-fresh";
+        createdSessions.push(sessionId);
+        return sessionId;
+      },
+      async loadSession(sessionId) {
+        loadedSessions.push(sessionId);
+        return sessionId;
+      },
+      prompt() {
+        return new Promise<string>(() => undefined);
+      },
+      cancel() {},
+      respondPermission() {},
+    };
+  };
+  return {
+    spawnAcp,
+    createdSessions,
+    loadedSessions,
+    get spawned() {
+      return spawned;
+    },
+    releaseInitialize() {
+      releaseInitialize?.();
+      releaseInitialize = null;
+    },
+  };
 }
 
 async function startCardBox(homeDir: string, pwaDir: string, fake = permissionFake()) {
@@ -255,7 +345,7 @@ describe("Talk HTTP Transcript Cards", () => {
         rawInput: { command: "curl -H 'Authorization: TOKEN-71'" },
         toolKind: "execute",
         options: [
-          { optionId: "allow-once", name: "TOKEN-71", kind: "allow_once" },
+          { optionId: "allow-once", name: "TOKEN-71", kind: "provider-private-TOKEN-71" },
           { optionId: "reject-once", name: "Reject", kind: "reject_once" },
         ],
       });
@@ -298,6 +388,28 @@ describe("Talk HTTP Transcript Cards", () => {
       });
       assert.equal(missingIdentity.status, 400);
       assert.deepEqual(first.fake.answered, []);
+
+      const invalidChoice = await fetch(`${first.box.url}/api/bots/${botId}/permissions`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ cardId: pending.id, optionId: "invented-choice" }),
+      });
+      assert.equal(invalidChoice.status, 409);
+      assert.deepEqual(first.fake.answered, []);
+      const stillPendingResponse = await fetch(`${first.box.url}/api/bots/${botId}`, { headers: { cookie } });
+      const stillPending = (await stillPendingResponse.json()) as {
+        permission: { cardId?: string; options: Array<{ optionId: string }> } | null;
+        messages: CardMessage[];
+      };
+      assert.equal(stillPending.permission?.cardId, pending.id);
+      assert.deepEqual(stillPending.permission?.options.map((option) => option.optionId), [
+        "allow-once",
+        "reject-once",
+      ]);
+      assert.deepEqual(stillPending.messages.find((message) => message.id === pending.id)?.card?.status, {
+        tone: "waiting",
+        label: "Waiting for you",
+      });
 
       const answered = await fetch(`${first.box.url}/api/bots/${botId}/permissions`, {
         method: "POST",
@@ -377,39 +489,35 @@ describe("Talk HTTP Transcript Cards", () => {
     }
   });
 
-  test("maps a Host grant to a path Card and persists its durable choice", async () => {
+  test("keeps path and command heuristics out of the normal v1 permission flow", async () => {
     const homeDir = await tempHome();
-    const pwaDir = await mkdtemp(join(tmpdir(), "openbot-host-card-pwa-"));
+    const pwaDir = await mkdtemp(join(tmpdir(), "openbot-generic-permission-pwa-"));
     await writeFile(join(pwaDir, "index.html"), "<!doctype html><title>OpenBot</title>");
-    const first = await startCardBox(homeDir, pwaDir);
-    let botId = "";
-    let cardId = "";
-    const requestedPath = "/tmp/openbot-card-host.txt";
+    const running = await startCardBox(homeDir, pwaDir);
     try {
-      const cookie = await login(first.box);
-      const created = await fetch(`${first.box.url}/api/bots`, {
+      const cookie = await login(running.box);
+      const created = await fetch(`${running.box.url}/api/bots`, {
         method: "POST",
         headers: { cookie, "content-type": "application/json" },
         body: JSON.stringify({ name: "Ada" }),
       });
-      botId = ((await created.json()) as { id: string }).id;
-      await fetch(`${first.box.url}/api/bots/${botId}`, {
+      const botId = ((await created.json()) as { id: string }).id;
+      await fetch(`${running.box.url}/api/bots/${botId}`, {
         method: "PATCH",
         headers: { cookie, "content-type": "application/json" },
         body: JSON.stringify({ harness: "codex" }),
       });
-      await fetch(`${first.box.url}/api/bots/${botId}/messages`, {
+      await fetch(`${running.box.url}/api/bots/${botId}/messages`, {
         method: "POST",
         headers: { cookie, "content-type": "application/json" },
-        body: JSON.stringify({ text: "Write the file." }),
+        body: JSON.stringify({ text: "Continue." }),
       });
-
-      first.fake.fire({
-        rpcId: 72,
-        title: "Write TOKEN-72 with raw shell",
-        description: "private stack TOKEN-72",
-        rawInput: { command: `printf TOKEN-72 > ${requestedPath}` },
-        locations: [{ path: requestedPath }],
+      running.fake.fire({
+        rpcId: 80,
+        title: "Write SECRET-80",
+        description: "private path prompt SECRET-80",
+        rawInput: { command: "printf SECRET-80 > /tmp/openbot-secret.txt" },
+        locations: [{ path: "/tmp/openbot-secret.txt" }],
         toolKind: "edit",
         options: [
           { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
@@ -417,78 +525,195 @@ describe("Talk HTTP Transcript Cards", () => {
         ],
       });
 
-      const pending = await waitForCard(first.box, cookie, botId);
-      cardId = pending.id;
-      assert.deepEqual(pending.card, {
-        kind: "host-grant",
-        title: "Host access requested",
-        body: "This Bot wants to read and change a path on this Computer outside Workspace.",
-        preview: requestedPath,
-        status: { tone: "waiting", label: "Waiting for you" },
-        actions: [
-          {
-            id: "read-write",
-            label: "Read and write",
-            intent: "primary",
-            command: { kind: "host-grant", access: "read-write" },
-          },
-          {
-            id: "deny",
-            label: "Deny",
-            intent: "secondary",
-            command: { kind: "host-grant", access: "deny" },
-          },
-        ],
-      });
-      assert.doesNotMatch(JSON.stringify(pending), /TOKEN-72|raw shell|private stack|printf/);
+      const pending = await waitForCard(running.box, cookie, botId);
+      assert.equal(pending.card?.kind, "permission");
+      assert.equal(pending.card?.preview, undefined);
+      assert.doesNotMatch(JSON.stringify(pending), /SECRET-80|openbot-secret|printf|private path/);
+      const grantsResponse = await fetch(`${running.box.url}/api/host-grants`, { headers: { cookie } });
+      assert.deepEqual((await grantsResponse.json()) as { grants: unknown[] }, { grants: [] });
 
-      const answered = await fetch(`${first.box.url}/api/bots/${botId}/permissions`, {
+      const answered = await fetch(`${running.box.url}/api/bots/${botId}/permissions`, {
         method: "POST",
         headers: { cookie, "content-type": "application/json" },
-        body: JSON.stringify({
-          cardId: pending.id,
-          access: "read-write",
-          duration: "until-revoked",
-        }),
+        body: JSON.stringify({ cardId: pending.id, optionId: "reject-once" }),
       });
       assert.equal(answered.status, 200);
-      const resolved = (await answered.json()) as { messages: CardMessage[] };
-      const resolvedCard = resolved.messages.find((message) => message.id === pending.id);
-      assert.deepEqual(resolvedCard?.card?.status, {
-        tone: "success",
-        label: "Read and write · until revoked",
-      });
-      assert.deepEqual(resolvedCard?.card?.actions, []);
-      assert.deepEqual(first.fake.answered, ["allow-once"]);
+      assert.deepEqual(running.fake.answered, ["reject-once"]);
     } finally {
-      await first.box.close();
+      await running.box.close();
+    }
+  });
+
+  test("preserves dormant Host-grant Card, row, persistence, and evaluator compatibility", async () => {
+    const homeDir = await tempHome();
+    const botId = crypto.randomUUID();
+    const channelId = crypto.randomUUID();
+    const cardId = crypto.randomUUID();
+    const requestedPath = "/tmp/openbot-card-host.txt";
+    const options = [
+      { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+      { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+    ];
+    const pending = hostGrantTranscriptCard(requestedPath, "read-write", options);
+    const resolved = resolvedHostGrantCard(pending, "read-write", "until-revoked");
+    const first = new HomeStore(homeDir);
+    try {
+      first.createBot({
+        id: botId,
+        name: "Ada",
+        color: "#ff3b5c",
+        shape: "capsule",
+        harness: "codex",
+        createdAt: "2026-08-27T10:00:00.000Z",
+      }, channelId);
+      first.appendMessage(channelId, {
+        id: cardId,
+        role: "assistant",
+        senderId: botId,
+        kind: "card",
+        card: pending,
+        text: "Host access requested: Waiting for you",
+        createdAt: "2026-08-27T10:01:00.000Z",
+      });
+      first.resolveHostGrantCard(cardId, resolved, {
+        path: requestedPath,
+        access: "read-write",
+        duration: "until-revoked",
+      });
+      assert.equal(first.matchHostGrant(requestedPath, "read-write")?.duration, "until-revoked");
+    } finally {
+      first.close();
     }
 
-    const restarted = await startCardBox(homeDir, pwaDir);
+    const restarted = new HomeStore(homeDir);
     try {
-      const cookie = await login(restarted.box);
-      const botResponse = await fetch(`${restarted.box.url}/api/bots/${botId}`, { headers: { cookie } });
-      const bot = (await botResponse.json()) as { messages: CardMessage[] };
-      const persisted = bot.messages.find((message) => message.id === cardId);
+      const persisted = restarted.getMessage(channelId, cardId);
       assert.deepEqual(persisted?.card?.status, {
         tone: "success",
         label: "Read and write · until revoked",
       });
       assert.deepEqual(persisted?.card?.actions, []);
-
-      const grantsResponse = await fetch(`${restarted.box.url}/api/host-grants`, { headers: { cookie } });
-      const grants = (await grantsResponse.json()) as {
-        grants: Array<{ path: string; access: string; duration: string }>;
-      };
-      assert.equal(
-        grants.grants.some((grant) =>
-          grant.path === requestedPath
-          && grant.access === "read-write"
-          && grant.duration === "until-revoked"),
-        true,
-      );
+      assert.equal(restarted.matchHostGrant(requestedPath, "read-write")?.duration, "until-revoked");
     } finally {
-      await restarted.box.close();
+      restarted.close();
+    }
+  });
+
+  test("preserves the dormant Host-grant HTTP answer flow without enabling normal classification", async () => {
+    const homeDir = await tempHome();
+    const pwaDir = await mkdtemp(join(tmpdir(), "openbot-host-compat-http-pwa-"));
+    await writeFile(join(pwaDir, "index.html"), "<!doctype html><title>OpenBot</title>");
+    const answered: string[] = [];
+    const client: AcpSession = {
+      close() {},
+      async initialize() { return {}; },
+      async newSession() { return "dormant-host-session"; },
+      async prompt() { return "unused"; },
+      cancel() {},
+      respondPermission(_rpcId, optionId) { answered.push(optionId); },
+    };
+    const store = new BotStore(homeDir, {
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: () => client,
+    });
+    const created = await store.create("Ada");
+    await store.pickHarness(created.id, "codex");
+    const requestedPath = "/tmp/openbot-dormant-http.txt";
+    const options = [
+      { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+      { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+    ];
+    const cardId = crypto.randomUUID();
+    const card = hostGrantTranscriptCard(requestedPath, "read-write", options);
+    type DormantRuntimeBot = {
+      permission: (PermissionPrompt & {
+        cardId: string;
+        title: string;
+        description: string;
+        hostGrant: { path: string; requested: "read-write" };
+      }) | null;
+      client: AcpSession | null;
+      write: boolean;
+      eyesMode: string;
+    };
+    const internals = store as unknown as {
+      home: HomeStore;
+      bots: Map<string, DormantRuntimeBot>;
+    };
+    const channelId = internals.home.directChannelId(created.id);
+    assert.ok(channelId);
+    internals.home.appendMessage(channelId, {
+      id: cardId,
+      role: "assistant",
+      senderId: created.id,
+      kind: "card",
+      card,
+      text: "Host access requested: Waiting for you",
+      createdAt: "2026-08-27T10:02:00.000Z",
+    });
+    const runtime = internals.bots.get(created.id);
+    assert.ok(runtime);
+    runtime.permission = {
+      rpcId: 801,
+      title: "Dormant Host compatibility",
+      description: card.body,
+      toolKind: "edit",
+      options,
+      cardId,
+      hostGrant: { path: requestedPath, requested: "read-write" },
+    };
+    runtime.client = client;
+    runtime.write = true;
+    runtime.eyesMode = "needs-you";
+
+    const box = await startBox({
+      password: "correct-horse",
+      pwaDir,
+      host: "127.0.0.1",
+      port: 0,
+      homeDir,
+      botStore: store,
+    });
+    let boxClosed = false;
+    try {
+      const cookie = await login(box);
+      const response = await fetch(`${box.url}/api/bots/${created.id}/permissions`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ cardId, access: "read-write", duration: "until-revoked" }),
+      });
+      assert.equal(response.status, 200, await response.text());
+      assert.deepEqual(answered, ["allow-once"]);
+      await box.close();
+      boxClosed = true;
+
+      const restarted = await startBox({
+        password: "correct-horse",
+        pwaDir,
+        host: "127.0.0.1",
+        port: 0,
+        homeDir,
+      });
+      try {
+        const restartedCookie = await login(restarted);
+        const botResponse = await fetch(`${restarted.url}/api/bots/${created.id}`, {
+          headers: { cookie: restartedCookie },
+        });
+        const persisted = (await botResponse.json()) as { messages: CardMessage[] };
+        const resolved = persisted.messages.find((message) => message.id === cardId)?.card;
+        assert.deepEqual(resolved?.status, { tone: "success", label: "Read and write · until revoked" });
+        assert.deepEqual(resolved?.actions, []);
+        const grantsResponse = await fetch(`${restarted.url}/api/host-grants`, {
+          headers: { cookie: restartedCookie },
+        });
+        const grants = (await grantsResponse.json()) as { grants: Array<{ path: string; duration: string }> };
+        assert.equal(grants.grants.some((grant) =>
+          grant.path === requestedPath && grant.duration === "until-revoked"), true);
+      } finally {
+        await restarted.close();
+      }
+    } finally {
+      if (!boxClosed) await box.close();
     }
   });
 
@@ -665,7 +890,256 @@ describe("Talk HTTP Transcript Cards", () => {
     }
   });
 
-  test("stores a permission choice before acknowledging it and closes a failed ACP transport", async () => {
+  test("serializes duplicate Card actions so one exact pending permission is consumed once", async () => {
+    const homeDir = await tempHome();
+    const pwaDir = await mkdtemp(join(tmpdir(), "openbot-duplicate-card-pwa-"));
+    await writeFile(join(pwaDir, "index.html"), "<!doctype html><title>OpenBot</title>");
+    const running = await startCardBox(homeDir, pwaDir);
+    running.fake.holdResponses();
+    running.fake.holdTransport();
+    try {
+      const cookie = await login(running.box);
+      const created = await fetch(`${running.box.url}/api/bots`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ name: "Ada" }),
+      });
+      const botId = ((await created.json()) as { id: string }).id;
+      await fetch(`${running.box.url}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ harness: "codex" }),
+      });
+      await fetch(`${running.box.url}/api/bots/${botId}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "Run once." }),
+      });
+      running.fake.fire({
+        rpcId: 77,
+        title: "Permission",
+        toolKind: "execute",
+        options: [
+          { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+          { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+        ],
+      });
+      const pending = await waitForCard(running.box, cookie, botId);
+      const answer = () => fetch(`${running.box.url}/api/bots/${botId}/permissions`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ cardId: pending.id, optionId: "allow-once" }),
+      });
+      const first = answer();
+      const second = answer();
+      const duplicateDeadline = Date.now() + 100;
+      while (running.fake.answered.length < 2 && Date.now() < duplicateDeadline) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      running.fake.releaseTransport();
+      const responses = await Promise.all([first, second]);
+      assert.deepEqual(responses.map((response) => response.status).sort(), [200, 409]);
+      assert.deepEqual(running.fake.answered, ["allow-once"]);
+    } finally {
+      running.fake.releaseTransport();
+      await running.box.close();
+    }
+  });
+
+  test("does not revive a queued prompt or resolve an expired Card after Turn replacement", async () => {
+    const homeDir = await tempHome();
+    const pwaDir = await mkdtemp(join(tmpdir(), "openbot-replaced-permission-pwa-"));
+    await writeFile(join(pwaDir, "index.html"), "<!doctype html><title>OpenBot</title>");
+    const running = await startCardBox(homeDir, pwaDir);
+    running.fake.holdResponses();
+    running.fake.holdTransport();
+    try {
+      const cookie = await login(running.box);
+      const created = await fetch(`${running.box.url}/api/bots`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ name: "Ada" }),
+      });
+      const botId = ((await created.json()) as { id: string }).id;
+      await fetch(`${running.box.url}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ harness: "codex" }),
+      });
+      await fetch(`${running.box.url}/api/bots/${botId}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "First Turn." }),
+      });
+      const options = [
+        { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+        { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+      ];
+      running.fake.fire({ rpcId: 81, title: "First", toolKind: "execute", options });
+      const firstCard = await waitForCard(running.box, cookie, botId);
+      const answer = fetch(`${running.box.url}/api/bots/${botId}/permissions`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ cardId: firstCard.id, optionId: "allow-once" }),
+      });
+      const answerDeadline = Date.now() + 500;
+      while (running.fake.answered.length === 0 && Date.now() < answerDeadline) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.deepEqual(running.fake.answered, ["allow-once"]);
+
+      running.fake.fire({ rpcId: 82, title: "Queued stale prompt", toolKind: "read", options });
+      const replacement = await fetch(`${running.box.url}/api/bots/${botId}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "Replacement Turn." }),
+      });
+      assert.equal(replacement.status, 200);
+      running.fake.releaseTransport();
+      assert.equal((await answer).status, 409);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const currentResponse = await fetch(`${running.box.url}/api/bots/${botId}`, { headers: { cookie } });
+      const current = (await currentResponse.json()) as { permission: unknown; messages: CardMessage[] };
+      assert.equal(current.permission, null);
+      const cards = current.messages.filter((message) => message.kind === "card");
+      assert.equal(cards.length, 1);
+      assert.deepEqual(cards[0]?.card?.status, { tone: "neutral", label: "No longer available" });
+    } finally {
+      running.fake.releaseTransport();
+      await running.box.close();
+    }
+  });
+
+  test("does not append a superseding prompt after its Turn is replaced mid-delivery", async () => {
+    const homeDir = await tempHome();
+    const pwaDir = await mkdtemp(join(tmpdir(), "openbot-supersede-replaced-pwa-"));
+    await writeFile(join(pwaDir, "index.html"), "<!doctype html><title>OpenBot</title>");
+    const running = await startCardBox(homeDir, pwaDir);
+    running.fake.holdResponses();
+    try {
+      const cookie = await login(running.box);
+      const created = await fetch(`${running.box.url}/api/bots`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ name: "Ada" }),
+      });
+      const botId = ((await created.json()) as { id: string }).id;
+      await fetch(`${running.box.url}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ harness: "codex" }),
+      });
+      await fetch(`${running.box.url}/api/bots/${botId}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "First Turn." }),
+      });
+      const options = [
+        { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+        { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+      ];
+      running.fake.fire({ rpcId: 83, title: "First", toolKind: "execute", options });
+      const firstCard = await waitForCard(running.box, cookie, botId);
+      running.fake.holdTransport();
+      running.fake.fire({ rpcId: 84, title: "Superseding", toolKind: "read", options });
+      const rejectDeadline = Date.now() + 500;
+      while (running.fake.answered.length === 0 && Date.now() < rejectDeadline) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.deepEqual(running.fake.answered, ["reject-once"]);
+
+      const replacement = await fetch(`${running.box.url}/api/bots/${botId}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "Replacement Turn." }),
+      });
+      assert.equal(replacement.status, 200);
+      running.fake.releaseTransport();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const currentResponse = await fetch(`${running.box.url}/api/bots/${botId}`, { headers: { cookie } });
+      const current = (await currentResponse.json()) as { permission: unknown; messages: CardMessage[] };
+      assert.equal(current.permission, null);
+      const cards = current.messages.filter((message) => message.kind === "card");
+      assert.equal(cards.length, 1);
+      assert.equal(cards[0]?.id, firstCard.id);
+      assert.deepEqual(cards[0]?.card?.status, { tone: "neutral", label: "No longer available" });
+    } finally {
+      running.fake.releaseTransport();
+      await running.box.close();
+    }
+  });
+
+  test("does not let a rejected stale answer fail its replacement Turn", async () => {
+    const homeDir = await tempHome();
+    const pwaDir = await mkdtemp(join(tmpdir(), "openbot-stale-rejection-pwa-"));
+    await writeFile(join(pwaDir, "index.html"), "<!doctype html><title>OpenBot</title>");
+    const running = await startCardBox(homeDir, pwaDir);
+    running.fake.holdResponses();
+    try {
+      const cookie = await login(running.box);
+      const created = await fetch(`${running.box.url}/api/bots`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ name: "Ada" }),
+      });
+      const botId = ((await created.json()) as { id: string }).id;
+      await fetch(`${running.box.url}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ harness: "codex" }),
+      });
+      await fetch(`${running.box.url}/api/bots/${botId}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "Original Turn." }),
+      });
+      running.fake.fire({
+        rpcId: 85,
+        title: "Original",
+        toolKind: "execute",
+        options: [
+          { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+          { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+        ],
+      });
+      const pending = await waitForCard(running.box, cookie, botId);
+      running.fake.holdTransport();
+      const answer = fetch(`${running.box.url}/api/bots/${botId}/permissions`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ cardId: pending.id, optionId: "allow-once" }),
+      });
+      while (running.fake.answered.length === 0) await new Promise((resolve) => setImmediate(resolve));
+
+      const replacement = await fetch(`${running.box.url}/api/bots/${botId}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "Replacement Turn." }),
+      });
+      assert.equal(replacement.status, 200);
+      running.fake.failResponses();
+      running.fake.releaseTransport();
+      assert.equal((await answer).status, 409);
+
+      const currentResponse = await fetch(`${running.box.url}/api/bots/${botId}`, { headers: { cookie } });
+      const current = (await currentResponse.json()) as { write: boolean; messages: CardMessage[] };
+      assert.equal(current.write, true);
+      const card = current.messages.find((message) => message.id === pending.id)?.card;
+      assert.deepEqual(card?.status, { tone: "neutral", label: "No longer available" });
+      assert.equal(card?.kind, "permission");
+      assert.equal(
+        current.messages.filter((message) => message.role === "user" && message.text === "Replacement Turn.").length,
+        1,
+      );
+    } finally {
+      running.fake.releaseTransport();
+      await running.box.close();
+    }
+  });
+
+  test("keeps a permission pending until transport succeeds and turns delivery failure into a retry Card", async () => {
     const homeDir = await tempHome();
     const pwaDir = await mkdtemp(join(tmpdir(), "openbot-card-ack-failure-pwa-"));
     await writeFile(join(pwaDir, "index.html"), "<!doctype html><title>OpenBot</title>");
@@ -713,14 +1187,22 @@ describe("Talk HTTP Transcript Cards", () => {
       const botResponse = await fetch(`${running.box.url}/api/bots/${botId}`, { headers: { cookie } });
       const bot = (await botResponse.json()) as {
         permission: unknown;
+        write: boolean;
         messages: CardMessage[];
       };
       assert.equal(bot.permission, null);
-      assert.deepEqual(bot.messages.find((message) => message.id === pending.id)?.card?.status, {
-        tone: "success",
-        label: "Allowed once",
+      const failedCard = bot.messages.find((message) => message.id === pending.id)?.card;
+      assert.deepEqual(failedCard && { ...failedCard, actions: [] }, {
+        kind: "bot-failure",
+        title: "Bot stopped",
+        body: "The Bot could not finish this message. Try again.",
+        status: { tone: "danger", label: "Failed" },
+        actions: [],
       });
-      assert.deepEqual(bot.messages.find((message) => message.id === pending.id)?.card?.actions, []);
+      const retryAction = failedCard?.actions[0];
+      assert.equal(retryAction?.command.kind, "retry-message");
+      assert.equal(retryAction?.command.messageId, bot.messages.find((message) => message.role === "user")?.id);
+      assert.equal(bot.write, false);
     } finally {
       await running.box.close();
     }
@@ -803,6 +1285,7 @@ describe("Talk HTTP Transcript Cards", () => {
       listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
       spawnAcp: failureFake("RETRY-SECRET").spawnAcp,
     });
+    let boxClosed = false;
     try {
       const cookie = await login(box);
       const created = await fetch(`${box.url}/api/bots`, {
@@ -819,23 +1302,48 @@ describe("Talk HTTP Transcript Cards", () => {
       await fetch(`${box.url}/api/bots/${botId}/messages`, {
         method: "POST",
         headers: { cookie, "content-type": "application/json" },
-        body: JSON.stringify({ text: "Retry this exact request." }),
+        body: JSON.stringify({ text: "Parent message." }),
       });
-      const failure = await waitForCard(box, cookie, botId);
+      const parentFailure = await waitForCard(box, cookie, botId);
+      const parentResponse = await fetch(`${box.url}/api/bots/${botId}`, { headers: { cookie } });
+      const parentBot = (await parentResponse.json()) as { messages: CardMessage[] };
+      const parent = parentBot.messages.find(
+        (message) => message.role === "user" && message.text === "Parent message.",
+      );
+      assert.ok(parent);
+
+      await fetch(`${box.url}/api/bots/${botId}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "Retry this exact request.", replyTo: parent.id }),
+      });
+      let failure: CardMessage | undefined;
+      const failureDeadline = Date.now() + 2_000;
+      while (!failure && Date.now() < failureDeadline) {
+        const response = await fetch(`${box.url}/api/bots/${botId}`, { headers: { cookie } });
+        const current = (await response.json()) as { messages: CardMessage[] };
+        failure = current.messages.find(
+          (message) => message.card?.kind === "bot-failure" && message.id !== parentFailure.id,
+        );
+        if (!failure) await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.ok(failure);
 
       const retried = await fetch(
         `${box.url}/api/bots/${botId}/cards/${failure.id}/retry`,
         { method: "POST", headers: { cookie } },
       );
-      assert.equal(retried.status, 200, await retried.text());
-      const bot = (await retried.json()) as { messages: CardMessage[] };
+      const retriedBody = await retried.text();
+      assert.equal(retried.status, 200, retriedBody);
+      const bot = JSON.parse(retriedBody) as { messages: CardMessage[] };
       const resolved = bot.messages.find((message) => message.id === failure.id);
       assert.deepEqual(resolved?.card?.status, { tone: "success", label: "Retried" });
       assert.deepEqual(resolved?.card?.actions, []);
-      assert.equal(
-        bot.messages.filter((message) => message.role === "user" && message.text === "Retry this exact request.").length,
-        2,
+      const retriedMessages = bot.messages.filter(
+        (message) => message.role === "user" && message.text === "Retry this exact request.",
       );
+      assert.equal(retriedMessages.length, 2);
+      assert.deepEqual(retriedMessages.map((message) => message.replyTo), [parent.id, parent.id]);
 
       const stale = await fetch(
         `${box.url}/api/bots/${botId}/cards/${failure.id}/retry`,
@@ -844,6 +1352,7 @@ describe("Talk HTTP Transcript Cards", () => {
       assert.equal(stale.status, 409);
 
       await box.close();
+      boxClosed = true;
       const restarted = await startBox({
         password: "correct-horse",
         pwaDir,
@@ -866,6 +1375,116 @@ describe("Talk HTTP Transcript Cards", () => {
         await restarted.close();
       }
     } finally {
+      if (!boxClosed) await box.close();
+    }
+  });
+
+  test("reserves client startup so retry and Send cannot spawn concurrent Sessions", async () => {
+    const homeDir = await tempHome();
+    const pwaDir = await mkdtemp(join(tmpdir(), "openbot-retry-send-race-pwa-"));
+    await writeFile(join(pwaDir, "index.html"), "<!doctype html><title>OpenBot</title>");
+    const fake = permissionFake();
+    fake.failNextInitialize();
+    const running = await startCardBox(homeDir, pwaDir, fake);
+    try {
+      const cookie = await login(running.box);
+      const created = await fetch(`${running.box.url}/api/bots`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ name: "Ada" }),
+      });
+      const botId = ((await created.json()) as { id: string }).id;
+      await fetch(`${running.box.url}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ harness: "codex" }),
+      });
+      const failed = await fetch(`${running.box.url}/api/bots/${botId}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "Retry me." }),
+      });
+      const failedBody = (await failed.json()) as { messages: CardMessage[] };
+      const failure = failedBody.messages.find((message) => message.card?.kind === "bot-failure");
+      assert.ok(failure);
+
+      fake.holdInitialize();
+      const retry = fetch(`${running.box.url}/api/bots/${botId}/cards/${failure.id}/retry`, {
+        method: "POST",
+        headers: { cookie },
+      });
+      while (fake.spawned < 2) await new Promise((resolve) => setImmediate(resolve));
+      const competing = await fetch(`${running.box.url}/api/bots/${botId}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "Competing Send." }),
+      });
+      assert.equal(competing.status, 409);
+      assert.equal(fake.spawned, 2);
+
+      fake.releaseInitialize();
+      assert.equal((await retry).status, 200);
+      assert.equal(fake.spawned, 2);
+    } finally {
+      fake.releaseInitialize();
+      await running.box.close();
+    }
+  });
+
+  test("does not restore an Isolated Session after switching to Host during startup", async () => {
+    const homeDir = await tempHome();
+    const pwaDir = await mkdtemp(join(tmpdir(), "openbot-startup-mode-switch-pwa-"));
+    await writeFile(join(pwaDir, "index.html"), "<!doctype html><title>OpenBot</title>");
+    const fake = configSwitchDuringStartupFake();
+    const box = await startBox({
+      password: "correct-horse",
+      pwaDir,
+      host: "127.0.0.1",
+      port: 0,
+      homeDir,
+      listHarnesses: () => [{ id: "codex", name: "Codex", bin: "codex", talk: true }],
+      spawnAcp: fake.spawnAcp,
+    });
+    try {
+      const cookie = await login(box);
+      const created = await fetch(`${box.url}/api/bots`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ name: "Ada" }),
+      });
+      const botId = ((await created.json()) as { id: string }).id;
+      await fetch(`${box.url}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ harness: "codex" }),
+      });
+
+      const staleSend = fetch(`${box.url}/api/bots/${botId}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "Start Isolated." }),
+      });
+      while (fake.spawned < 1) await new Promise((resolve) => setImmediate(resolve));
+      const switched = await fetch(`${box.url}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ configMode: "host" }),
+      });
+      assert.equal(switched.status, 200);
+      fake.releaseInitialize();
+      assert.equal((await staleSend).status, 409);
+      assert.deepEqual(fake.createdSessions, ["isolated-stale"]);
+
+      const hostSend = await fetch(`${box.url}/api/bots/${botId}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "Start Host." }),
+      });
+      assert.equal(hostSend.status, 200);
+      assert.deepEqual(fake.loadedSessions, []);
+      assert.deepEqual(fake.createdSessions, ["isolated-stale", "host-fresh"]);
+    } finally {
+      fake.releaseInitialize();
       await box.close();
     }
   });

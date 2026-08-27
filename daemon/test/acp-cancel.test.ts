@@ -164,6 +164,30 @@ function defer() {
 }
 
 describe("AcpClient cancellation boundary", () => {
+  test("rejects a permission response when the real child transport is closed", async () => {
+    const client = new AcpClient({
+      command: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      env: { ...process.env },
+    }, process.cwd());
+
+    try {
+      let transportFailure: unknown;
+      const deadline = Date.now() + 1_000;
+      while (!transportFailure && Date.now() < deadline) {
+        try {
+          await client.respondPermission(900, "allow-once");
+        } catch (err) {
+          transportFailure = err;
+        }
+        if (!transportFailure) await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.match(String((transportFailure as Error)?.message ?? transportFailure), /closed|exited|write|pipe/i);
+    } finally {
+      client.close();
+    }
+  });
+
   test("drains cancelled updates before assigning replacement Turn handlers", async () => {
     const oldPermission = defer();
     const oldMessages: string[] = [];
