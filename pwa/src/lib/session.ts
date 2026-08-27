@@ -20,6 +20,28 @@ export async function unlock(password: string): Promise<{ ok: true } | { ok: fal
 
 export type EyesMode = "idle" | "think" | "work" | "write" | "needs-you" | "sleep";
 
+export type TranscriptCardAction = {
+  id: string;
+  label: string;
+  intent: "primary" | "secondary";
+  command:
+    | { kind: "permission"; optionId: string }
+    | { kind: "host-grant"; access: "read" | "read-write" | "deny" }
+    | { kind: "retry-message"; messageId: string };
+};
+
+export type TranscriptCard = {
+  kind: "permission" | "host-grant" | "bot-failure" | "computer";
+  title: string;
+  body: string;
+  preview?: string;
+  status: {
+    tone: "neutral" | "waiting" | "success" | "danger";
+    label: string;
+  };
+  actions: TranscriptCardAction[];
+};
+
 export type Bot = {
   id: string;
   name: string;
@@ -30,6 +52,7 @@ export type Bot = {
   zoom?: boolean;
   display?: number | null;
   permission: {
+    cardId?: string;
     title: string;
     description?: string;
     options: Array<{ optionId: string; name: string; kind?: string }>;
@@ -51,7 +74,8 @@ export type Bot = {
     receipt?: "sent" | "delivered" | "read";
     replyTo?: string;
     reactions?: Array<{ emoji: string; by: "user" }>;
-    kind?: "text" | "host-grant";
+    kind?: "text" | "host-grant" | "card";
+    card?: TranscriptCard;
   }>;
 };
 
@@ -207,12 +231,12 @@ export async function toggleReaction(botId: string, messageId: string, emoji: st
   return (await res.json()) as Bot;
 }
 
-export async function answerPermission(botId: string, optionId: string): Promise<Bot> {
+export async function answerPermission(botId: string, cardId: string, optionId: string): Promise<Bot> {
   const res = await fetch(`/api/bots/${encodeURIComponent(botId)}/permissions`, {
     method: "POST",
     credentials: "same-origin",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ optionId }),
+    body: JSON.stringify({ cardId, optionId }),
   });
   if (!res.ok) {
     throw new Error("Could not answer permission.");
@@ -220,8 +244,21 @@ export async function answerPermission(botId: string, optionId: string): Promise
   return (await res.json()) as Bot;
 }
 
+export async function retryTranscriptCard(botId: string, cardId: string): Promise<Bot> {
+  const res = await fetch(
+    `/api/bots/${encodeURIComponent(botId)}/cards/${encodeURIComponent(cardId)}/retry`,
+    { method: "POST", credentials: "same-origin" },
+  );
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Could not retry this message.");
+  }
+  return (await res.json()) as Bot;
+}
+
 export async function answerHostGrant(
   botId: string,
+  cardId: string,
   access: string,
   duration: string,
 ): Promise<Bot> {
@@ -229,7 +266,7 @@ export async function answerHostGrant(
     method: "POST",
     credentials: "same-origin",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ access, duration }),
+    body: JSON.stringify({ cardId, access, duration }),
   });
   if (!res.ok) {
     throw new Error("Could not answer Host grant.");

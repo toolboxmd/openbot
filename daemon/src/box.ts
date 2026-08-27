@@ -20,6 +20,7 @@ export type BoxOptions = {
   homeDir?: string;
   workspaceDir?: string;
   computer?: ComputerRuntime;
+  botStore?: BotStore;
 } & Pick<BotStoreDeps, "spawnAcp" | "listHarnesses">;
 
 export type RunningBox = {
@@ -408,7 +409,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
   const homeDir = path.resolve(options.homeDir ?? defaultHomeDir());
   const workspaceDir = path.resolve(options.workspaceDir ?? defaultWorkspaceDir(homeDir));
   fsSync.mkdirSync(workspaceDir, { recursive: true });
-  const store = new BotStore(homeDir, {
+  const store = options.botStore ?? new BotStore(homeDir, {
     computer,
     spawnAcp: options.spawnAcp,
     listHarnesses: options.listHarnesses,
@@ -682,6 +683,24 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         return;
       }
 
+      const retryCardMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/cards\/([^/]+)\/retry$/);
+      if (retryCardMatch && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        try {
+          const bot = await store.retryCard(
+            decodeURIComponent(retryCardMatch[1]),
+            decodeURIComponent(retryCardMatch[2]),
+          );
+          sendJson(res, 200, bot);
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
       const botReadMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/read$/);
       if (botReadMatch && method === "POST") {
         if (!hasSession(req, key)) {
@@ -759,13 +778,14 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         }
         try {
           const botId = decodeURIComponent(permMatch[1]);
+          const cardId = typeof body.cardId === "string" ? body.cardId : "";
           if (typeof body.access === "string") {
             const duration = typeof body.duration === "string" ? body.duration : "session";
-            const bot = store.answerHostGrant(botId, body.access, duration);
+            const bot = await store.answerHostGrant(botId, body.access, duration, cardId);
             sendJson(res, 200, bot);
           } else {
             const optionId = typeof body.optionId === "string" ? body.optionId : "";
-            const bot = store.answerPermission(botId, optionId);
+            const bot = await store.answerPermission(botId, optionId, cardId);
             sendJson(res, 200, bot);
           }
         } catch (err) {

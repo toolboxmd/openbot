@@ -474,7 +474,7 @@ describe("HomeStore sqlite", () => {
     try {
       const version = probe.prepare("PRAGMA user_version").get() as { user_version?: number };
       assert.equal(version.user_version, HOME_SCHEMA_VERSION);
-      assert.equal(HOME_SCHEMA_VERSION, 4);
+      assert.equal(HOME_SCHEMA_VERSION, 5);
       const table = probe
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'channel_reads'")
         .get() as { name?: string } | undefined;
@@ -823,6 +823,29 @@ describe("channelHistory and talkPrompt", () => {
     assert.match(history, /\[Earlier transcript clipped\]/);
     assert.equal(history.length, 64_000);
     assert.match(history, /^Recent Channel transcript:\n/);
+  });
+
+  test("keeps Cards out of the speech transcript injected into ACP", () => {
+    const history = channelHistory([
+      { id: "u1", role: "user", senderId: HUMAN_MEMBER_ID, text: "hello", createdAt: iso() },
+      {
+        id: "c1",
+        role: "assistant",
+        senderId: "ada",
+        kind: "card",
+        text: "Permission requested: Waiting for you",
+        createdAt: iso(1),
+        card: {
+          kind: "permission",
+          title: "Permission requested",
+          body: "This Bot needs approval.",
+          status: { tone: "waiting", label: "Waiting for you" },
+          actions: [],
+        },
+      },
+      { id: "a1", role: "assistant", senderId: "ada", text: "done", createdAt: iso(2) },
+    ], "Ada");
+    assert.equal(history, "Recent Channel transcript:\nYou: hello\nAda: done");
   });
 
   test("talkPrompt includes Replying to even when history is empty", () => {

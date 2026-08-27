@@ -155,6 +155,53 @@ input.on("line", (line) => {
 });
 `;
 
+const MALFORMED_PERMISSION_ACP = String.raw`
+const readline = require("node:readline");
+const input = readline.createInterface({ input: process.stdin });
+let promptId = null;
+let permissionId = null;
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
+input.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ jsonrpc: "2.0", id: message.id, result: { authMethods: [] } });
+    return;
+  }
+  if (message.method === "session/new") {
+    send({ jsonrpc: "2.0", id: message.id, result: { sessionId: "malformed-session" } });
+    return;
+  }
+  if (message.method === "session/prompt") {
+    const text = message.params.prompt[0].text;
+    if (text === "malformed" || text === "duplicate") {
+      promptId = message.id;
+      permissionId = text === "malformed" ? 800 : 801;
+      send({
+        jsonrpc: "2.0",
+        id: permissionId,
+        method: "session/request_permission",
+        params: {
+          sessionId: "malformed-session",
+          title: "Malformed choices",
+          options: text === "malformed"
+            ? [null, { optionId: "allow-once", name: "Allow", kind: "allow_once" }]
+            : [
+              { optionId: "same-choice", name: "Allow", kind: "allow_once" },
+              { optionId: "same-choice", name: "Reject", kind: "reject_once" },
+            ],
+        },
+      });
+      return;
+    }
+    send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
+    return;
+  }
+  if (message.id === permissionId && message.result?.outcome?.outcome === "cancelled") {
+    send({ jsonrpc: "2.0", id: promptId, result: { stopReason: "cancelled" } });
+  }
+});
+`;
+
 function defer() {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => {
@@ -164,6 +211,58 @@ function defer() {
 }
 
 describe("AcpClient cancellation boundary", () => {
+  test("fails malformed and duplicate permission options closed without poisoning the next Turn", async () => {
+    const seenOptions: unknown[] = [];
+    const client = new AcpClient({
+      command: process.execPath,
+      args: ["-e", MALFORMED_PERMISSION_ACP],
+      env: { ...process.env },
+    }, process.cwd());
+
+    try {
+      await client.initialize();
+      await client.newSession(process.cwd());
+      const rejectInvalidPrompt = (text: string) => client.prompt(text, {
+        onPermission(prompt) {
+          seenOptions.push(prompt.options);
+          client.cancel();
+        },
+      }).catch((error: unknown) => error);
+      const malformed = rejectInvalidPrompt("malformed");
+      assert.equal(isCancelled(await malformed), true);
+      const duplicate = rejectInvalidPrompt("duplicate");
+      assert.equal(isCancelled(await duplicate), true);
+      assert.deepEqual(seenOptions, [[], []]);
+      assert.equal(await client.prompt("recovered"), "");
+    } finally {
+      client.close();
+    }
+  });
+
+  test("rejects a permission response when the real child transport is closed", async () => {
+    const client = new AcpClient({
+      command: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      env: { ...process.env },
+    }, process.cwd());
+
+    try {
+      let transportFailure: unknown;
+      const deadline = Date.now() + 1_000;
+      while (!transportFailure && Date.now() < deadline) {
+        try {
+          await client.respondPermission(900, "allow-once");
+        } catch (err) {
+          transportFailure = err;
+        }
+        if (!transportFailure) await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.match(String((transportFailure as Error)?.message ?? transportFailure), /closed|exited|write|pipe/i);
+    } finally {
+      client.close();
+    }
+  });
+
   test("drains cancelled updates before assigning replacement Turn handlers", async () => {
     const oldPermission = defer();
     const oldMessages: string[] = [];
