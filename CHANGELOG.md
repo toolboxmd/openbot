@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.2] - 2026-08-27
+
+### Changed
+
+- Supervise one durable PinchTab bridge process group per Screen display with bounded health and browser-bootstrap readiness.
+- Fail the PinchTab MCP transport closed on malformed, ambiguous, stalled, backpressured, or disconnected JSON-RPC streams.
+
 ## [0.9.1] - 2026-08-27
 
 ### Changed

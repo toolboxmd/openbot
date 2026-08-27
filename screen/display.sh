@@ -53,6 +53,81 @@ process_matches() {
     && [ "$(process_start_id "$pid")" = "$expected_start" ]
 }
 
+process_group_id() {
+  local pid="$1"
+  ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+process_group_alive() {
+  local pgid="$1"
+  [ -n "$pgid" ] && kill -0 -- "-${pgid}" 2>/dev/null
+}
+
+terminate_exact_process_or_group() {
+  local pid="$1"
+  local expected_start="$2"
+  local expected_pgid="${3:-}"
+  local pgid target i
+  target="$pid"
+  pgid=""
+  if [ -n "$expected_pgid" ] && [ "$expected_pgid" = "$pid" ]; then
+    pgid="$expected_pgid"
+    if process_matches "$pid" "$expected_start"; then
+      if [ "$(process_group_id "$pid")" != "$expected_pgid" ]; then
+        return 1
+      fi
+    elif ! process_group_alive "$expected_pgid"; then
+      return 0
+    fi
+    target="-${expected_pgid}"
+  elif ! process_matches "$pid" "$expected_start"; then
+    return 0
+  fi
+  # Revalidate the exact leader identity or captured live group immediately before TERM.
+  if [ "$target" = "$pid" ]; then
+    process_matches "$pid" "$expected_start" || return 0
+  else
+    if process_matches "$pid" "$expected_start" \
+      && [ "$(process_group_id "$pid")" != "$expected_pgid" ]; then
+      return 1
+    fi
+    process_group_alive "$expected_pgid" || return 0
+  fi
+  kill -TERM -- "$target" 2>/dev/null || true
+  for i in $(seq 1 10); do
+    if [ "$target" = "$pid" ]; then
+      if ! process_matches "$pid" "$expected_start"; then
+        wait "$pid" 2>/dev/null || true
+        return 0
+      fi
+    elif ! process_group_alive "$pgid"; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
+  if [ "$target" = "$pid" ]; then
+    if process_matches "$pid" "$expected_start"; then
+      kill -KILL -- "$pid" 2>/dev/null || true
+    fi
+  elif process_group_alive "$pgid"; then
+    kill -KILL -- "-${pgid}" 2>/dev/null || true
+  fi
+  for i in $(seq 1 10); do
+    if [ "$target" = "$pid" ]; then
+      if ! process_matches "$pid" "$expected_start"; then
+        wait "$pid" 2>/dev/null || true
+        return 0
+      fi
+    elif ! process_group_alive "$pgid"; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
 pinchtab_lock_valid() {
   local n="$1"
   local lock pid start
@@ -328,8 +403,9 @@ pinchtab_health() {
 
 wait_bridge() {
   local port="$1"
+  local timeout="${2:-$PINCHTAB_START_TIMEOUT_SEC}"
   local deadline remaining request_timeout health_seen
-  deadline=$((SECONDS + PINCHTAB_START_TIMEOUT_SEC))
+  deadline=$((SECONDS + timeout))
   health_seen=0
   while [ "$SECONDS" -lt "$deadline" ]; do
     remaining=$((deadline - SECONDS))
@@ -498,7 +574,8 @@ pinchtab_supervise() {
 
 pinchtab_start_locked() {
   local n="$1"
-  local pt cfg log owner i ready_status
+  local pt cfg log owner i ready_status provisional_pid provisional_start provisional_pgid
+  local startup_deadline owner_deadline remaining
   pt="$(pinchtab_port "$n")"
   cfg="$(pinchtab_config "$n")"
   log="$(pinchtab_dir "$n")/bridge.log"
@@ -515,10 +592,36 @@ pinchtab_start_locked() {
   fi
 
   # One new session owns one supervisor and child for this display.
+  startup_deadline=$((SECONDS + PINCHTAB_START_TIMEOUT_SEC))
   OPENBOT_PINCHTAB_LOCK_PID="$$" \
     OPENBOT_PINCHTAB_LOCK_START="$(process_start_id "$$")" \
     "$SETSID_BIN" bash "$SCRIPT_PATH" pinchtab-supervise "$n" >>"$log" 2>&1 < /dev/null &
+  provisional_pid=$!
+  provisional_start=""
+  provisional_pgid=""
   for i in $(seq 1 50); do
+    provisional_start="$(process_start_id "$provisional_pid")"
+    provisional_pgid="$(process_group_id "$provisional_pid")"
+    if [ -n "$provisional_start" ] && [ "$provisional_pgid" = "$provisional_pid" ]; then
+      break
+    fi
+    sleep 0.01
+  done
+  if [ -z "$provisional_start" ] || [ "$provisional_pgid" != "$provisional_pid" ]; then
+    echo "openbot-display: PinchTab supervisor did not establish a verifiable process group" >&2
+    if [ -n "$provisional_start" ]; then
+      terminate_exact_process_or_group "$provisional_pid" "$provisional_start" "" || true
+    else
+      kill -KILL -- "$provisional_pid" 2>/dev/null || true
+    fi
+    pinchtab_stop_locked "$n"
+    return 1
+  fi
+  owner_deadline=$((SECONDS + 5))
+  if [ "$startup_deadline" -lt "$owner_deadline" ]; then
+    owner_deadline="$startup_deadline"
+  fi
+  while [ "$SECONDS" -lt "$owner_deadline" ]; do
     if pinchtab_owner_valid "$n" "$pt"; then
       break
     fi
@@ -526,10 +629,19 @@ pinchtab_start_locked() {
   done
   if ! pinchtab_owner_valid "$n" "$pt"; then
     echo "openbot-display: PinchTab supervisor did not publish owner ${owner}" >&2
+    if ! terminate_exact_process_or_group "$provisional_pid" "$provisional_start" "$provisional_pgid"; then
+      echo "openbot-display: provisional PinchTab supervisor ${provisional_pid} survived bounded TERM/KILL cleanup" >&2
+    fi
     pinchtab_stop_locked "$n"
     return 1
   fi
-  if wait_bridge "$pt"; then
+  remaining=$((startup_deadline - SECONDS))
+  if [ "$remaining" -le 0 ]; then
+    echo "openbot-display: PinchTab startup exhausted its $(pinchtab_deadline_summary) before readiness checks" >&2
+    pinchtab_stop_locked "$n"
+    return 1
+  fi
+  if wait_bridge "$pt" "$remaining"; then
     return 0
   else
     ready_status=$?

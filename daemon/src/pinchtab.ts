@@ -45,6 +45,8 @@ const MCP_INHERIT_ENV = [
   "TERM",
   "TMPDIR",
   "TZ",
+  "OPENBOT_PINCHTAB_MCP_CHILD_REQUEST_TIMEOUT_MS",
+  "OPENBOT_PINCHTAB_MCP_ID_LEDGER_MAX",
   "OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS",
 ] as const;
 
@@ -103,25 +105,26 @@ function pathWithLocalBin(pathEnv: string, home: string | undefined): string {
   return extra + path.delimiter + pathEnv;
 }
 
+function executableRegularFile(candidate: string): boolean {
+  try {
+    if (!fs.statSync(candidate).isFile()) return false;
+    fs.accessSync(candidate, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function resolveExecutable(bin: string, pathEnv: string): string | null {
   if (!bin) return null;
   if (bin.includes("/") || bin.includes("\\")) {
-    try {
-      fs.accessSync(bin, fs.constants.X_OK);
-      return bin;
-    } catch {
-      return null;
-    }
+    const candidate = path.resolve(bin);
+    return executableRegularFile(candidate) ? candidate : null;
   }
   for (const dir of pathEnv.split(path.delimiter)) {
     if (!dir || dir.includes(SHIM_MARKER)) continue;
-    const candidate = path.join(dir, bin);
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return candidate;
-    } catch {
-      continue;
-    }
+    const candidate = path.resolve(dir, bin);
+    if (executableRegularFile(candidate)) return candidate;
   }
   return null;
 }
