@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.5] - 2026-08-28
+
+### Changed
+
+- Harden Harness Home bootstrap rollback and config preservation for #98
+
 ## [0.9.4] - 2026-08-27
 
 ### Changed

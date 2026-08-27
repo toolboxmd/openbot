@@ -22,6 +22,7 @@ import {
   type TranscriptMessage,
 } from "./home.ts";
 import {
+  BotWorkspacePreparationError,
   botWorkspaceDir,
   ensureBotWorkspace,
   ensureHarnessHome,
@@ -33,15 +34,19 @@ import {
   isInsideScreenWorkspace,
   pickAllowOption,
   pickRejectOption,
+  prepareBotWorkspace,
   readAgentsFile,
   requestedAccessFromKind,
+  rollbackPreparedBotWorkspace,
   thisBotAgentsPath,
   writeAgentsFile,
   allBotsAgentsPath,
   applyVendorHomeEnv,
+  type BotWorkspaceRollback,
   type ConfigMode,
   type HostGrantAccess,
   type HostGrantDuration,
+  type PreparedBotWorkspace,
 } from "./harness-home.ts";
 import {
   isAuthError,
@@ -162,9 +167,15 @@ export class BotStore {
     this.computer = deps.computer ?? new NoopComputerRuntime();
     this.spawnAcpFn = deps.spawnAcp ?? spawnAcp;
     this.listHarnessesFn = deps.listHarnesses ?? listHarnessesOnPath;
-    fs.mkdirSync(this.workspaceDir, { recursive: true });
-    ensureHarnessHome(this.home.homeDir, this.workspaceDir);
-    this.load();
+    try {
+      const storedBots = this.home.listBots();
+      fs.mkdirSync(this.workspaceDir, { recursive: true });
+      ensureHarnessHome(this.home.homeDir, this.workspaceDir);
+      this.load(storedBots);
+    } catch (error) {
+      this.home.close();
+      throw error;
+    }
   }
 
   close(): void {
@@ -262,9 +273,36 @@ export class BotStore {
       configMode: "isolated",
       createdAt: nowIso(),
     };
-    const display = await this.computer.allocate(id);
-    this.home.createBot(stored, crypto.randomUUID());
-    ensureBotWorkspace(this.workspaceDir, id);
+    let preparedWorkspace: PreparedBotWorkspace;
+    try {
+      preparedWorkspace = prepareBotWorkspace(this.workspaceDir, id);
+    } catch (error) {
+      let bootstrapError = error;
+      if (error instanceof BotWorkspacePreparationError) {
+        bootstrapError = error.cause;
+        const rollback = rollbackPreparedBotWorkspace(error.preparedWorkspace);
+        if (!rollback.removed) {
+          throw botWorkspaceCleanupRequiredError("Bot workspace bootstrap failed", bootstrapError, rollback);
+        }
+      }
+      const detail = bootstrapError instanceof Error ? bootstrapError.message : String(bootstrapError);
+      throw Object.assign(new Error(`Bot workspace bootstrap failed: ${detail}`), {
+        status: 503,
+        code: "BOT_BOOTSTRAP_FAILED",
+        recoverable: true,
+      });
+    }
+    let display: DisplayHandle;
+    try {
+      display = await this.computer.allocate(id);
+      this.home.createBot(stored, crypto.randomUUID());
+    } catch (error) {
+      const rollback = rollbackPreparedBotWorkspace(preparedWorkspace);
+      if (!rollback.removed) {
+        throw botWorkspaceCleanupRequiredError("Bot creation failed", error, rollback);
+      }
+      throw error;
+    }
     const bot = this.runtimeBot(stored, display);
     this.bots.set(id, bot);
     return this.toPublic(bot, true);
@@ -490,8 +528,8 @@ export class BotStore {
     return this.toPublic(bot, true);
   }
 
-  private load(): void {
-    for (const stored of this.home.listBots()) {
+  private load(storedBots: StoredBot[]): void {
+    for (const stored of storedBots) {
       ensureBotWorkspace(this.workspaceDir, stored.id);
       this.bots.set(stored.id, this.runtimeBot(stored, null));
     }
@@ -811,6 +849,28 @@ export class BotStore {
     if (withMessages) out.messages = this.transcript(bot.id);
     return out;
   }
+}
+
+function botWorkspaceCleanupRequiredError(
+  context: string,
+  error: unknown,
+  rollback: BotWorkspaceRollback,
+): Error {
+  const detail = error instanceof Error ? error.message : String(error);
+  const status = typeof error === "object" && error !== null
+    ? (error as { status?: unknown }).status
+    : undefined;
+  return Object.assign(
+    new Error(
+      `${context}: ${detail}. Bot workspace ${JSON.stringify(rollback.preservedPath)} was preserved because ${rollback.reason}. Inspect it, preserve anything you need, and remove the directory only if safe before retrying.`,
+      { cause: error },
+    ),
+    {
+      status: typeof status === "number" ? status : 503,
+      code: "BOT_WORKSPACE_CLEANUP_REQUIRED",
+      recoverable: true,
+    },
+  );
 }
 
 function isPinchTabPermission(prompt: PermissionPrompt): boolean {
