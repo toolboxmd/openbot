@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, test } from "node:test";
 import { startBox, type RunningBox } from "../src/box.ts";
 import { listHarnessesOnPath, spawnSpec } from "../src/harness.ts";
@@ -68,6 +68,7 @@ type PublicBot = {
   write?: boolean;
   needsYou?: { reason?: string } | null;
   permission?: {
+    cardId?: string;
     title?: string;
     hostGrant?: { path?: string };
     options?: Array<{ optionId: string; name: string }>;
@@ -373,15 +374,19 @@ describe("Live Codex Isolated Harness Home", () => {
           box.url,
           cookie,
           adaId,
-          `Write the exact text GRANTED-${token} into the file ${allowPath}. Use that absolute path. Reply with done when the file exists.`,
+          `Use the file-edit tool directly on ${allowPath} to write the exact text GRANTED-${token}. Do not use exec, docker, Screen, find, or another path. Reply with done when the file exists.`,
         );
         const grant = await pollHostGrant(box.url, cookie, adaId);
         assert.ok(grant.hostGrant?.path);
-        assert.match(grant.hostGrant.path, /openbot-grant-/);
+        assert.equal(
+          grant.hostGrant.path === allowPath || grant.hostGrant.path === dirname(allowPath),
+          true,
+          `Host grant must be scoped to the requested file or its direct parent; got ${grant.hostGrant.path}`,
+        );
         const answered = await fetch(`${box.url}/api/bots/${adaId}/permissions`, {
           method: "POST",
           headers: { cookie, "content-type": "application/json" },
-          body: JSON.stringify({ access: "read-write", duration: "session" }),
+          body: JSON.stringify({ cardId: grant.cardId, access: "read-write", duration: "session" }),
         });
         assert.ok(answered.ok, await answered.text());
         const adaIdle = await pollIdle(box.url, cookie, adaId);
@@ -392,7 +397,7 @@ describe("Live Codex Isolated Harness Home", () => {
           box.url,
           cookie,
           benId,
-          `Append BEN-${token} to ${allowPath}. Reply with done. Do not ask me if a Host grant already exists.`,
+          `Use the file-edit tool directly on ${allowPath} to append BEN-${token}. Do not use exec, docker, Screen, find, or another path. A Host grant already exists, so do not ask me again. Reply with done.`,
         );
         const benStart = Date.now();
         let benSawCard = false;
@@ -413,14 +418,14 @@ describe("Live Codex Isolated Harness Home", () => {
           box.url,
           cookie,
           adaId,
-          `Write the exact text DENIED-${token} into the file ${denyPath}. Use that absolute path.`,
+          `Use the file-edit tool directly on ${denyPath} to write the exact text DENIED-${token}. Do not use exec, docker, Screen, find, or another path.`,
         );
         const denyCard = await pollHostGrant(box.url, cookie, adaId);
         assert.ok(denyCard.hostGrant?.path);
         const denied = await fetch(`${box.url}/api/bots/${adaId}/permissions`, {
           method: "POST",
           headers: { cookie, "content-type": "application/json" },
-          body: JSON.stringify({ access: "deny", duration: "session" }),
+          body: JSON.stringify({ cardId: denyCard.cardId, access: "deny", duration: "session" }),
         });
         assert.ok(denied.ok, await denied.text());
         await pollIdle(box.url, cookie, adaId);

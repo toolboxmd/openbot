@@ -13,8 +13,15 @@ import {
   type HostGrantAccess,
   type HostGrantDuration,
 } from "./harness-home.ts";
+import {
+  expiredTranscriptCard,
+  legacyHostGrantTranscriptCard,
+  parseTranscriptCard,
+  transcriptCardSummary,
+  type TranscriptCard,
+} from "./transcript-card.ts";
 
-export const HOME_SCHEMA_VERSION = 4;
+export const HOME_SCHEMA_VERSION = 5;
 export const HUMAN_MEMBER_ID = "you";
 
 export type MessageReceipt = "sent" | "delivered" | "read";
@@ -24,7 +31,7 @@ export type MessageReaction = {
   by: "user";
 };
 
-export type TranscriptKind = "text" | "host-grant";
+export type TranscriptKind = "text" | "host-grant" | "card";
 
 export type TranscriptMessage = {
   id: string;
@@ -32,6 +39,7 @@ export type TranscriptMessage = {
   text: string;
   createdAt: string;
   kind?: TranscriptKind;
+  card?: TranscriptCard;
   receipt?: MessageReceipt;
   replyTo?: string;
   reactions?: MessageReaction[];
@@ -104,7 +112,7 @@ const CHANNEL_SUMMARY_SELECT = `SELECT
     SELECT substr(messages.text, 1, 512)
     FROM messages
     WHERE messages.channel_id = channels.id
-      AND messages.kind = 'text'
+      AND messages.kind IN ('text', 'card')
       AND trim(messages.text) <> ''
     ORDER BY messages.activity_sequence DESC
     LIMIT 1
@@ -113,7 +121,7 @@ const CHANNEL_SUMMARY_SELECT = `SELECT
     SELECT messages.activity_at
     FROM messages
     WHERE messages.channel_id = channels.id
-      AND messages.kind = 'text'
+      AND messages.kind IN ('text', 'card')
       AND trim(messages.text) <> ''
     ORDER BY messages.activity_sequence DESC
     LIMIT 1
@@ -137,7 +145,7 @@ const CHANNEL_SUMMARY_SELECT = `SELECT
     FROM messages
     LEFT JOIN channel_reads ON channel_reads.channel_id = messages.channel_id
     WHERE messages.channel_id = channels.id
-      AND messages.kind = 'text'
+      AND messages.kind IN ('text', 'card')
       AND messages.sender_kind = 'bot'
       AND trim(messages.text) <> ''
       AND (
@@ -254,7 +262,7 @@ export class HomeStore {
   listMessages(channelId: string): TranscriptMessage[] {
     return this.db
       .prepare(
-        `SELECT id, kind, sender_kind, text, created_at, reply_to
+        `SELECT id, kind, sender_kind, text, created_at, reply_to, card_json
          FROM messages WHERE channel_id = ? ORDER BY sequence`,
       )
       .all(channelId)
@@ -264,7 +272,7 @@ export class HomeStore {
   getMessage(channelId: string, messageId: string): TranscriptMessage | null {
     const row = this.db
       .prepare(
-        `SELECT id, kind, sender_kind, text, created_at, reply_to
+        `SELECT id, kind, sender_kind, text, created_at, reply_to, card_json
          FROM messages WHERE channel_id = ? AND id = ?`,
       )
       .get(channelId, messageId) as SqlRow | undefined;
@@ -543,8 +551,8 @@ export class HomeStore {
         .prepare(
           `INSERT INTO messages
             (id, channel_id, kind, sender_kind, sender_id, text, created_at, reply_to,
-             activity_sequence, activity_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             activity_sequence, activity_at, card_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           message.id,
@@ -557,6 +565,7 @@ export class HomeStore {
           message.replyTo ?? null,
           activitySequence,
           message.createdAt,
+          message.card ? JSON.stringify(message.card) : null,
         );
       if (message.receipt && message.recipientBotId) {
         this.db
@@ -584,6 +593,84 @@ export class HomeStore {
         )
         .run(text, activitySequence, updatedAt, messageId);
     });
+  }
+
+  updateMessageCard(messageId: string, card: TranscriptCard, updatedAt = new Date().toISOString()): void {
+    if (this.closed) return;
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT channel_id FROM messages WHERE id = ? AND kind = 'card'").get(messageId) as SqlRow | undefined;
+      if (typeof row?.channel_id !== "string") {
+        throw Object.assign(new Error("Transcript Card not found"), { status: 404 });
+      }
+      const activitySequence = this.nextChannelActivitySequence(row.channel_id);
+      this.db
+        .prepare(
+          `UPDATE messages
+           SET text = ?, card_json = ?, revision = revision + 1, activity_sequence = ?, activity_at = ?
+           WHERE id = ?`,
+        )
+        .run(transcriptCardSummary(card), JSON.stringify(card), activitySequence, updatedAt, messageId);
+    });
+  }
+
+  resolveHostGrantCard(
+    messageId: string,
+    card: TranscriptCard,
+    grantInput: { path: string; access: HostGrantAccess; duration: HostGrantDuration } | null,
+    updatedAt = new Date().toISOString(),
+  ): StoredHostGrant | null {
+    if (this.closed) throw new Error("Home is closed");
+    const grant = grantInput && grantInput.duration !== "once"
+      ? {
+          id: crypto.randomUUID(),
+          path: path.resolve(grantInput.path),
+          access: grantInput.access,
+          duration: grantInput.duration,
+          consumed: false,
+          createdAt: updatedAt,
+        }
+      : null;
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT channel_id FROM messages WHERE id = ? AND kind = 'card'").get(messageId) as SqlRow | undefined;
+      if (typeof row?.channel_id !== "string") {
+        throw Object.assign(new Error("Transcript Card not found"), { status: 404 });
+      }
+      if (grant?.duration === "until-revoked") {
+        this.db
+          .prepare(
+            `INSERT INTO host_grants (id, path, access, duration, consumed, created_at)
+             VALUES (?, ?, ?, ?, 0, ?)`,
+          )
+          .run(grant.id, grant.path, grant.access, grant.duration, grant.createdAt);
+      }
+      const activitySequence = this.nextChannelActivitySequence(row.channel_id);
+      this.db
+        .prepare(
+          `UPDATE messages
+           SET text = ?, card_json = ?, revision = revision + 1, activity_sequence = ?, activity_at = ?
+           WHERE id = ?`,
+        )
+        .run(transcriptCardSummary(card), JSON.stringify(card), activitySequence, updatedAt, messageId);
+    });
+    if (grant?.duration === "session") this.sessionGrants.push(grant);
+    return grant;
+  }
+
+  expirePendingTranscriptCards(updatedAt = new Date().toISOString()): void {
+    if (this.closed) return;
+    const rows = this.db
+      .prepare("SELECT id, card_json FROM messages WHERE kind = 'card' AND card_json IS NOT NULL")
+      .all() as SqlRow[];
+    for (const row of rows) {
+      if (typeof row.id !== "string" || typeof row.card_json !== "string") continue;
+      try {
+        const card = parseTranscriptCard(JSON.parse(row.card_json) as unknown);
+        if (!card || card.status.tone !== "waiting" || card.actions.length === 0) continue;
+        this.updateMessageCard(row.id, expiredTranscriptCard(card), updatedAt);
+      } catch {
+        // Malformed private state stays hidden and cannot become actionable.
+      }
+    }
   }
 
   deleteMessage(messageId: string): boolean {
@@ -682,7 +769,8 @@ export class HomeStore {
           sender_id TEXT NOT NULL,
           text TEXT NOT NULL,
           created_at TEXT NOT NULL,
-          reply_to TEXT REFERENCES messages(id)
+          reply_to TEXT REFERENCES messages(id),
+          card_json TEXT
         );
 
         CREATE INDEX messages_channel_sequence ON messages(channel_id, sequence);
@@ -812,6 +900,22 @@ export class HomeStore {
             ON messages(channel_id, activity_sequence DESC);
         `);
       }
+      if (version <= 4 && !tableHasColumn(this.db, "messages", "card_json")) {
+        this.db.exec("ALTER TABLE messages ADD COLUMN card_json TEXT;");
+      }
+      if (version <= 4) {
+        const legacyCards = this.db
+          .prepare("SELECT id, text FROM messages WHERE kind = 'host-grant'")
+          .all() as SqlRow[];
+        const migrateCard = this.db.prepare(
+          "UPDATE messages SET kind = 'card', text = ?, card_json = ? WHERE id = ?",
+        );
+        for (const row of legacyCards) {
+          if (typeof row.id !== "string" || typeof row.text !== "string") continue;
+          const card = legacyHostGrantTranscriptCard(row.text);
+          migrateCard.run(transcriptCardSummary(card), JSON.stringify(card), row.id);
+        }
+      }
       this.db.exec(`PRAGMA user_version = ${HOME_SCHEMA_VERSION};`);
     });
   }
@@ -885,6 +989,17 @@ export class HomeStore {
       createdAt: row.created_at,
     };
     if (row.kind === "host-grant") message.kind = "host-grant";
+    if (row.kind === "card" && typeof row.card_json === "string") {
+      try {
+        const card = parseTranscriptCard(JSON.parse(row.card_json) as unknown);
+        if (card) {
+          message.kind = "card";
+          message.card = card;
+        }
+      } catch {
+        // Keep malformed private state out of the public Transcript.
+      }
+    }
     if (isReceipt(receiptRow?.state)) message.receipt = receiptRow.state;
     if (typeof row.reply_to === "string" && row.reply_to) message.replyTo = row.reply_to;
     if (reactions.length) message.reactions = reactions;

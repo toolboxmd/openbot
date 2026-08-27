@@ -13,6 +13,7 @@ import {
   applyVendorHomeEnv,
   ensureHarnessHome,
   extractPermissionPath,
+  extractPermissionPaths,
   isInsideScreenWorkspace,
   isInsideWorkspace,
   vendorDir,
@@ -235,6 +236,40 @@ allow_login_shell = true
       "/tmp/openbot-ws/bots/ada",
     );
     assert.equal(fromExec, "/home/box/.openbot-hh-live/outside/grant.txt");
+    const fromShellGroup = extractPermissionPath(
+      {
+        rawInput: {
+          command: "test -f /Users/example/outside/grant.txt)",
+        },
+      },
+      "/tmp/openbot-ws/bots/ada",
+    );
+    assert.equal(fromShellGroup, "/Users/example/outside/grant.txt");
+    const quotedClosingParenthesis = extractPermissionPath(
+      {
+        rawInput: {
+          command: "cat '/Users/example/outside/grant).txt'",
+        },
+      },
+      "/tmp/openbot-ws/bots/ada",
+    );
+    assert.equal(quotedClosingParenthesis, "/Users/example/outside/grant).txt");
+    const structuredClosingParenthesis = extractPermissionPath(
+      { locations: [{ path: "/Users/example/outside/grant).txt" }] },
+      "/tmp/openbot-ws/bots/ada",
+    );
+    assert.equal(structuredClosingParenthesis, "/Users/example/outside/grant).txt");
+    assert.deepEqual(
+      extractPermissionPaths(
+        {
+          rawInput: {
+            command: "cd /workspace && test -w /tmp/outside.txt >/dev/null",
+          },
+        },
+        "/tmp/openbot-ws/bots/ada",
+      ),
+      ["/workspace", "/tmp/outside.txt", "/dev/null"],
+    );
     assert.equal(isInsideScreenWorkspace("/workspace"), true);
     assert.equal(isInsideScreenWorkspace("/workspace/bots/ada"), true);
     assert.equal(isInsideScreenWorkspace("/workspace/bots/$OPENBOT_BOT_ID"), true);
@@ -445,16 +480,30 @@ describe("BotStore Isolated cwd and env", () => {
       rpcId: 12,
       title: "Write file",
       options: allowDenyOptions,
-      locations: [{ path: "/tmp/outside-ada.txt" }],
-      toolKind: "edit",
+      rawInput: {
+        command: "cd /workspace && test -w /tmp/outside-ada.txt >/dev/null",
+      },
+      toolKind: "execute",
     });
     const pending = store.get(ada.id)?.permission;
     assert.ok(pending?.hostGrant);
     assert.equal(pending?.hostGrant?.path, "/tmp/outside-ada.txt");
-    store.answerHostGrant(ada.id, "read-write", "session");
+    store.answerHostGrant(ada.id, "read-write", "session", pending?.cardId ?? "");
     assert.deepEqual(fake.answered, ["allow-once", "allow-once"]);
     const grants = store.listHostGrants();
     assert.equal(grants.some((grant) => grant.path === "/tmp/outside-ada.txt"), true);
+
+    fake.fire({
+      rpcId: 14,
+      title: "Check a shell condition",
+      options: allowDenyOptions,
+      rawInput: { command: "true >/dev/null" },
+      toolKind: "execute",
+    });
+    const generic = store.get(ada.id)?.permission;
+    assert.ok(generic);
+    assert.equal(generic?.hostGrant, undefined);
+    store.answerPermission(ada.id, "allow-once", generic?.cardId ?? "");
 
     const ben = await store.create("Ben");
     await store.pickHarness(ben.id, "codex");
@@ -527,7 +576,8 @@ describe("BotStore Isolated cwd and env", () => {
       locations: [{ path: "/tmp/denied.txt" }],
       toolKind: "edit",
     });
-    store.answerHostGrant(ada.id, "deny", "session");
+    const pending = store.get(ada.id)?.permission;
+    store.answerHostGrant(ada.id, "deny", "session", pending?.cardId ?? "");
     assert.ok(fake.answered.includes("reject-once"));
     fake.fire({
       rpcId: 21,

@@ -26,6 +26,7 @@ import {
 import { MessengerShell, type MobileSurface } from "@/components/MessengerShell";
 import { NewBotDialog } from "@/components/NewBotDialog";
 import { StackedEyes } from "@/components/StackedEyes";
+import { TranscriptCard } from "@/components/TranscriptCard";
 import { useUiPreferences } from "@/components/UiPreferencesProvider";
 import { Button } from "@/components/ui/button";
 import {
@@ -39,6 +40,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { Toast, ToastDescription, ToastProvider, ToastTitle, ToastViewport } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { FaceMode, FaceShape } from "@/lib/face";
@@ -48,8 +50,6 @@ import {
   groupDisplayTitle,
   type Channel,
 } from "@/lib/channels";
-import { HostGrantCard } from "@/components/HostGrantCard";
-import { isHostGrantPermission } from "@/lib/harness-home";
 import {
   botSettingsHash,
   parseBotSettingsHash,
@@ -105,10 +105,12 @@ import {
   listHarnesses,
   listInbox,
   markBotRead,
+  retryMessageInput,
   sendMessage,
   toggleReaction,
   type Bot,
   type Harness,
+  type TranscriptCardAction,
 } from "@/lib/session";
 import {
   buildChatChronology,
@@ -339,7 +341,7 @@ export function Messenger() {
   const previousTranscriptWritingRef = useRef(false);
   const previousTranscriptMountedRef = useRef(false);
   const previousTranscriptDesktopRef = useRef(desktopLayout);
-  const messageBubbleRefs = useRef(new Map<string, HTMLDivElement>());
+  const messageBubbleRefs = useRef(new Map<string, HTMLElement>());
   const longPressTimerRef = useRef<number | null>(null);
   const inboxSearchRef = useRef<HTMLInputElement | null>(null);
   const createMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -1074,23 +1076,39 @@ export function Messenger() {
     }
   }
 
-  async function onPermission(optionId: string) {
+  async function onCardAction(
+    messageId: string,
+    action: TranscriptCardAction,
+    duration?: "once" | "session" | "until-revoked",
+  ) {
     if (!activeId) return;
     const botId = activeId;
     setBusy(true);
+    setError(null);
     try {
-      await performBotMutation(botId, () => answerPermission(botId, optionId));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function onHostGrant(access: "read" | "read-write" | "deny", duration: "once" | "session" | "until-revoked") {
-    if (!activeId) return;
-    const botId = activeId;
-    setBusy(true);
-    try {
-      await performBotMutation(botId, () => answerHostGrant(botId, access, duration));
+      if (action.command.kind === "permission") {
+        const optionId = action.command.optionId;
+        await performBotMutation(botId, () =>
+          answerPermission(botId, messageId, optionId));
+      } else if (action.command.kind === "host-grant") {
+        if (!duration) throw new Error("Choose how long this Host grant should last.");
+        const access = action.command.access;
+        await performBotMutation(botId, () =>
+          answerHostGrant(botId, messageId, access, duration));
+      } else if (action.command.kind === "retry-message") {
+        const sourceMessageId = action.command.messageId;
+        const source = active?.messages?.find((message) => message.id === sourceMessageId);
+        if (!source || source.role !== "user" || (source.kind && source.kind !== "text")) {
+          throw new Error("The original message is no longer available.");
+        }
+        const retry = retryMessageInput(source);
+        await performBotMutation(botId, () => sendMessage(botId, retry.text, retry.replyTo));
+      }
+      window.requestAnimationFrame(() => messageBubbleRefs.current.get(messageId)?.focus());
+    } catch (err) {
+      if (activeIdRef.current === botId) {
+        setError(err instanceof Error ? err.message : "Could not complete this action.");
+      }
     } finally {
       setBusy(false);
     }
@@ -1135,6 +1153,37 @@ export function Messenger() {
     const spacingClass = presentation?.spacing === "compact"
       ? "mt-[var(--message-burst-gap)]"
       : "mt-[var(--message-inter-burst-gap)]";
+    if (message.kind === "card" && message.card) {
+      const card = (
+        <TranscriptCard
+          ref={(node) => {
+            if (node) messageBubbleRefs.current.set(message.id, node);
+            else messageBubbleRefs.current.delete(message.id);
+          }}
+          card={message.card}
+          busy={busy}
+          onAction={(action, duration) => void onCardAction(message.id, action, duration)}
+        />
+      );
+      return (
+        <li
+          key={message.id}
+          data-message-id={message.id}
+          data-burst="card"
+          data-tail="none"
+          className={cn("w-full max-w-[var(--message-max-width)] self-center", spacingClass)}
+        >
+          {presentation?.exactTime ? (
+            <Tooltip>
+              <TooltipTrigger asChild>{card}</TooltipTrigger>
+              <TooltipContent>
+                <time dateTime={message.createdAt}>{presentation.exactTime}</time>
+              </TooltipContent>
+            </Tooltip>
+          ) : card}
+        </li>
+      );
+    }
     if (message.kind === "host-grant") {
       const card = (
         <div
@@ -1539,7 +1588,7 @@ export function Messenger() {
   }
 
   return (
-    <>
+    <ToastProvider duration={3600} swipeDirection="right">
       <p className="sr-only" aria-live="polite" aria-atomic="true">
         <span key={inboxLive.serial}>{inboxLive.text}</span>
       </p>
@@ -1944,34 +1993,6 @@ export function Messenger() {
                 </li>
               ) : null}
             </ul>
-            {active.permission && isHostGrantPermission(active.permission) && active.permission.hostGrant ? (
-              <HostGrantCard
-                grant={active.permission.hostGrant}
-                busy={busy}
-                onAnswer={(access, duration) => void onHostGrant(access, duration)}
-              />
-            ) : active.permission ? (
-              <div className="mx-auto mt-3 w-full max-w-2xl rounded-2xl bg-secondary p-4 text-sm">
-                <p className="font-medium">{active.permission.title}</p>
-                {active.permission.description ? (
-                  <p className="mt-1 text-muted-foreground">{active.permission.description}</p>
-                ) : null}
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {active.permission.options.map((option) => (
-                    <Button
-                      key={option.optionId}
-                      type="button"
-                      size="sm"
-                      variant={option.kind?.startsWith("allow") ? "default" : "outline"}
-                      disabled={busy}
-                      onClick={() => void onPermission(option.optionId)}
-                    >
-                      {option.name}
-                    </Button>
-                  ))}
-                </div>
-              </div>
-            ) : null}
             </div>
             {newMessagesAvailable ? (
               <Button
@@ -1995,11 +2016,6 @@ export function Messenger() {
             Opening Chat…
           </div>
         )}
-        {error ? (
-          <p className="px-6 pb-2 text-center text-sm text-destructive" role="alert">
-            {error}
-          </p>
-        ) : null}
         <form onSubmit={onSubmit} className="px-4 pb-5 pt-2">
           <div className="mx-auto flex max-w-2xl flex-col gap-2">
             {replyTo ? (
@@ -2149,6 +2165,19 @@ export function Messenger() {
           onSectionChange={chooseBotSettingsSection}
         />
       ) : null}
-    </>
+      {error ? (
+        <Toast
+          open
+          className="border-destructive"
+          onOpenChange={(open) => {
+            if (!open) setError(null);
+          }}
+        >
+          <ToastTitle>Action not completed</ToastTitle>
+          <ToastDescription>{error}</ToastDescription>
+        </Toast>
+      ) : null}
+      <ToastViewport />
+    </ToastProvider>
   );
 }

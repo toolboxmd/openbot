@@ -759,13 +759,14 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         }
         try {
           const botId = decodeURIComponent(permMatch[1]);
+          const cardId = typeof body.cardId === "string" ? body.cardId : "";
           if (typeof body.access === "string") {
             const duration = typeof body.duration === "string" ? body.duration : "session";
-            const bot = store.answerHostGrant(botId, body.access, duration);
+            const bot = store.answerHostGrant(botId, body.access, duration, cardId);
             sendJson(res, 200, bot);
           } else {
             const optionId = typeof body.optionId === "string" ? body.optionId : "";
-            const bot = store.answerPermission(botId, optionId);
+            const bot = store.answerPermission(botId, optionId, cardId);
             sendJson(res, 200, bot);
           }
         } catch (err) {
