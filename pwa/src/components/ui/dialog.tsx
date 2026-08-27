@@ -30,7 +30,9 @@ function DialogContent({
   children,
   showCloseButton = true,
   ...props
-}: React.ComponentProps<typeof DialogPrimitive.Content> & { showCloseButton?: boolean }) {
+}: React.ComponentProps<typeof DialogPrimitive.Content> & {
+  showCloseButton?: boolean;
+}) {
   const [closeTooltipOpen, setCloseTooltipOpen] = React.useState(false);
 
   return (
@@ -39,8 +41,7 @@ function DialogContent({
       <DialogPrimitive.Content
         data-slot="dialog-content"
         className={cn(
-          "fixed left-1/2 top-1/2 z-50 grid max-h-[calc(100dvh-1.5rem)] w-[calc(100%-1.5rem)] max-w-[var(--dialog-max-width)] -translate-x-1/2 -translate-y-1/2 gap-5 overflow-y-auto rounded-[var(--radius-dialog)] border bg-surface p-6 text-foreground shadow-[var(--shadow-dialog)] outline-none",
-          "max-[47.999rem]:inset-0 max-[47.999rem]:h-dvh max-[47.999rem]:max-h-none max-[47.999rem]:w-full max-[47.999rem]:max-w-none max-[47.999rem]:translate-x-0 max-[47.999rem]:translate-y-0 max-[47.999rem]:rounded-none max-[47.999rem]:border-0 max-[47.999rem]:p-5",
+          "fixed left-1/2 top-1/2 z-50 grid max-h-[calc(100dvh-1.5rem)] w-[calc(100%-1.5rem)] max-w-[var(--dialog-max-width)] -translate-x-1/2 -translate-y-1/2 gap-5 overflow-y-auto rounded-[var(--radius-dialog)] border bg-surface p-6 text-foreground shadow-[var(--shadow-dialog)] outline-none max-[47.999rem]:inset-0 max-[47.999rem]:h-dvh max-[47.999rem]:max-h-none max-[47.999rem]:w-full max-[47.999rem]:max-w-none max-[47.999rem]:translate-x-0 max-[47.999rem]:translate-y-0 max-[47.999rem]:rounded-none max-[47.999rem]:border-0 max-[47.999rem]:p-5",
           className,
         )}
         {...props}

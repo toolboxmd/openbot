@@ -19,6 +19,7 @@ import {
   type BotSettingsSection,
 } from "@/lib/bot-settings";
 import type { FaceShape } from "@/lib/face";
+import { connectedFocusTarget } from "@/lib/first-use";
 import {
   getAllBotsAgents,
   getThisBotAgents,
@@ -78,20 +79,26 @@ function SettingsSection({
 export function BotSettings({
   bot,
   harnesses,
+  harnessesState,
   open,
   onOpenChange,
   openerRef,
+  fallbackFocusRef,
   onBotChange,
+  onRetryHarnesses,
   onOpenComputer,
   section,
   onSectionChange,
 }: {
   bot: Bot;
   harnesses: Harness[];
+  harnessesState: "loading" | "ready" | "error";
   open: boolean;
   onOpenChange: (open: boolean) => void;
   openerRef: RefObject<HTMLButtonElement | null>;
+  fallbackFocusRef: RefObject<HTMLElement | null>;
   onBotChange: (bot: Bot) => void;
+  onRetryHarnesses: () => void;
   onOpenComputer: () => void;
   section: BotSettingsSection;
   onSectionChange: (section: BotSettingsSection) => void;
@@ -224,7 +231,9 @@ export function BotSettings({
           aria-describedby="bot-settings-description"
           onCloseAutoFocus={(event) => {
             event.preventDefault();
-            openerRef.current?.focus();
+            window.requestAnimationFrame(() => {
+              connectedFocusTarget(openerRef.current, fallbackFocusRef.current)?.focus();
+            });
           }}
         >
           <DialogHeader>
@@ -270,7 +279,24 @@ export function BotSettings({
             title="AI"
             description="Choose the local AI connection used for new Sessions. OpenBot currently supports Codex for Talk; Harness is the technical connection layer."
           >
-            {connections.length > 0 ? (
+            {harnessesState === "loading" ? (
+              <p className="rounded-[var(--radius-card)] bg-muted p-4 text-sm text-muted-foreground" role="status">
+                Loading AI connections…
+              </p>
+            ) : harnessesState === "error" ? (
+              <div className="grid gap-3 rounded-[var(--radius-card)] bg-muted p-4 text-sm" role="alert">
+                <p>Could not load AI connections.</p>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={onRetryHarnesses}
+                  className="min-h-[var(--touch-min)] justify-self-start"
+                >
+                  Retry
+                </Button>
+              </div>
+            ) : connections.length > 0 ? (
               <div className="grid gap-2">
                 <Label htmlFor="bot-ai-connection">AI connection</Label>
                 <select

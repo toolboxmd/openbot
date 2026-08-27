@@ -270,7 +270,11 @@ describe("PWA has no Takeover button", () => {
     const messenger = await readFile(join(repoRoot, "pwa/src/components/Messenger.tsx"), "utf8");
     const shell = await readFile(join(repoRoot, "pwa/src/components/MessengerShell.tsx"), "utf8");
     assert.match(messenger, /computerPaneIsOpen\(preferences, activeId\)/);
-    assert.match(messenger, /data-testid=\{computerOpen\s*\?\s*"close-computer"\s*:\s*"open-computer"\}/);
+    assert.match(
+      messenger,
+      /data-testid=\{visibleComputerOpen\s*\?\s*"close-computer"\s*:\s*"open-computer"\}/,
+    );
+    assert.match(messenger, /computerVisibleDuringPluginsReturn/);
     assert.match(messenger, /data-testid="computer-expanded"/);
     assert.match(
       messenger,

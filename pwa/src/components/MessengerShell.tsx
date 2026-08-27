@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { ReactNode, RefObject } from "react";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 
@@ -7,11 +7,13 @@ export type MobileSurface = "sidebar" | "chat";
 export function MessengerShell({
   sidebar,
   chat,
+  chatRef,
   computer,
   mobileSurface,
 }: {
   sidebar: ReactNode;
   chat: ReactNode;
+  chatRef: RefObject<HTMLElement | null>;
   computer: ReactNode | null;
   mobileSurface: MobileSurface;
 }) {
@@ -34,10 +36,12 @@ export function MessengerShell({
       <Separator orientation="vertical" className="max-[47.999rem]:hidden" />
 
       <main
+        ref={chatRef}
+        tabIndex={-1}
         aria-label="Chat"
         data-testid="chat-region"
         className={cn(
-          "flex min-w-0 flex-1 flex-col",
+          "flex min-w-0 flex-1 flex-col outline-none",
           (mobileSurface === "sidebar" || computerVisible) && "max-[47.999rem]:hidden",
         )}
       >

@@ -1,15 +1,29 @@
 import { FormEvent, Fragment, useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
-import { motion } from "framer-motion";
-import { ArrowUp, Menu, MessageSquare, Monitor, MoreHorizontal, Plus, Reply, Settings, Smile, Users, X } from "lucide-react";
+import { ArrowUp, Menu, MessageSquare, Monitor, Plug, Plus, Reply, Settings, Smile, X } from "lucide-react";
 import { AppSettings } from "@/components/AppSettings";
 import { BotSettings } from "@/components/BotSettings";
 import { ComputerScreen } from "@/components/Computer";
 import { Eyes } from "@/components/Eyes";
+import {
+  BotsLoadError,
+  ChatDetailError,
+  ChatDetailLoading,
+  EmptyChatStart,
+  LoadingHome,
+  Plugins,
+  Welcome,
+} from "@/components/FirstUse";
 import { MessengerShell, type MobileSurface } from "@/components/MessengerShell";
+import { NewBotDialog } from "@/components/NewBotDialog";
 import { StackedEyes } from "@/components/StackedEyes";
 import { useUiPreferences } from "@/components/UiPreferencesProvider";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -31,10 +45,23 @@ import {
 } from "@/lib/bot-settings";
 import { computerPaneIsOpen } from "@/lib/ui-preferences";
 import {
+  botListViewState,
+  canSendDirectMessage,
+  chatDetailViewState,
+  computerToCloseForDirectPluginsReturn,
+  computerVisibleDuringPluginsReturn,
+  globalRouteFromHash,
+  isInternalPluginsEntry,
+  pluginsDirectReturnDestination,
+  pluginsHistoryState,
+  resolvedPluginsReturnTarget,
+  type GlobalRoute,
+  type PluginsReturnTarget,
+} from "@/lib/first-use";
+import {
   answerHostGrant,
   answerPermission,
   createBot,
-  createGroupChannel,
   getBot,
   getChannel,
   listBots,
@@ -48,6 +75,7 @@ import {
 
 
 type ChatMessage = NonNullable<Bot["messages"]>[number];
+type RemoteListState = "loading" | "ready" | "error";
 
 function clearBotSettingsLocation() {
   window.history.replaceState(
@@ -209,16 +237,6 @@ function HoverActions({
       <TooltipContent>Reply</TooltipContent>
     </Tooltip>
   );
-  const moreBtn = (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button type="button" size="icon-sm" variant="ghost" aria-label="More" disabled>
-          <MoreHorizontal />
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>More</TooltipContent>
-    </Tooltip>
-  );
   return (
     <div
       data-testid="bubble-hover-actions"
@@ -231,7 +249,6 @@ function HoverActions({
     >
       {user ? (
         <>
-          {moreBtn}
           {replyBtn}
           {reactBtn}
         </>
@@ -239,7 +256,6 @@ function HoverActions({
         <>
           {reactBtn}
           {replyBtn}
-          {moreBtn}
         </>
       )}
       {picker}
@@ -249,17 +265,20 @@ function HoverActions({
 
 export function Messenger() {
   const [draft, setDraft] = useState("");
-  const [nameDraft, setNameDraft] = useState("");
-  const [creating, setCreating] = useState<false | "bot" | "group">(false);
   const [bots, setBots] = useState<Bot[]>([]);
+  const [botsReady, setBotsReady] = useState(false);
+  const [botsLoadError, setBotsLoadError] = useState(false);
   const [channels, setChannels] = useState<Channel[]>([]);
+  const [channelsState, setChannelsState] = useState<RemoteListState>("loading");
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
+  const [harnessesState, setHarnessesState] = useState<RemoteListState>("loading");
   const [activeId, setActiveId] = useState<string | null>(null);
   const [active, setActive] = useState<Bot | null>(null);
+  const [activeDetailErrorId, setActiveDetailErrorId] = useState<string | null>(null);
   const [activeGroup, setActiveGroup] = useState<Channel | null>(null);
-  const [groupTitleDraft, setGroupTitleDraft] = useState("");
-  const [groupBotIds, setGroupBotIds] = useState<string[]>([]);
   const [mobileSurface, setMobileSurface] = useState<MobileSurface>("chat");
+  const [globalRoute, setGlobalRoute] = useState<GlobalRoute>(() => globalRouteFromHash(window.location.hash));
+  const [newBotOpen, setNewBotOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
@@ -268,41 +287,58 @@ export function Messenger() {
   const closeChatsButtonRef = useRef<HTMLButtonElement | null>(null);
   const computerButtonRef = useRef<HTMLButtonElement | null>(null);
   const closeComputerButtonRef = useRef<HTMLButtonElement | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const createMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const newBotOpenerRef = useRef<HTMLButtonElement | null>(null);
+  const newBotDestinationRef = useRef<HTMLButtonElement | null>(null);
+  const welcomePluginsRef = useRef<HTMLButtonElement | null>(null);
+  const sidebarPluginsRef = useRef<HTMLButtonElement | null>(null);
+  const loadingHomeRef = useRef<HTMLElement | null>(null);
+  const botsLoadErrorRef = useRef<HTMLElement | null>(null);
+  const welcomeDestinationRef = useRef<HTMLElement | null>(null);
+  const chatRegionRef = useRef<HTMLElement | null>(null);
+  const pluginsReturnTargetRef = useRef<PluginsReturnTarget | null>(null);
   const botSettingsOpenerRef = useRef<HTMLButtonElement | null>(null);
   const activeIdRef = useRef<string | null>(null);
+  const activeGroupIdRef = useRef<string | null>(null);
   const botSettingsNavigationRef = useRef(0);
+  const previousGlobalRouteRef = useRef(globalRoute);
   const [botSettingsOpen, setBotSettingsOpen] = useState(false);
   const [botSettingsSection, setBotSettingsSection] = useState<BotSettingsSection>("ai");
   const { preferences, updateComputerPane } = useUiPreferences();
   const computerOpen = computerPaneIsOpen(preferences, activeId);
+  const visibleComputerOpen = computerVisibleDuringPluginsReturn({
+    computerOpen,
+    returnTarget: pluginsReturnTargetRef.current,
+  });
+  const composerKind = activeGroup ? "group" : active?.messages !== undefined ? "direct" : null;
 
-  async function refresh(id = activeId) {
-    const [listed, available, channelList] = await Promise.all([listBots(), listHarnesses(), listChannels()]);
-    setBots(listed.bots);
-    setHarnesses(available.harnesses);
-    setChannels(channelList.channels);
-    if (id) {
-      const detail = await getBot(id);
-      setActive(detail);
-      setActiveGroup(null);
-      return detail;
+  function activateBot(bot: Bot) {
+    activeIdRef.current = bot.id;
+    activeGroupIdRef.current = null;
+    setActiveId(bot.id);
+    setActive(bot);
+    setActiveDetailErrorId(null);
+    setActiveGroup(null);
+  }
+
+  function mergeBot(bot: Bot) {
+    setBots((rows) => rows.map((row) => (row.id === bot.id ? { ...row, ...bot } : row)));
+    if (activeIdRef.current === bot.id) {
+      setActive(bot);
+      if (bot.messages !== undefined) setActiveDetailErrorId(null);
     }
-    if (activeGroup) {
-      const detail = await getChannel(activeGroup.id);
-      setActiveGroup(detail);
-      return null;
-    }
-    return null;
   }
 
   useEffect(() => {
     let cancelled = false;
     const navigation = ++botSettingsNavigationRef.current;
-    void Promise.all([listBots(), listChannels()])
-      .then(([data, channelList]) => {
+    void listBots()
+      .then((data) => {
         if (cancelled) return;
         setBots(data.bots);
-        setChannels(channelList.channels);
+        setBotsLoadError(false);
+        setBotsReady(true);
         const requestedSettings = parseBotSettingsHash(window.location.hash);
         const requestedBot = data.bots.find((bot) => bot.id === requestedSettings?.botId);
         if ((requestedSettings && !requestedBot) || (!requestedSettings && botSettingsLocationCandidate(window.location.hash))) {
@@ -310,35 +346,48 @@ export function Messenger() {
         }
         const selected = requestedBot ?? data.bots[0];
         if (!selected) return;
+        activateBot(selected);
         void getBot(selected.id)
           .then((bot) => {
-            if (cancelled || navigation !== botSettingsNavigationRef.current) return;
-            activeIdRef.current = bot.id;
-            setActiveId(bot.id);
-            setActive(bot);
+            if (cancelled) return;
+            mergeBot(bot);
+            if (navigation !== botSettingsNavigationRef.current) return;
             if (requestedSettings?.botId === bot.id) {
               setBotSettingsSection(requestedSettings.section);
               setBotSettingsOpen(true);
             }
           })
           .catch(() => {
-            if (cancelled || navigation !== botSettingsNavigationRef.current) return;
+            if (cancelled) return;
+            if (activeIdRef.current === selected.id) setActiveDetailErrorId(selected.id);
+            if (navigation !== botSettingsNavigationRef.current) return;
             setBotSettingsOpen(false);
             if (requestedSettings) clearBotSettingsLocation();
           });
       })
       .catch(() => {
         if (!cancelled) {
-          setBots([]);
-          setChannels([]);
+          setBotsLoadError(true);
+          setBotsReady(true);
         }
+      });
+    void listChannels()
+      .then((data) => {
+        if (cancelled) return;
+        setChannels(data.channels);
+        setChannelsState("ready");
+      })
+      .catch(() => {
+        if (!cancelled) setChannelsState("error");
       });
     void listHarnesses()
       .then((data) => {
-        if (!cancelled) setHarnesses(data.harnesses);
+        if (cancelled) return;
+        setHarnesses(data.harnesses);
+        setHarnessesState("ready");
       })
       .catch(() => {
-        if (!cancelled) setHarnesses([]);
+        if (!cancelled) setHarnessesState("error");
       });
     return () => {
       cancelled = true;
@@ -365,10 +414,7 @@ export function Messenger() {
       void getBot(requested.botId)
         .then((bot) => {
           if (cancelled || navigation !== botSettingsNavigationRef.current) return;
-          activeIdRef.current = bot.id;
-          setActiveId(bot.id);
-          setActive(bot);
-          setActiveGroup(null);
+          activateBot(bot);
           setBotSettingsSection(requested.section);
           setMobileSurface("chat");
           setBotSettingsOpen(true);
@@ -393,6 +439,78 @@ export function Messenger() {
   }, [activeId]);
 
   useEffect(() => {
+    const syncGlobalRoute = () => {
+      const next = globalRouteFromHash(window.location.hash);
+      if (
+        previousGlobalRouteRef.current === "plugins" &&
+        next === "chat" &&
+        pluginsReturnTargetRef.current === null
+      ) {
+        pluginsReturnTargetRef.current = "direct";
+      }
+      setGlobalRoute(next);
+    };
+    window.addEventListener("hashchange", syncGlobalRoute);
+    window.addEventListener("popstate", syncGlobalRoute);
+    return () => {
+      window.removeEventListener("hashchange", syncGlobalRoute);
+      window.removeEventListener("popstate", syncGlobalRoute);
+    };
+  }, []);
+
+  useEffect(() => {
+    const previous = previousGlobalRouteRef.current;
+    previousGlobalRouteRef.current = globalRoute;
+    if (previous !== "plugins" || globalRoute !== "chat") return;
+    const returnTarget = resolvedPluginsReturnTarget(pluginsReturnTargetRef.current);
+    if (returnTarget === "direct") {
+      pluginsReturnTargetRef.current = "direct";
+      setMobileSurface("chat");
+      return;
+    }
+    pluginsReturnTargetRef.current = null;
+    if (returnTarget === "sidebar") setMobileSurface("sidebar");
+    const frame = window.requestAnimationFrame(() => {
+      if (returnTarget === "welcome") welcomePluginsRef.current?.focus();
+      if (returnTarget === "sidebar") sidebarPluginsRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [globalRoute]);
+
+  useEffect(() => {
+    if (globalRoute !== "chat" || pluginsReturnTargetRef.current !== "direct") return;
+    const destination = pluginsDirectReturnDestination({
+      ready: botsReady,
+      failed: botsLoadError,
+      count: bots.length,
+    });
+    const computerToClose = computerToCloseForDirectPluginsReturn({
+      activeId,
+      computerOpen,
+      destination,
+    });
+    if (computerToClose) {
+      updateComputerPane(computerToClose, false);
+      return;
+    }
+    if (destination === "chat" && (mobileSurface !== "chat" || computerOpen)) return;
+    const frame = window.requestAnimationFrame(() => {
+      const target = destination === "loading"
+        ? loadingHomeRef.current
+        : destination === "error"
+          ? botsLoadErrorRef.current
+          : destination === "welcome"
+            ? welcomeDestinationRef.current
+            : chatRegionRef.current;
+      target?.focus();
+      if (destination !== "loading" && target && document.activeElement === target) {
+        pluginsReturnTargetRef.current = null;
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeId, bots.length, botsLoadError, botsReady, computerOpen, globalRoute, mobileSurface]);
+
+  useEffect(() => {
     setReplyTo(null);
     setReactingId(null);
   }, [activeId]);
@@ -407,83 +525,131 @@ export function Messenger() {
 
   useEffect(() => {
     if (!activeId) return;
+    let cancelled = false;
     const tick = window.setInterval(() => {
       void getBot(activeId)
         .then((bot) => {
-          setActive(bot);
-          setBots((rows) => rows.map((row) => (row.id === bot.id ? { ...row, ...bot } : row)));
+          if (!cancelled) mergeBot(bot);
         })
         .catch(() => undefined);
     }, 600);
-    return () => window.clearInterval(tick);
+    return () => {
+      cancelled = true;
+      window.clearInterval(tick);
+    };
   }, [activeId]);
 
-  async function onCreate(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const name = nameDraft.trim();
-    if (!name) return;
-    setBusy(true);
+  function openCreatedBot(bot: Bot) {
+    botSettingsNavigationRef.current += 1;
+    setBotSettingsOpen(false);
+    if (parseBotSettingsHash(window.location.hash)) clearBotSettingsLocation();
     setError(null);
-    try {
-      const bot = await createBot(name);
-      setNameDraft("");
-      setCreating(false);
-      setActiveId(bot.id);
-      setActive(bot);
-      setActiveGroup(null);
-      setMobileSurface("chat");
-      await refresh(bot.id);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not create Bot.");
-    } finally {
-      setBusy(false);
-    }
+    setBots((rows) => [...rows.filter((row) => row.id !== bot.id), bot]);
+    setBotsReady(true);
+    activateBot(bot);
+    setMobileSurface("chat");
   }
 
-  async function onCreateGroup(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (groupBotIds.length < 2) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const channel = await createGroupChannel({
-        title: groupTitleDraft.trim() || undefined,
-        botIds: groupBotIds,
-      });
-      setGroupTitleDraft("");
-      setGroupBotIds([]);
-      setCreating(false);
-      setActiveId(null);
-      setActive(null);
-      setActiveGroup(channel);
-      setMobileSurface("chat");
-      await refresh();
-      const detail = await getChannel(channel.id);
-      setActiveGroup(detail);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not create group Channel.");
-    } finally {
-      setBusy(false);
+  function openNewBot(event: MouseEvent<HTMLButtonElement>) {
+    newBotOpenerRef.current = event.currentTarget;
+    setNewBotOpen(true);
+  }
+
+  function openNewBotFromMenu() {
+    newBotOpenerRef.current = createMenuTriggerRef.current;
+    setNewBotOpen(true);
+  }
+
+  function openPlugins(returnTarget: PluginsReturnTarget) {
+    pluginsReturnTargetRef.current = returnTarget;
+    botSettingsNavigationRef.current += 1;
+    setBotSettingsOpen(false);
+    setMobileSurface("chat");
+    setGlobalRoute("plugins");
+    window.history.pushState(
+      pluginsHistoryState(window.history.state),
+      "",
+      `${window.location.pathname}${window.location.search}#plugins`,
+    );
+  }
+
+  function closePlugins() {
+    pluginsReturnTargetRef.current ??= "direct";
+    if (isInternalPluginsEntry(window.history.state)) {
+      window.history.back();
+      return;
     }
+    setGlobalRoute("chat");
+    clearBotSettingsLocation();
+  }
+
+  function chooseSuggestion(text: string) {
+    setDraft(text);
+    window.requestAnimationFrame(() => composerRef.current?.focus());
+  }
+
+  function retryActiveChat() {
+    const botId = activeIdRef.current;
+    if (!botId) return;
+    setActiveDetailErrorId(null);
+    void getBot(botId)
+      .then((detail) => mergeBot(detail))
+      .catch(() => {
+        if (activeIdRef.current === botId) setActiveDetailErrorId(botId);
+      });
+  }
+
+  function retryChannels() {
+    setChannelsState("loading");
+    void listChannels()
+      .then((data) => {
+        setChannels(data.channels);
+        setChannelsState("ready");
+      })
+      .catch(() => setChannelsState("error"));
+  }
+
+  function retryHarnesses() {
+    setHarnessesState("loading");
+    void listHarnesses()
+      .then((data) => {
+        setHarnesses(data.harnesses);
+        setHarnessesState("ready");
+      })
+      .catch(() => setHarnessesState("error"));
   }
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!composerSendEnabled(activeGroup ? "group" : active ? "direct" : null)) return;
-    if (!activeId || draft.trim().length === 0) return;
+    if (!composerSendEnabled(composerKind)) return;
+    if (
+      !activeId ||
+      active?.messages === undefined ||
+      !canSendDirectMessage({
+        active: Boolean(active),
+        harness: active?.harness ?? null,
+        draft,
+        busy,
+      })
+    ) {
+      return;
+    }
+    const botId = activeId;
     const text = draft.trim();
     const targetId = replyTo?.id;
     setDraft("");
     setBusy(true);
     setError(null);
     try {
-      const bot = await sendMessage(activeId, text, targetId);
-      setActive(bot);
-      setReplyTo(null);
+      const bot = await sendMessage(botId, text, targetId);
+      mergeBot(bot);
+      if (activeIdRef.current === botId) setReplyTo(null);
     } catch (err) {
-      setDraft(text);
-      const message = err instanceof Error ? err.message : "Could not send.";
-      if (!isCancelledMessage(message)) setError(message);
+      if (activeIdRef.current === botId) {
+        setDraft(text);
+        const message = err instanceof Error ? err.message : "Could not send.";
+        if (!isCancelledMessage(message)) setError(message);
+      }
     } finally {
       setBusy(false);
     }
@@ -491,10 +657,11 @@ export function Messenger() {
 
   async function onPermission(optionId: string) {
     if (!activeId) return;
+    const botId = activeId;
     setBusy(true);
     try {
-      const bot = await answerPermission(activeId, optionId);
-      setActive(bot);
+      const bot = await answerPermission(botId, optionId);
+      mergeBot(bot);
     } finally {
       setBusy(false);
     }
@@ -502,10 +669,11 @@ export function Messenger() {
 
   async function onHostGrant(access: "read" | "read-write" | "deny", duration: "once" | "session" | "until-revoked") {
     if (!activeId) return;
+    const botId = activeId;
     setBusy(true);
     try {
-      const bot = await answerHostGrant(activeId, access, duration);
-      setActive(bot);
+      const bot = await answerHostGrant(botId, access, duration);
+      mergeBot(bot);
     } finally {
       setBusy(false);
     }
@@ -513,12 +681,15 @@ export function Messenger() {
 
   async function onReact(messageId: string, emoji: string) {
     if (!activeId) return;
+    const botId = activeId;
     try {
-      const bot = await toggleReaction(activeId, messageId, emoji);
-      setActive(bot);
-      setReactingId(null);
+      const bot = await toggleReaction(botId, messageId, emoji);
+      mergeBot(bot);
+      if (activeIdRef.current === botId) setReactingId(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not react.");
+      if (activeIdRef.current === botId) {
+        setError(err instanceof Error ? err.message : "Could not react.");
+      }
     }
   }
 
@@ -638,6 +809,12 @@ export function Messenger() {
   }
 
   const messages = active?.messages ?? [];
+  const chatDetailState = active
+    ? chatDetailViewState({
+        messageCount: active.messages?.length,
+        failed: activeDetailErrorId === active.id,
+      })
+    : null;
   const visible = messages.filter((message) => message.text.length > 0);
   const writing = isWorkingMode(active?.eyes.mode);
   const sidebarMode = (bot: Bot): FaceMode =>
@@ -658,17 +835,33 @@ export function Messenger() {
   }
 
   function openBot(bot: Bot) {
-    setActiveId(bot.id);
-    setActiveGroup(null);
+    botSettingsNavigationRef.current += 1;
+    setBotSettingsOpen(false);
+    if (parseBotSettingsHash(window.location.hash)) clearBotSettingsLocation();
+    activateBot(bot);
     setMobileSurface("chat");
-    void getBot(bot.id).then(setActive);
+    void getBot(bot.id)
+      .then((detail) => mergeBot(detail))
+      .catch(() => {
+        if (activeIdRef.current === bot.id) setActiveDetailErrorId(bot.id);
+      });
   }
 
   function openGroup(channel: Channel) {
+    botSettingsNavigationRef.current += 1;
+    setBotSettingsOpen(false);
+    if (parseBotSettingsHash(window.location.hash)) clearBotSettingsLocation();
+    activeIdRef.current = null;
+    activeGroupIdRef.current = channel.id;
     setActiveId(null);
     setActive(null);
+    setActiveGroup(channel);
     setMobileSurface("chat");
-    void getChannel(channel.id).then(setActiveGroup);
+    void getChannel(channel.id)
+      .then((detail) => {
+        if (activeGroupIdRef.current === channel.id) setActiveGroup(detail);
+      })
+      .catch(() => undefined);
   }
 
   function openBotSettings(event: MouseEvent<HTMLButtonElement>) {
@@ -703,8 +896,7 @@ export function Messenger() {
   }
 
   function applyBotUpdate(bot: Bot) {
-    setActive(bot);
-    setBots((rows) => rows.map((row) => (row.id === bot.id ? { ...row, ...bot } : row)));
+    mergeBot(bot);
   }
 
   function openComputer() {
@@ -720,10 +912,49 @@ export function Messenger() {
     focusOnNextFrame(computerButtonRef);
   }
 
+  if (globalRoute === "plugins") {
+    return <Plugins onBack={closePlugins} />;
+  }
+
+  const botView = botListViewState({ ready: botsReady, failed: botsLoadError, count: bots.length });
+
+  if (botView === "loading") return <LoadingHome destinationRef={loadingHomeRef} />;
+
+  if (botView === "error") {
+    return (
+      <BotsLoadError
+        onRetry={() => window.location.reload()}
+        destinationRef={botsLoadErrorRef}
+      />
+    );
+  }
+
+  if (botView === "empty") {
+    return (
+      <>
+        <Welcome
+          onNewBot={openNewBot}
+          onPlugins={() => openPlugins("welcome")}
+          pluginsRef={welcomePluginsRef}
+          destinationRef={welcomeDestinationRef}
+        />
+        <NewBotDialog
+          open={newBotOpen}
+          onOpenChange={setNewBotOpen}
+          openerRef={newBotOpenerRef}
+          destinationRef={newBotDestinationRef}
+          onCreate={createBot}
+          onCreated={openCreatedBot}
+        />
+      </>
+    );
+  }
+
   return (
     <>
       <MessengerShell
         mobileSurface={mobileSurface}
+        chatRef={chatRegionRef}
         sidebar={
         <>
           <div className="flex h-[var(--header-height)] items-center justify-between gap-3 px-4">
@@ -737,115 +968,71 @@ export function Messenger() {
                 </p>
               </div>
             </div>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  ref={closeChatsButtonRef}
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  aria-label="Close Chats"
-                  onClick={closeChats}
-                  className="min-h-[var(--touch-min)] min-w-[var(--touch-min)] min-[48rem]:hidden"
-                >
-                  <X />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Close Chats</TooltipContent>
-            </Tooltip>
+            <div className="flex items-center gap-1">
+              <DropdownMenu>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        ref={createMenuTriggerRef}
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        aria-label="Create"
+                        className="min-h-[var(--touch-min)] min-w-[var(--touch-min)]"
+                      >
+                        <Plus />
+                      </Button>
+                    </DropdownMenuTrigger>
+                  </TooltipTrigger>
+                  <TooltipContent>Create</TooltipContent>
+                </Tooltip>
+                <DropdownMenuContent align="end" aria-label="Create">
+                  <DropdownMenuItem onSelect={openNewBotFromMenu}>
+                    <Plus />
+                    New Bot
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    ref={closeChatsButtonRef}
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    aria-label="Close Chats"
+                    onClick={closeChats}
+                    className="min-h-[var(--touch-min)] min-w-[var(--touch-min)] min-[48rem]:hidden"
+                  >
+                    <X />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Close Chats</TooltipContent>
+              </Tooltip>
+            </div>
           </div>
           <Separator />
         <div className="flex-1 overflow-y-auto px-3 py-3">
-          {creating === "bot" ? (
-            <form onSubmit={onCreate} className="mb-3 space-y-2 px-1">
-              <Input
-                autoFocus
-                name="bot-name"
-                placeholder="Name"
-                value={nameDraft}
-                onChange={(event) => setNameDraft(event.target.value)}
-              />
-              <div className="flex gap-2">
-                <Button type="submit" size="sm" disabled={busy || nameDraft.trim().length === 0}>
-                  Create
-                </Button>
-                <Button type="button" size="sm" variant="ghost" onClick={() => setCreating(false)}>
-                  Cancel
-                </Button>
-              </div>
-            </form>
-          ) : creating === "group" ? (
-            <form onSubmit={onCreateGroup} className="mb-3 space-y-2 px-1">
-              <Input
-                autoFocus
-                name="group-title"
-                placeholder="Title (optional)"
-                value={groupTitleDraft}
-                onChange={(event) => setGroupTitleDraft(event.target.value)}
-              />
-              <div className="space-y-1">
-                {bots.map((bot) => (
-                  <label key={bot.id} className="flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={groupBotIds.includes(bot.id)}
-                      onChange={(event) => {
-                        setGroupBotIds((ids) =>
-                          event.target.checked ? [...ids, bot.id] : ids.filter((id) => id !== bot.id),
-                        );
-                      }}
-                    />
-                    {bot.name}
-                  </label>
-                ))}
-              </div>
-              <div className="flex gap-2">
-                <Button type="submit" size="sm" disabled={busy || groupBotIds.length < 2}>
-                  Create
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => {
-                    setCreating(false);
-                    setGroupBotIds([]);
-                    setGroupTitleDraft("");
-                  }}
-                >
-                  Cancel
-                </Button>
-              </div>
-            </form>
-          ) : (
-            <div className="mb-3 space-y-1">
+          {channelsState === "loading" ? (
+            <p className="px-3 py-2 text-xs text-muted-foreground" role="status">
+              Loading group Chats…
+            </p>
+          ) : channelsState === "error" ? (
+            <div className="mb-2 grid gap-2 rounded-[var(--radius-card)] bg-muted p-3 text-xs" role="alert">
+              <p>Could not load group Chats.</p>
               <Button
                 type="button"
-                variant="ghost"
                 size="sm"
-                className="w-full justify-start"
-                onClick={() => setCreating("bot")}
+                variant="ghost"
+                onClick={retryChannels}
+                className="min-h-[var(--touch-min)] justify-self-start"
               >
-                <Plus />
-                New Bot
+                Retry
               </Button>
-              {bots.length >= 2 ? (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="w-full justify-start"
-                  data-testid="new-group"
-                  onClick={() => setCreating("group")}
-                >
-                  <Users />
-                  New group
-                </Button>
-              ) : null}
             </div>
-          )}
-          {bots.length > 0 ? (
-            <ul className="space-y-1">
+          ) : null}
+          <ul className="space-y-1">
               {bots.map((bot) => (
                 <li key={bot.id}>
                   <button
@@ -890,12 +1077,19 @@ export function Messenger() {
                   </button>
                 </li>
               ))}
-            </ul>
-          ) : (
-            <p className="px-3 py-4 text-sm text-muted-foreground">No Bots yet.</p>
-          )}
+          </ul>
         </div>
-        <div className="border-t border-sidebar-border p-3">
+        <div className="grid gap-1 border-t border-sidebar-border p-3">
+          <Button
+            ref={sidebarPluginsRef}
+            type="button"
+            variant="ghost"
+            className="min-h-[var(--touch-min)] w-full justify-start rounded-[var(--radius-control)]"
+            onClick={() => openPlugins("sidebar")}
+          >
+            <Plug />
+            Plugins
+          </Button>
           <AppSettings />
         </div>
         </>
@@ -922,6 +1116,7 @@ export function Messenger() {
             </Tooltip>
             {active && !activeGroup ? (
               <button
+                ref={newBotDestinationRef}
                 type="button"
                 onClick={openBotSettings}
                 className="flex min-h-[var(--touch-min)] min-w-0 items-center gap-2 rounded-[var(--radius-control)] px-2 text-left transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -953,13 +1148,13 @@ export function Messenger() {
                 type="button"
                 size="sm"
                 variant="outline"
-                data-testid={computerOpen ? "close-computer" : "open-computer"}
-                aria-expanded={computerOpen}
-                onClick={computerOpen ? closeComputer : openComputer}
+                data-testid={visibleComputerOpen ? "close-computer" : "open-computer"}
+                aria-expanded={visibleComputerOpen}
+                onClick={visibleComputerOpen ? closeComputer : openComputer}
                 className="shrink-0 max-[47.999rem]:min-h-[var(--touch-min)]"
               >
-                {computerOpen ? <MessageSquare /> : <Monitor />}
-                {computerOpen ? "Hide Computer" : "Computer"}
+                {visibleComputerOpen ? <MessageSquare /> : <Monitor />}
+                {visibleComputerOpen ? "Hide Computer" : "Computer"}
               </Button>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -1007,7 +1202,11 @@ export function Messenger() {
               <p className="mt-6 text-sm text-muted-foreground">Sending in a group is not this slice.</p>
             </div>
           </div>
-        ) : active && messages.length > 0 ? (
+        ) : active && chatDetailState === "loading" ? (
+          <ChatDetailLoading bot={active} />
+        ) : active && chatDetailState === "error" ? (
+          <ChatDetailError bot={active} onRetry={retryActiveChat} />
+        ) : active && chatDetailState === "populated" ? (
           <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-6 py-4">
             <ul className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-3">
               {rootsOf(visible).map((message, index, roots) => {
@@ -1081,24 +1280,11 @@ export function Messenger() {
               </div>
             ) : null}
           </div>
+        ) : active && chatDetailState === "empty" ? (
+          <EmptyChatStart bot={active} onSuggestion={chooseSuggestion} onOpenSettings={openBotSettings} />
         ) : (
-          <div className="flex flex-1 items-center justify-center px-6">
-            <motion.div
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
-              className="flex flex-col items-center gap-4 text-center"
-            >
-              <Eyes
-                name={active?.name ?? "OpenBot"}
-                color={active?.eyes.color}
-                shape={active?.eyes.shape as FaceShape | undefined}
-                size={140}
-              />
-              <p className="text-sm text-muted-foreground">
-                {active ? "No messages yet." : "Create a Bot to talk."}
-              </p>
-            </motion.div>
+          <div className="flex flex-1 items-center justify-center px-6 text-sm text-muted-foreground">
+            Opening Chat…
           </div>
         )}
         {error ? (
@@ -1134,6 +1320,7 @@ export function Messenger() {
             ) : null}
             <div className="flex items-end gap-2 rounded-[28px] bg-secondary p-2 pl-5">
             <Textarea
+              ref={composerRef}
               name="draft"
               rows={1}
               value={draft}
@@ -1149,21 +1336,32 @@ export function Messenger() {
                   ? "Sending in a group is not this slice."
                   : !active
                     ? "Create a Bot first…"
-                    : replyTo
-                      ? "Reply…"
-                      : "Message a Bot…"
+                    : active.messages === undefined
+                      ? "Opening Chat…"
+                      : !active.harness
+                        ? "Choose an AI connection to start…"
+                        : replyTo
+                          ? "Reply…"
+                          : "Message a Bot…"
               }
-              disabled={!composerSendEnabled(activeGroup ? "group" : active ? "direct" : null)}
+              disabled={!composerSendEnabled(composerKind)}
               className="min-h-10 resize-none"
             />
-            {composerSendEnabled(activeGroup ? "group" : active ? "direct" : null) ? (
+            {composerSendEnabled(composerKind) ? (
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
                   type="submit"
                   size="icon"
                   data-testid="composer-send"
-                  disabled={!active || draft.trim().length === 0 || busy}
+                  disabled={
+                    !canSendDirectMessage({
+                      active: active?.messages !== undefined,
+                      harness: active?.harness ?? null,
+                      draft,
+                      busy,
+                    })
+                  }
                   aria-label="Send"
                   className="shrink-0"
                 >
@@ -1179,7 +1377,7 @@ export function Messenger() {
         </>
       }
         computer={
-        computerOpen && activeId ? (
+        visibleComputerOpen && activeId ? (
           <>
             <header className="flex h-[var(--header-height)] items-center justify-between gap-2 px-4">
               <div className="flex min-w-0 items-center gap-2">
@@ -1217,15 +1415,26 @@ export function Messenger() {
         ) : null
       }
       />
+      <NewBotDialog
+        open={newBotOpen}
+        onOpenChange={setNewBotOpen}
+        openerRef={newBotOpenerRef}
+        destinationRef={newBotDestinationRef}
+        onCreate={createBot}
+        onCreated={openCreatedBot}
+      />
       {active && !activeGroup ? (
         <BotSettings
           key={active.id}
           bot={active}
           harnesses={harnesses}
+          harnessesState={harnessesState}
           open={botSettingsOpen}
           onOpenChange={setBotSettingsOpenFromDialog}
           openerRef={botSettingsOpenerRef}
+          fallbackFocusRef={newBotDestinationRef}
           onBotChange={applyBotUpdate}
+          onRetryHarnesses={retryHarnesses}
           onOpenComputer={openComputer}
           section={botSettingsSection}
           onSectionChange={chooseBotSettingsSection}
