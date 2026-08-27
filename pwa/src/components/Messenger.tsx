@@ -56,7 +56,7 @@ import {
   type BotSettingsSection,
 } from "@/lib/bot-settings";
 import { computerPaneIsOpen } from "@/lib/ui-preferences";
-import { appearanceSettingsRequested } from "@/lib/app-settings";
+import { appSettingsRequested } from "@/lib/app-settings";
 import {
   acceptOrderedSnapshots,
   botDraftKey,
@@ -315,7 +315,7 @@ export function Messenger() {
   const [activeGroup, setActiveGroup] = useState<Channel | null>(null);
   const [mobileSurface, setMobileSurface] = useState<MobileSurface>("chat");
   const [globalRoute, setGlobalRoute] = useState<GlobalRoute>(() => globalRouteFromHash(window.location.hash));
-  const [appSettingsOpen, setAppSettingsOpenState] = useState(() => appearanceSettingsRequested(window.location.hash));
+  const [appSettingsOpen, setAppSettingsOpenState] = useState(() => appSettingsRequested(window.location.hash));
   const [newBotOpen, setNewBotOpenState] = useState(false);
   const [botSettingsOpen, setBotSettingsOpenState] = useState(false);
   const [botSettingsSection, setBotSettingsSection] = useState<BotSettingsSection>("ai");
@@ -819,7 +819,7 @@ export function Messenger() {
   useEffect(() => {
     const syncGlobalRoute = () => {
       const next = globalRouteFromHash(window.location.hash);
-      setAppSettingsOpen(appearanceSettingsRequested(window.location.hash));
+      setAppSettingsOpen(appSettingsRequested(window.location.hash));
       if (
         previousGlobalRouteRef.current === "plugins" &&
         next === "chat" &&

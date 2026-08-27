@@ -18,6 +18,21 @@ export async function unlock(password: string): Promise<{ ok: true } | { ok: fal
   return { ok: true };
 }
 
+export async function lockSession(): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const res = await fetch("/api/session", {
+      method: "DELETE",
+      credentials: "same-origin",
+    });
+    if (!res.ok) {
+      return { ok: false, error: "OpenBot could not lock. Try again." };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: "OpenBot could not lock. Try again." };
+  }
+}
+
 export type EyesMode = "idle" | "think" | "work" | "write" | "needs-you" | "sleep";
 
 export type TranscriptCardAction = {

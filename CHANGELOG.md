@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.5] - 2026-08-27
+
+### Changed
+
+- Persist Password sessions until explicit invalidation
+
 ## [0.9.4] - 2026-08-27
 
 ### Changed

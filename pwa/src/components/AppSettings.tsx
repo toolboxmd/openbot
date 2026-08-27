@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Laptop, Moon, Settings, Sun } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Laptop, LockKeyhole, Moon, Settings, Sun } from "lucide-react";
 import { useUiPreferences } from "@/components/UiPreferencesProvider";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,7 +14,12 @@ import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Separator } from "@/components/ui/separator";
 import { Toast, ToastDescription, ToastProvider, ToastTitle, ToastViewport } from "@/components/ui/toast";
-import { APPEARANCE_SETTINGS_HASH, appearanceSettingsRequested } from "@/lib/app-settings";
+import {
+  APPEARANCE_SETTINGS_HASH,
+  appSettingsRequested,
+  SECURITY_SETTINGS_HASH,
+} from "@/lib/app-settings";
+import { lockSession } from "@/lib/session";
 import type { ThemePreference } from "@/lib/ui-preferences";
 import { cn } from "@/lib/utils";
 
@@ -61,13 +66,18 @@ export function AppSettings({
   onOpenChange?: (open: boolean) => void;
 }) {
   const { preferences, effectiveTheme, updateTheme } = useUiPreferences();
-  const [localOpen, setLocalOpen] = useState(() => appearanceSettingsRequested(window.location.hash));
+  const [localOpen, setLocalOpen] = useState(() => appSettingsRequested(window.location.hash));
+  const [requestedHash, setRequestedHash] = useState(() => window.location.hash);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const [lockPending, setLockPending] = useState(false);
+  const securitySectionRef = useRef<HTMLElement | null>(null);
   const open = controlledOpen ?? localOpen;
 
   useEffect(() => {
     const syncWithLocation = () => {
-      const next = appearanceSettingsRequested(window.location.hash);
+      const hash = window.location.hash;
+      setRequestedHash(hash);
+      const next = appSettingsRequested(hash);
       if (onOpenChange) onOpenChange(next);
       else setLocalOpen(next);
     };
@@ -79,10 +89,22 @@ export function AppSettings({
     };
   }, [onOpenChange]);
 
+  useEffect(() => {
+    if (!open || requestedHash !== SECURITY_SETTINGS_HASH) return;
+    const frame = window.requestAnimationFrame(() => {
+      const section = securitySectionRef.current;
+      if (!section) return;
+      section.scrollIntoView({ block: "start" });
+      section.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [open, requestedHash]);
+
   function setAppSettingsOpen(next: boolean) {
+    const suffix = next ? APPEARANCE_SETTINGS_HASH : "";
+    setRequestedHash(suffix);
     if (onOpenChange) onOpenChange(next);
     else setLocalOpen(next);
-    const suffix = next ? APPEARANCE_SETTINGS_HASH : "";
     window.history.replaceState(
       window.history.state,
       "",
@@ -102,6 +124,23 @@ export function AppSettings({
         : "This browser blocked local preferences, so the choice could not be saved.",
       error: !saved,
     });
+  }
+
+  async function lockOpenBot() {
+    setLockPending(true);
+    const result = await lockSession();
+    if (!result.ok) {
+      setLockPending(false);
+      setFeedback({
+        id: Date.now(),
+        title: "Lock failed",
+        description: result.error,
+        error: true,
+      });
+      return;
+    }
+    setAppSettingsOpen(false);
+    window.location.reload();
   }
 
   return (
@@ -177,6 +216,46 @@ export function AppSettings({
             <p className="text-xs text-muted-foreground" role="status" aria-live="polite">
               Effective appearance: {effectiveTheme === "dark" ? "Dark" : "Light"}.
             </p>
+          </section>
+
+          <Separator />
+
+          <section
+            ref={securitySectionRef}
+            id={SECURITY_SETTINGS_HASH.slice(1)}
+            aria-labelledby="security-heading"
+            tabIndex={-1}
+            className="grid gap-4"
+          >
+            <div className="grid gap-1">
+              <h2 id="security-heading" className="text-base font-semibold">
+                Security
+              </h2>
+              <p className="text-sm text-muted-foreground">
+                Control Password access for this browser.
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-4 rounded-[var(--radius-card)] border p-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="grid gap-1">
+                <h3 className="text-sm font-medium">Password lock</h3>
+                <p id="lock-openbot-description" className="text-xs leading-relaxed text-muted-foreground">
+                  Clear this browser's Password session and return to the Password screen.
+                </p>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                className="min-h-[var(--touch-min)] shrink-0"
+                aria-describedby="lock-openbot-description"
+                aria-busy={lockPending}
+                onClick={lockOpenBot}
+                disabled={lockPending}
+              >
+                <LockKeyhole aria-hidden="true" />
+                Lock OpenBot
+              </Button>
+            </div>
           </section>
         </DialogContent>
       </Dialog>
