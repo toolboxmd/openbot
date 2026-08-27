@@ -14,12 +14,16 @@ const finishCancelledPrompt = () => {
   if (!cancelledPermissions.has(700) || !cancelledPermissions.has(701)) return;
   send({ jsonrpc: "2.0", id: firstPromptId, result: { stopReason: "cancelled" } });
 };
-const update = (text) => send({
+const update = (text, messageId) => send({
   jsonrpc: "2.0",
   method: "session/update",
   params: {
     sessionId: "s1",
-    update: { sessionUpdate: "agent_message", content: { type: "text", text } },
+    update: {
+      sessionUpdate: "agent_message",
+      ...(messageId ? { messageId } : {}),
+      content: { type: "text", text },
+    },
   },
 });
 const chunk = (text, messageId) => send({
@@ -110,6 +114,26 @@ input.on("line", (line) => {
       update("Anonymous complete.");
       send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
     }
+    if (text === "consecutive-ids") {
+      chunk("First complete.", "message-one");
+      chunk("Second complete.", "message-two");
+      send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
+    }
+    if (text === "chunk-then-complete-message") {
+      chunk("Chunk boundary.", "chunk-message");
+      update("Complete message.", "complete-message");
+      send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
+    }
+    if (text === "chunk-then-same-complete-message") {
+      chunk("Private partial", "same-message");
+      update("Stable complete message.", "same-message");
+      send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
+    }
+    if (text === "anonymous-chunk-then-complete-message") {
+      chunk("Private anonymous partial");
+      update("Stable anonymous message.");
+      send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
+    }
     return;
   }
   if (message.method === "session/cancel") {
@@ -141,7 +165,6 @@ function defer() {
 
 describe("AcpClient cancellation boundary", () => {
   test("drains cancelled updates before assigning replacement Turn handlers", async () => {
-    const oldStarted = defer();
     const oldPermission = defer();
     const oldMessages: string[] = [];
     const oldPermissions: string[] = [];
@@ -159,14 +182,12 @@ describe("AcpClient cancellation boundary", () => {
       const oldSettled = client.prompt("old", {
         onAssistant(text) {
           oldMessages.push(text);
-          oldStarted.resolve();
         },
         onPermission(prompt) {
           oldPermissions.push(prompt.title);
           oldPermission.resolve();
         },
       }).catch((error: unknown) => error);
-      await oldStarted.promise;
       await oldPermission.promise;
 
       client.cancel();
@@ -189,7 +210,7 @@ describe("AcpClient cancellation boundary", () => {
         ]),
         "fresh",
       );
-      assert.deepEqual(oldMessages, ["partial old"]);
+      assert.deepEqual(oldMessages, []);
       assert.deepEqual(oldPermissions, ["pending permission"]);
       assert.deepEqual(replacementMessages, ["fresh"]);
       assert.deepEqual(replacementPermissions, []);
@@ -212,25 +233,21 @@ describe("AcpClient cancellation boundary", () => {
     try {
       await client.initialize();
       await client.newSession(process.cwd());
-      await client.prompt("boundary-tool", {
+      const toolText = await client.prompt("boundary-tool", {
         onAssistant(text, delta) {
           events.push({ text, delta });
         },
       });
-      await client.prompt("boundary-thought", {
+      const thoughtText = await client.prompt("boundary-thought", {
         onAssistant(text, delta) {
           events.push({ text, delta });
         },
       });
 
+      assert.equal(toolText, "Complete after tool.");
+      assert.equal(thoughtText, "Complete after thought.");
       assert.deepEqual(events, [
-        { text: "Complete ", delta: { start: true, messageId: "tool-message" } },
-        { text: "Complete ", delta: { done: true, messageId: "tool-message" } },
-        { text: "Complete after tool.", delta: { messageId: "tool-message" } },
         { text: "Complete after tool.", delta: { done: true, messageId: "tool-message" } },
-        { text: "Complete ", delta: { start: true, messageId: "thought-message" } },
-        { text: "Complete ", delta: { done: true, messageId: "thought-message" } },
-        { text: "Complete after thought.", delta: { messageId: "thought-message" } },
         { text: "Complete after thought.", delta: { done: true, messageId: "thought-message" } },
       ]);
     } finally {
@@ -264,19 +281,113 @@ describe("AcpClient cancellation boundary", () => {
       });
 
       assert.deepEqual(events, [
-        { text: "Identified.", delta: { start: true, messageId: "identified-message" } },
         { text: "Identified.", delta: { done: true, messageId: "identified-message" } },
-        { text: "Anonymous.", delta: { start: true } },
         { text: "Anonymous.", delta: { done: true } },
-        {
-          text: "Identified complete.",
-          delta: { start: true, messageId: "identified-complete-message" },
-        },
         {
           text: "Identified complete.",
           delta: { done: true, messageId: "identified-complete-message" },
         },
         { text: "Anonymous complete.", delta: { start: true, done: true } },
+      ]);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("completes the prior protocol message when a distinct message id begins", async () => {
+    const events: Array<{
+      text: string;
+      delta?: { start?: boolean; done?: boolean; messageId?: string };
+    }> = [];
+    const client = new AcpClient({
+      command: process.execPath,
+      args: ["-e", FAKE_ACP],
+      env: { ...process.env },
+    }, process.cwd());
+
+    try {
+      await client.initialize();
+      await client.newSession(process.cwd());
+      await client.prompt("consecutive-ids", {
+        onAssistant(text, delta) {
+          events.push({ text, delta });
+        },
+      });
+
+      assert.deepEqual(events, [
+        { text: "First complete.", delta: { done: true, messageId: "message-one" } },
+        { text: "Second complete.", delta: { done: true, messageId: "message-two" } },
+      ]);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("completes a chunked message before a distinct complete message event", async () => {
+    const events: Array<{
+      text: string;
+      delta?: { start?: boolean; done?: boolean; messageId?: string };
+    }> = [];
+    const client = new AcpClient({
+      command: process.execPath,
+      args: ["-e", FAKE_ACP],
+      env: { ...process.env },
+    }, process.cwd());
+
+    try {
+      await client.initialize();
+      await client.newSession(process.cwd());
+      await client.prompt("chunk-then-complete-message", {
+        onAssistant(text, delta) {
+          events.push({ text, delta });
+        },
+      });
+
+      assert.deepEqual(events, [
+        { text: "Chunk boundary.", delta: { done: true, messageId: "chunk-message" } },
+        {
+          text: "Complete message.",
+          delta: { start: true, done: true, messageId: "complete-message" },
+        },
+      ]);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("publishes identified and anonymous chunk streams once when their complete event arrives", async () => {
+    const events: Array<{
+      text: string;
+      delta?: { start?: boolean; done?: boolean; messageId?: string };
+    }> = [];
+    const client = new AcpClient({
+      command: process.execPath,
+      args: ["-e", FAKE_ACP],
+      env: { ...process.env },
+    }, process.cwd());
+
+    try {
+      await client.initialize();
+      await client.newSession(process.cwd());
+      const identified = await client.prompt("chunk-then-same-complete-message", {
+        onAssistant(text, delta) {
+          events.push({ text, delta });
+        },
+      });
+      const anonymous = await client.prompt("anonymous-chunk-then-complete-message", {
+        onAssistant(text, delta) {
+          events.push({ text, delta });
+        },
+      });
+
+      assert.equal(identified, "Stable complete message.");
+      assert.equal(anonymous, "Stable anonymous message.");
+      assert.deepEqual(events, [
+        {
+          text: "Stable complete message.",
+          delta: { start: true, done: true, messageId: "same-message" },
+        },
+        { text: "Stable anonymous message.", delta: { start: true, done: true } },
       ]);
     } finally {
       client.close();
