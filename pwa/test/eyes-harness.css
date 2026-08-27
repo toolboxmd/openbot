@@ -1,0 +1,102 @@
+@import "../src/index.css";
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #dedee3;
+  font-family: var(--font-sans);
+}
+
+button {
+  min-height: 44px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--foreground);
+  color: var(--canvas);
+  padding: 0 16px;
+  font: inherit;
+  font-weight: 600;
+}
+
+.harness {
+  display: grid;
+  min-width: 1180px;
+  gap: 24px;
+  padding: 24px;
+}
+
+.theme-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-dialog);
+  background: var(--canvas);
+  color: var(--foreground);
+  padding: 22px;
+  box-shadow: var(--shadow-dialog);
+}
+
+.theme-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.theme-header h1 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.theme-header p,
+.face-card p {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.face-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.face-card {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  padding: 14px;
+}
+
+.face-card h2 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.face-sizes {
+  display: grid;
+  grid-template-columns: 1fr;
+  place-items: center;
+  min-height: 176px;
+  margin-top: 14px;
+}
+
+.face-compact {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.sample {
+  display: grid;
+  justify-items: center;
+  gap: 5px;
+  color: var(--text-muted);
+  font-size: 10px;
+}

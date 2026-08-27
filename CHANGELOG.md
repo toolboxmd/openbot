@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.4] - 2026-08-27
+
+### Changed
+
+- Smooth named Eyes and focus the working pose
+
 ## [0.9.3] - 2026-08-27
 
 ### Changed

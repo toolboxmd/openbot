@@ -24,6 +24,13 @@ export type FaceMode = "idle" | "think" | "work" | "write" | "needs-you" | "slee
 export type Vec3 = { x: number; y: number; z: number };
 export type Vec2 = { x: number; y: number };
 
+export type FacePose = {
+  lid: number;
+  eye: number;
+  look: Vec2;
+  nod: number;
+};
+
 export type ShapeFit = {
   scale: number;
   originX: number;
@@ -44,6 +51,24 @@ export function hash32(s: string): number {
 
 export function isDefaultBot(name: string): boolean {
   return name.toLowerCase() === "openbot";
+}
+
+export function facePoseAt(mode: FaceMode, elapsedSeconds = 0, reducedMotion = false): FacePose {
+  if (mode === "think") return { lid: 0.12, eye: 0.92, look: { x: 0.28, y: -0.35 }, nod: 0 };
+  if (mode === "work" || mode === "write") {
+    const focus = reducedMotion
+      ? 0.5
+      : (1 - Math.cos((elapsedSeconds / 0.9) * Math.PI * 2)) / 2;
+    return {
+      lid: 0.34 + focus * 0.12,
+      eye: 0.96 - focus * 0.04,
+      look: { x: 0, y: 0.2 + focus * 0.035 },
+      nod: focus * 1.3,
+    };
+  }
+  if (mode === "needs-you") return { lid: 0, eye: 1.18, look: { x: 0, y: 0 }, nod: 0 };
+  if (mode === "sleep") return { lid: 0.88, eye: 1.05, look: { x: 0, y: 0 }, nod: 0 };
+  return { lid: 0.04, eye: 1, look: { x: 0, y: 0 }, nod: 0 };
 }
 
 export function pickShape(name: string, taken: Iterable<FaceShape> = []): FaceShape {
@@ -86,32 +111,19 @@ export function norm(p: Vec3): Vec3 {
  */
 export function deform(p: Vec3, shape: FaceShape): Vec3 {
   if (shape === "capsule") {
-    const R = 0.58;
-    const H = 0.42;
-    return { x: p.x * R, y: p.y * R + Math.sign(p.y) * H, z: p.z * R };
+    return { x: p.x * 0.9, y: p.y * 0.88, z: p.z * 0.82 };
   }
   if (shape === "rounded-cube") {
-    const n = 8;
-    const s = (Math.abs(p.x) ** n + Math.abs(p.y) ** n + Math.abs(p.z) ** n) ** (1 / n) || 1;
-    return { x: p.x / s, y: p.y / s, z: p.z / s };
+    return { x: p.x * 0.92, y: p.y * 0.92, z: p.z * 0.88 };
   }
   if (shape === "diamond") {
-    const s = (Math.abs(p.x) + Math.abs(p.y) + Math.abs(p.z)) || 1;
-    return { x: p.x / s, y: p.y / s, z: p.z / s };
+    return { x: p.x * 0.88, y: p.y * 0.88, z: p.z * 0.8 };
   }
   if (shape === "bean") {
-    const ry = 0.5 + 0.28 * ((p.x + 1) / 2);
-    let x = p.x * 0.92 + 0.22;
-    const y = p.y * ry;
-    const z = p.z * ry * 0.72;
-    const bite = Math.exp(-(y * y) / 0.2) * Math.max(0, -p.x);
-    x += 0.26 * bite;
-    return { x, y, z };
+    return { x: p.x * 0.9, y: p.y * 0.88, z: p.z * 0.8 };
   }
   if (shape === "shield") {
-    const t = (p.y + 1) / 2;
-    const width = 0.22 + 0.78 * Math.sqrt(Math.max(0, t));
-    return { x: p.x * width, y: p.y * 1.08, z: p.z * width * 0.42 };
+    return { x: p.x * 0.9, y: p.y * 0.88, z: p.z * 0.78 };
   }
   return p;
 }
@@ -145,117 +157,92 @@ export function shoelace(pts: Vec2[]): number {
   return Math.abs(a / 2);
 }
 
-function flattenX(pts: Vec2[], yaw: number, amount: number): Vec2[] {
-  if (amount <= 0) return pts;
-  const k = 1 - amount * (1 - Math.abs(Math.cos(yaw)));
-  return pts.map((p) => ({ x: p.x * k, y: p.y }));
+function sampledContour(pointAt: (angle: number) => Vec2, steps = 192): Vec2[] {
+  return Array.from({ length: steps }, (_, index) => pointAt((index / steps) * Math.PI * 2));
 }
 
-/** Rounded rectangle, y-up, centered. radius = half-width yields a stadium. */
-function roundRectContour(width: number, height: number, radius: number, steps = 7): Vec2[] {
-  const hw = width / 2;
-  const hh = height / 2;
-  const r = Math.min(radius, hw, hh);
-  const corners = [
-    { x: hw - r, y: hh - r, a0: 0, a1: Math.PI / 2 },
-    { x: -hw + r, y: hh - r, a0: Math.PI / 2, a1: Math.PI },
-    { x: -hw + r, y: -hh + r, a0: Math.PI, a1: (3 * Math.PI) / 2 },
-    { x: hw - r, y: -hh + r, a0: (3 * Math.PI) / 2, a1: Math.PI * 2 },
-  ];
-  const arcs: Vec2[][] = corners.map((c) => {
-    const pts: Vec2[] = [];
-    for (let i = 0; i <= steps; i++) {
-      const a = c.a0 + (c.a1 - c.a0) * (i / steps);
-      pts.push({ x: c.x + Math.cos(a) * r, y: c.y + Math.sin(a) * r });
-    }
-    return pts;
+function superellipseContour(width: number, height: number, exponent: number): Vec2[] {
+  return sampledContour((angle) => {
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    return {
+      x: width * Math.sign(cos) * Math.abs(cos) ** (2 / exponent),
+      y: height * Math.sign(sin) * Math.abs(sin) ** (2 / exponent),
+    };
   });
-  const pts: Vec2[] = [];
-  for (let i = 0; i < 4; i++) {
-    pts.push(...arcs[i]);
-    const a = arcs[i][arcs[i].length - 1];
-    const b = arcs[(i + 1) % 4][0];
-    if (Math.hypot(b.x - a.x, b.y - a.y) > 1e-6) {
-      for (let k = 1; k <= 4; k++) {
-        const t = k / 5;
-        pts.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
-      }
-    }
-  }
-  return pts;
 }
 
-function quadratic(p0: Vec2, p1: Vec2, p2: Vec2, t: number): Vec2 {
-  const u = 1 - t;
+function mixPoint(a: Vec2, b: Vec2, amount: number): Vec2 {
+  return { x: a.x + (b.x - a.x) * amount, y: a.y + (b.y - a.y) * amount };
+}
+
+function quadraticPoint(start: Vec2, control: Vec2, end: Vec2, amount: number): Vec2 {
+  const remaining = 1 - amount;
   return {
-    x: u * u * p0.x + 2 * u * t * p1.x + t * t * p2.x,
-    y: u * u * p0.y + 2 * u * t * p1.y + t * t * p2.y,
+    x: remaining * remaining * start.x + 2 * remaining * amount * control.x + amount * amount * end.x,
+    y: remaining * remaining * start.y + 2 * remaining * amount * control.y + amount * amount * end.y,
   };
 }
 
+function roundedPolygonContour(sides: number, radiusX: number, radiusY: number, rotation: number): Vec2[] {
+  const vertices = Array.from({ length: sides }, (_, index) => {
+    const angle = rotation + (index / sides) * Math.PI * 2;
+    return { x: Math.cos(angle) * radiusX, y: Math.sin(angle) * radiusY };
+  });
+  const points: Vec2[] = [];
+  const rounding = 0.24;
+  const cornerSteps = 12;
+  const edgeSteps = 20;
+
+  for (let index = 0; index < vertices.length; index += 1) {
+    const previous = vertices[(index - 1 + vertices.length) % vertices.length];
+    const vertex = vertices[index];
+    const next = vertices[(index + 1) % vertices.length];
+    const cornerStart = mixPoint(vertex, previous, rounding);
+    const cornerEnd = mixPoint(vertex, next, rounding);
+    const nextIncoming = mixPoint(next, vertex, rounding);
+
+    for (let step = 0; step < cornerSteps; step += 1) {
+      points.push(quadraticPoint(cornerStart, vertex, cornerEnd, step / cornerSteps));
+    }
+    for (let step = 0; step < edgeSteps; step += 1) {
+      points.push(mixPoint(cornerEnd, nextIncoming, step / edgeSteps));
+    }
+  }
+
+  return points;
+}
+
 /**
- * Rest-pose 2D silhouette (y-up). Named shapes stay clearly different at 28px:
- * capsule = vertical stadium, cube = rounded square, diamond = rhombus,
- * bean = kidney with a bite, shield = heater (pointed bottom, broad top).
- * Yaw only slims flattened volumes — never grows past the rest bbox.
+ * Rest-pose 2D silhouette (y-up). The stored shape names are kept for Home
+ * compatibility, while every named contour is now dense, smooth, and square.
+ * The outline stays fixed under yaw so looking never squashes a 2D identity.
  */
 export function shapeContour(shape: FaceShape, yaw = 0): Vec2[] {
+  void yaw;
   if (shape === "sphere") {
-    const pts: Vec2[] = [];
-    const n = 48;
-    for (let i = 0; i < n; i++) {
-      const a = (i / n) * Math.PI * 2;
-      pts.push({ x: Math.cos(a), y: Math.sin(a) });
-    }
-    return pts;
+    return sampledContour((angle) => ({ x: Math.cos(angle), y: Math.sin(angle) }));
   }
   if (shape === "capsule") {
-    // Vertical stadium: parallel sides + hemispherical caps. Not an ellipse.
-    return roundRectContour(1.12, 2, 0.56);
+    // Legacy key: a soft, almost-square pebble rather than a tall pill.
+    return superellipseContour(0.95, 0.91, 2.6);
   }
   if (shape === "rounded-cube") {
-    return flattenX(roundRectContour(1.7, 1.7, 0.22), yaw, 0.08);
+    return superellipseContour(0.94, 0.94, 4.4);
   }
   if (shape === "diamond") {
-    const w = 0.62;
-    return flattenX(
-      [
-        { x: 0, y: 1 },
-        { x: w, y: 0 },
-        { x: 0, y: -1 },
-        { x: -w, y: 0 },
-      ],
-      yaw,
-      0.06,
-    );
+    // A continuously rounded lozenge, never a four-segment jagged hull.
+    return superellipseContour(0.93, 0.93, 1.55);
   }
   if (shape === "bean") {
-    // Squat ellipse with a left-side waist so it reads as a kidney, not a circle.
-    const pts: Vec2[] = [];
-    const n = 48;
-    for (let i = 0; i < n; i++) {
-      const t = (i / n) * Math.PI * 2;
-      let x = 0.98 * Math.cos(t);
-      const y = 0.56 * Math.sin(t);
-      x += 0.52 * Math.exp(-((y / 0.18) ** 2)) * Math.max(0, -x);
-      pts.push({ x: x + 0.08, y });
-    }
-    return flattenX(pts, yaw, 0.22);
+    // Legacy key: a centered teardrop with no kidney-shaped side bite.
+    return sampledContour((angle) => ({
+      x: 0.96 * Math.sin(angle) * (0.86 - 0.14 * Math.cos(angle)),
+      y: 0.92 * Math.cos(angle),
+    }));
   }
-  // shield — heater: broad top, tapered sides, pointed bottom
-  const top = { x: 0, y: 0.92 };
-  const rShoulder = { x: 0.9, y: 0.58 };
-  const rWaist = { x: 0.68, y: -0.1 };
-  const bottom = { x: 0, y: -1.08 };
-  const lWaist = { x: -0.68, y: -0.1 };
-  const lShoulder = { x: -0.9, y: 0.58 };
-  const pts: Vec2[] = [top, rShoulder, rWaist];
-  const steps = 12;
-  for (let i = 1; i <= steps; i++) {
-    pts.push(quadratic(rWaist, bottom, lWaist, i / steps));
-  }
-  pts.push(lShoulder);
-  return flattenX(pts, yaw, 0.34);
+  // Legacy shield key: a softly rounded, square-proportioned hex.
+  return roundedPolygonContour(6, 1.02, 0.94, Math.PI / 2);
 }
 
 /** Rest-pose (or yawed) silhouette bounds, y-up. */
@@ -302,6 +289,16 @@ export function shapeFit(shape: FaceShape, size: number, padding = FACE_PAD): Sh
   };
 }
 
+export function clampFaceYOffset(
+  offset: number,
+  fit: Pick<ShapeFit, "height">,
+  size: number,
+  strokeWidth = 0,
+): number {
+  const clearance = Math.max(0, (size - fit.height - strokeWidth) / 2);
+  return Math.max(-clearance, Math.min(clearance, offset));
+}
+
 export function projectPoint(p: Vec3, fit: ShapeFit, size: number): Vec2 {
   return {
     x: size / 2 + (p.x - fit.originX) * fit.scale,
@@ -316,16 +313,16 @@ function project2(p: Vec2, fit: ShapeFit, size: number): Vec2 {
   };
 }
 
-/** Canvas-space silhouette at yaw. Bean keeps its bite (not a convex hull). */
+/** Canvas-space silhouette at yaw. The 2D identity never narrows with gaze. */
 export function shapeOutline(shape: FaceShape, yaw: number, fit: ShapeFit, size: number): Vec2[] {
   return shapeContour(shape, yaw).map((p) => project2(p, fit, size));
 }
 
 export function shapeZExtent(shape: FaceShape): number {
-  if (shape === "capsule") return 0.58;
-  if (shape === "rounded-cube") return 1;
-  if (shape === "diamond") return 1;
-  if (shape === "bean") return 0.55;
-  if (shape === "shield") return 0.42;
+  if (shape === "capsule") return 0.82;
+  if (shape === "rounded-cube") return 0.88;
+  if (shape === "diamond") return 0.8;
+  if (shape === "bean") return 0.8;
+  if (shape === "shield") return 0.78;
   return 1;
 }
