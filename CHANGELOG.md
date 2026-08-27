@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.1] - 2026-08-27
+
+### Changed
+
+- Bound daemon HTTP, WebSocket, and static-file input
+
 ## [0.10.0] - 2026-08-27
 
 ### Added
