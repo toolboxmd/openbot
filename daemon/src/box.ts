@@ -30,7 +30,13 @@ export type RunningBox = {
 };
 
 const COOKIE = "openbot";
-const MAX_AGE = 60 * 60 * 24 * 30;
+const COOKIE_EXPIRES = "Fri, 31 Dec 9999 23:59:59 GMT";
+const SESSION_VERSION = "v1";
+const AUTH_DIRECTORY = "auth";
+const AUTH_SALT_FILE = "salt";
+const AUTH_SALT_BYTES = 32;
+const PRIVATE_DIRECTORY_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
 const SCREEN_PREFIX = "/screen";
 
 const MIME: Record<string, string> = {
@@ -62,6 +68,7 @@ function verify(token: string, key: Buffer): boolean {
   const cut = token.lastIndexOf(".");
   if (cut <= 0) return false;
   const payload = token.slice(0, cut);
+  if (payload !== SESSION_VERSION) return false;
   const sig = token.slice(cut + 1);
   const expected = crypto.createHmac("sha256", key).update(payload).digest("base64url");
   const left = Buffer.from(sig);
@@ -126,6 +133,139 @@ function sendJson(
 function hasSession(req: http.IncomingMessage, key: Buffer): boolean {
   const token = parseCookies(req.headers.cookie)[COOKIE];
   return Boolean(token && verify(token, key));
+}
+
+function sessionCookie(token: string): string {
+  return `${COOKIE}=${token}; HttpOnly; Path=/; SameSite=Lax; Expires=${COOKIE_EXPIRES}`;
+}
+
+function clearedSessionCookie(): string {
+  return `${COOKIE}=; HttpOnly; Path=/; SameSite=Lax; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0`;
+}
+
+function clearSessionCookieWhenPresent(
+  req: http.IncomingMessage,
+): Record<string, string> {
+  return Object.hasOwn(parseCookies(req.headers.cookie), COOKIE)
+    ? { "Set-Cookie": clearedSessionCookie() }
+    : {};
+}
+
+function requireSession(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  key: Buffer,
+): boolean {
+  const token = parseCookies(req.headers.cookie)[COOKIE];
+  if (token && verify(token, key)) {
+    res.setHeader("Set-Cookie", sessionCookie(token));
+    return true;
+  }
+  sendJson(
+    res,
+    401,
+    { error: "unauthenticated" },
+    clearSessionCookieWhenPresent(req),
+  );
+  return false;
+}
+
+async function loadOrCreateAuthSalt(homeDir: string): Promise<Buffer> {
+  const authDir = path.join(homeDir, AUTH_DIRECTORY);
+  const saltPath = path.join(authDir, AUTH_SALT_FILE);
+  await ensurePrivateDirectory(homeDir, true, "OpenBot Home");
+  await ensurePrivateDirectory(authDir, false, "authentication directory");
+  try {
+    return await readAuthSalt(saltPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+  const candidate = path.join(
+    authDir,
+    `.salt-${process.pid}-${crypto.randomBytes(12).toString("hex")}.tmp`,
+  );
+  const candidateHandle = await fs.open(
+    candidate,
+    fsSync.constants.O_WRONLY |
+      fsSync.constants.O_CREAT |
+      fsSync.constants.O_EXCL |
+      fsSync.constants.O_NOFOLLOW,
+    PRIVATE_FILE_MODE,
+  );
+  try {
+    await candidateHandle.writeFile(crypto.randomBytes(AUTH_SALT_BYTES));
+    await candidateHandle.chmod(PRIVATE_FILE_MODE);
+  } finally {
+    await candidateHandle.close();
+  }
+  try {
+    try {
+      await fs.link(candidate, saltPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+  } finally {
+    await fs.unlink(candidate);
+  }
+  return readAuthSalt(saltPath);
+}
+
+async function ensurePrivateDirectory(
+  directory: string,
+  recursive: boolean,
+  label: string,
+): Promise<void> {
+  try {
+    await fs.mkdir(directory, { recursive, mode: PRIVATE_DIRECTORY_MODE });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
+
+  let handle: fs.FileHandle;
+  try {
+    handle = await fs.open(
+      directory,
+      fsSync.constants.O_RDONLY |
+        fsSync.constants.O_DIRECTORY |
+        fsSync.constants.O_NOFOLLOW,
+    );
+  } catch {
+    throw new Error(`${label} must be a real directory`);
+  }
+  try {
+    const info = await handle.stat();
+    if (!info.isDirectory()) throw new Error(`${label} must be a real directory`);
+    await handle.chmod(PRIVATE_DIRECTORY_MODE);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readAuthSalt(saltPath: string): Promise<Buffer> {
+  let handle: fs.FileHandle;
+  try {
+    handle = await fs.open(
+      saltPath,
+      fsSync.constants.O_RDONLY |
+        fsSync.constants.O_NONBLOCK |
+        fsSync.constants.O_NOFOLLOW,
+    );
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") throw err;
+    throw new Error("authentication salt must be a regular file");
+  }
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) {
+      throw new Error("authentication salt must be a regular file");
+    }
+    await handle.chmod(PRIVATE_FILE_MODE);
+    const salt = await handle.readFile();
+    if (salt.length !== AUTH_SALT_BYTES) throw new Error("invalid authentication salt");
+    return salt;
+  } finally {
+    await handle.close();
+  }
 }
 
 function isScreenPath(pathname: string): boolean {
@@ -401,12 +541,12 @@ function sendStoreError(res: http.ServerResponse, err: unknown): void {
 
 export async function startBox(options: BoxOptions): Promise<RunningBox> {
   const host = options.host ?? "0.0.0.0";
-  const salt = crypto.randomBytes(16);
+  const homeDir = path.resolve(options.homeDir ?? defaultHomeDir());
+  const salt = await loadOrCreateAuthSalt(homeDir);
   const key = crypto.scryptSync(options.password, salt, 32);
   const auth = kasmAuthorization(options);
   const computer: ComputerRuntime =
     options.computer ?? new NoopComputerRuntime(undefined, options.screenUpstream);
-  const homeDir = path.resolve(options.homeDir ?? defaultHomeDir());
   const workspaceDir = path.resolve(options.workspaceDir ?? defaultWorkspaceDir(homeDir));
   fsSync.mkdirSync(workspaceDir, { recursive: true });
   const store = options.botStore ?? new BotStore(homeDir, {
@@ -444,55 +584,65 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
       const method = req.method ?? "GET";
 
+      if (url.pathname === "/api/session" && method === "DELETE") {
+        res.writeHead(204, {
+          "Cache-Control": "no-store",
+          "Set-Cookie": clearedSessionCookie(),
+        });
+        res.end();
+        return;
+      }
+
       if (url.pathname === "/api/session" && method === "POST") {
-        let body: { password?: unknown } = {};
+        let body: unknown;
         try {
           const raw = await readBody(req);
-          body = raw ? (JSON.parse(raw) as { password?: unknown }) : {};
+          body = raw ? JSON.parse(raw) : null;
         } catch {
-          sendJson(res, 400, { error: "invalid json" });
+          sendJson(res, 400, { error: "invalid json" }, clearSessionCookieWhenPresent(req));
           return;
         }
-        const given = typeof body.password === "string" ? body.password : "";
+        if (
+          typeof body !== "object" ||
+          body === null ||
+          Array.isArray(body) ||
+          typeof (body as Record<string, unknown>).password !== "string" ||
+          (body as Record<string, unknown>).password === ""
+        ) {
+          sendJson(res, 400, { error: "invalid Password" }, clearSessionCookieWhenPresent(req));
+          return;
+        }
+        const given = (body as { password: string }).password;
         if (!passwordsEqual(given, options.password)) {
-          sendJson(res, 401, { error: "wrong Password" });
+          sendJson(res, 401, { error: "wrong Password" }, clearSessionCookieWhenPresent(req));
           return;
         }
-        const token = sign(`v1.${Date.now()}`, key);
+        const token = sign(SESSION_VERSION, key);
         sendJson(
           res,
           200,
           { ok: true },
           {
-            "Set-Cookie": `${COOKIE}=${token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${MAX_AGE}`,
+            "Set-Cookie": sessionCookie(token),
           },
         );
         return;
       }
 
       if (url.pathname === "/api/session" && method === "GET") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         sendJson(res, 200, { ok: true });
         return;
       }
 
       if (url.pathname === "/api/agents" && method === "GET") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         sendJson(res, 200, { text: store.readAllBotsAgents() });
         return;
       }
 
       if (url.pathname === "/api/agents" && method === "PUT") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         let body: Record<string, unknown> = {};
         try {
           const raw = await readBody(req);
@@ -507,46 +657,31 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       }
 
       if (url.pathname === "/api/host-grants" && method === "GET") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         sendJson(res, 200, { grants: store.listHostGrants() });
         return;
       }
 
       if (url.pathname === "/api/harnesses" && method === "GET") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         sendJson(res, 200, { harnesses: store.listHarnesses() });
         return;
       }
 
       if (url.pathname === "/api/bots" && method === "GET") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         sendJson(res, 200, { bots: store.list() });
         return;
       }
 
       if (url.pathname === "/api/inbox" && method === "GET") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         sendJson(res, 200, store.inbox());
         return;
       }
 
       if (url.pathname === "/api/bots" && method === "POST") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         let body: Record<string, unknown> = {};
         try {
           const raw = await readBody(req);
@@ -566,19 +701,13 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       }
 
       if (url.pathname === "/api/channels" && method === "GET") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         sendJson(res, 200, { channels: store.listChannels() });
         return;
       }
 
       if (url.pathname === "/api/channels" && method === "POST") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         let body: Record<string, unknown> = {};
         try {
           const raw = await readBody(req);
@@ -602,10 +731,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
 
       const channelMessagesMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/messages$/);
       if (channelMessagesMatch && method === "POST") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         const channelId = decodeURIComponent(channelMessagesMatch[1]);
         const channel = store.getChannel(channelId);
         if (!channel) {
@@ -618,10 +744,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
 
       const channelReadMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/read$/);
       if (channelReadMatch && method === "POST") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         let body: Record<string, unknown> = {};
         try {
           const raw = await readBody(req);
@@ -642,10 +765,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
 
       const channelMatch = url.pathname.match(/^\/api\/channels\/([^/]+)$/);
       if (channelMatch && method === "GET") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         const channel = store.getChannel(decodeURIComponent(channelMatch[1]));
         if (!channel) {
           sendJson(res, 404, { error: "Channel not found" });
@@ -657,10 +777,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
 
       const reactionMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/messages\/([^/]+)\/reactions$/);
       if (reactionMatch && method === "POST") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         let body: Record<string, unknown> = {};
         try {
           const raw = await readBody(req);
@@ -685,10 +802,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
 
       const retryCardMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/cards\/([^/]+)\/retry$/);
       if (retryCardMatch && method === "POST") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         try {
           const bot = await store.retryCard(
             decodeURIComponent(retryCardMatch[1]),
@@ -703,10 +817,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
 
       const botReadMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/read$/);
       if (botReadMatch && method === "POST") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         let body: Record<string, unknown> = {};
         try {
           const raw = await readBody(req);
@@ -727,10 +838,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
 
       const messagesMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/messages$/);
       if (messagesMatch) {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         const botId = decodeURIComponent(messagesMatch[1]);
         if (method === "GET") {
           const thread = store.messages(botId);
@@ -764,10 +872,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
 
       const permMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/permissions$/);
       if (permMatch && method === "POST") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         let body: Record<string, unknown> = {};
         try {
           const raw = await readBody(req);
@@ -796,10 +901,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
 
       const botAgentsMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/agents$/);
       if (botAgentsMatch) {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         const botId = decodeURIComponent(botAgentsMatch[1]);
         if (method === "GET") {
           try {
@@ -830,10 +932,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
 
       const harnessMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/harness$/);
       if (harnessMatch && method === "POST") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         let body: Record<string, unknown> = {};
         try {
           const raw = await readBody(req);
@@ -854,10 +953,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
 
       const botMatch = url.pathname.match(/^\/api\/bots\/([^/]+)$/);
       if (botMatch) {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         const botId = decodeURIComponent(botMatch[1]);
         if (method === "GET") {
           const bot = store.get(botId);
@@ -898,10 +994,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       }
 
       if (url.pathname === "/api/computer/zoom" && method === "POST") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         let body: Record<string, unknown> = {};
         try {
           const raw = await readBody(req);
@@ -949,10 +1042,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       }
 
       if (url.pathname === "/api/computer" && method === "GET") {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         const requested = url.searchParams.get("botId");
         const bot = requested ? store.get(requested) : null;
         if (requested && !bot) {
@@ -984,10 +1074,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       }
 
       if (isScreenPath(url.pathname)) {
-        if (!hasSession(req, key)) {
-          sendJson(res, 401, { error: "unauthenticated" });
-          return;
-        }
+        if (!requireSession(req, res, key)) return;
         const parsed = parseScreenPath(url.pathname, (id) => store.get(id) != null);
         const destBase = upstreamFor(parsed.botId);
         if (!destBase) {
