@@ -34,8 +34,12 @@ One origin. The host daemon is Talk, the reverse proxy, and the PWA.
 
 ```bash
 npm install
+npm run test:focused -- daemon/test/messages.test.ts
 npm test
 npm run typecheck
+npm run build:pwa
 ```
 
-Tests talk HTTP. They hit `/api/session`, `/api/bots`, `/api/computer`, `/screen/`, and `GET /`. A fake Kasm server stands in for the container. The Computer runtime is injected: two Bots allocate two displays and never `docker run` a second Screen name. Supervisor tests inject a compose runner, daemon spawner, clock, and signals; they do not start Docker or Codex. `screenIsReachable` uses `node:http`, not `fetch`+AbortSignal.
+Use focused deterministic files while implementing. Before committing or pushing a slice, run the complete deterministic suite, type check, and PWA build. `npm test` excludes every `*.live.test.*` module. Tests talk HTTP through loopback only. A fake Kasm server stands in for the container. The Computer runtime is injected: two Bots allocate two displays and never `docker run` a second Screen name. Supervisor tests inject a compose runner, daemon spawner, clock, and signals; they do not start Docker or Codex. `screenIsReachable` uses `node:http`, not `fetch`+AbortSignal.
+
+Real-Harness, Screen, and PinchTab proof use explicit `test:live:*` commands on the slice's final candidate. Missing live prerequisites fail rather than skip. See [the contributor test workflow](CONTRIBUTING.md#test-workflow) for the lane taxonomy and handoff contract.
