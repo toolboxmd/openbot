@@ -42,7 +42,9 @@ export type TranscriptCardAction = {
   command:
     | { kind: "permission"; optionId: string }
     | { kind: "host-grant"; access: "read" | "read-write" | "deny" }
-    | { kind: "retry-message"; messageId: string };
+    | { kind: "retry-message"; messageId: string }
+    | { kind: "open-computer"; eventId: string }
+    | { kind: "resolve-needs-you"; eventId: string; resolution: "done" | "skip" };
 };
 
 export type TranscriptCard = {
@@ -50,6 +52,7 @@ export type TranscriptCard = {
   title: string;
   body: string;
   preview?: string;
+  needsYou?: { id: string; reason: "computer-help" };
   status: {
     tone: "neutral" | "waiting" | "success" | "danger";
     label: string;
@@ -73,7 +76,10 @@ export type Bot = {
     options: Array<{ optionId: string; name: string; kind?: string }>;
     hostGrant?: { path: string; requested?: "read" | "read-write" };
   } | null;
-  needsYou: { reason: "login"; hint: string } | null;
+  needsYou:
+    | { reason: "login"; hint: string }
+    | { reason: "computer-help"; hint: string; eventId: string; cardId: string }
+    | null;
   activity: {
     latestText: string | null;
     lastActivityAt: string;
@@ -267,6 +273,28 @@ export async function retryTranscriptCard(botId: string, cardId: string): Promis
   if (!res.ok) {
     const body = (await res.json().catch(() => ({}))) as { error?: string };
     throw new Error(body.error ?? "Could not retry this message.");
+  }
+  return (await res.json()) as Bot;
+}
+
+export async function resolveNeedsYouCard(
+  botId: string,
+  cardId: string,
+  eventId: string,
+  resolution: "done" | "skip",
+): Promise<Bot> {
+  const res = await fetch(
+    `/api/bots/${encodeURIComponent(botId)}/cards/${encodeURIComponent(cardId)}/needs-you`,
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ eventId, resolution }),
+    },
+  );
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Could not resolve this action.");
   }
   return (await res.json()) as Bot;
 }

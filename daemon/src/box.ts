@@ -815,6 +815,38 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         return;
       }
 
+      const needsYouCardMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/cards\/([^/]+)\/needs-you$/);
+      if (needsYouCardMatch && method === "POST") {
+        if (!requireSession(req, res, key)) return;
+        let body: unknown = {};
+        try {
+          const raw = await readBody(req);
+          body = raw ? JSON.parse(raw) : {};
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        if (typeof body !== "object" || body === null || Array.isArray(body)) {
+          sendJson(res, 400, { error: "request body must be a JSON object" });
+          return;
+        }
+        const input = body as Record<string, unknown>;
+        try {
+          const eventId = typeof input.eventId === "string" ? input.eventId : "";
+          const resolution = typeof input.resolution === "string" ? input.resolution : "";
+          const bot = await store.resolveNeedsYou(
+            decodeURIComponent(needsYouCardMatch[1]),
+            decodeURIComponent(needsYouCardMatch[2]),
+            eventId,
+            resolution,
+          );
+          sendJson(res, 200, bot);
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
       const botReadMatch = url.pathname.match(/^\/api\/bots\/([^/]+)\/read$/);
       if (botReadMatch && method === "POST") {
         if (!requireSession(req, res, key)) return;

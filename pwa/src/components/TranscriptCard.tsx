@@ -53,6 +53,7 @@ export const TranscriptCard = forwardRef<HTMLElement, TranscriptCardProps>(funct
           {card.title}
         </h3>
         <span
+          role="status"
           data-card-status={card.status.tone}
           className={cn("rounded-full px-2 py-1 text-xs font-medium", STATUS_CLASS[card.status.tone])}
         >
@@ -94,6 +95,7 @@ export const TranscriptCard = forwardRef<HTMLElement, TranscriptCardProps>(funct
           {card.actions.map((action) => (
             <Button
               key={action.id}
+              data-card-action={action.command.kind}
               type="button"
               size="sm"
               variant={action.intent === "primary" ? "default" : "outline"}

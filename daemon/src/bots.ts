@@ -45,16 +45,22 @@ import {
 import {
   botFailureTranscriptCard,
   expiredTranscriptCard,
+  failedNeedsYouResumeCard,
   hostGrantTranscriptCard,
+  needsYouComputerCard,
   permissionTranscriptCard,
   retriedBotFailureTranscriptCard,
   resolvedHostGrantCard,
+  resolvedNeedsYouComputerCard,
   resolvedPermissionCard,
   retryingBotFailureTranscriptCard,
   transcriptCardSummary,
+  unconfirmedNeedsYouComputerCard,
+  unavailableNeedsYouComputerCard,
   unsupportedPermissionTranscriptCard,
 } from "./transcript-card.ts";
 import {
+  computerHelpResponseWasFlushed,
   isAuthError,
   isCancelled,
   permissionOptionKind,
@@ -62,6 +68,8 @@ import {
   validatedPermissionOptions,
   type AcpHandlers,
   type AssistantDelta,
+  type ComputerHelpPrompt,
+  type ComputerHelpResolution,
   type PermissionPrompt,
 } from "./acp.ts";
 import { NoopComputerRuntime, type ComputerRuntime, type DisplayHandle } from "./computer.ts";
@@ -94,7 +102,10 @@ export type PublicBot = {
   zoom: boolean;
   display: number | null;
   permission: PublicPermission | null;
-  needsYou: { reason: "login"; hint: string } | null;
+  needsYou:
+    | { reason: "login"; hint: string }
+    | { reason: "computer-help"; hint: string; eventId: string; cardId: string }
+    | null;
   activity: ChannelActivity;
   messages?: PublicMessage[];
 };
@@ -127,9 +138,22 @@ export type AcpSession = {
   prompt(text: string, handlers?: AcpHandlers): Promise<string>;
   cancel(): void;
   respondPermission(rpcId: PermissionPrompt["rpcId"], optionId: string): void | Promise<void>;
+  respondComputerHelp?(
+    rpcId: ComputerHelpPrompt["rpcId"],
+    resolution: ComputerHelpResolution,
+    onFlushed?: () => void,
+  ): void | Promise<void>;
 };
 
 type BotPermission = PermissionPrompt & PublicPermission;
+
+type BotComputerHelp = {
+  eventId: string;
+  cardId: string;
+  rpcId: ComputerHelpPrompt["rpcId"];
+  client: AcpSession;
+  turnSeq: number;
+};
 
 type Bot = {
   id: string;
@@ -142,7 +166,8 @@ type Bot = {
   zoom: boolean;
   display: DisplayHandle | null;
   eyesMode: EyesMode;
-  needsYou: { reason: "login"; hint: string } | null;
+  needsYou: PublicBot["needsYou"];
+  computerHelp: BotComputerHelp | null;
   permission: BotPermission | null;
   pendingAssistant: { text: string; messageId?: string } | null;
   assistantMessageIds: Map<string, string>;
@@ -150,6 +175,7 @@ type Bot = {
   turnSeq: number;
   startingTurn: boolean;
   permissionQueue: Promise<void>;
+  computerHelpQueue: Promise<void>;
   client: AcpSession | null;
 };
 
@@ -396,6 +422,9 @@ export class BotStore {
     const bot = this.require(id);
     if (!isConfigMode(configMode)) throw Object.assign(new Error("unknown config mode"), { status: 400 });
     if (bot.configMode === configMode) return this.toPublic(bot, true);
+    if (bot.computerHelp) {
+      throw Object.assign(new Error("resolve the pending action before changing this Bot"), { status: 409 });
+    }
     this.home.setConfigMode(bot.id, configMode);
     bot.turnSeq += 1;
     this.expireActivePermission(bot);
@@ -453,6 +482,9 @@ export class BotStore {
     if (!bot.harness) throw Object.assign(new Error("pick a Harness first"), { status: 400 });
     if (bot.harness !== "codex") {
       throw Object.assign(new Error("Talk spawn is Codex-only in this slice"), { status: 400 });
+    }
+    if (bot.computerHelp) {
+      throw Object.assign(new Error("This Bot is waiting for you"), { status: 409 });
     }
     if (bot.startingTurn) {
       throw Object.assign(new Error("wait for the current message to start"), { status: 409 });
@@ -518,6 +550,13 @@ export class BotStore {
     void (async () => {
       try {
         const reply = await client.prompt(talkPrompt(trimmed, replyTarget?.text, history), {
+          onComputerHelp: (prompt) => {
+            if (turnSeq !== bot.turnSeq) return;
+            this.queueComputerHelp(bot, client, prompt, turnSeq);
+          },
+          onComputerHelpCancelled: (prompt) => {
+            this.queueComputerHelpCancellation(bot, client, prompt, turnSeq);
+          },
           onPermission: (prompt) => {
             if (turnSeq !== bot.turnSeq) return;
             this.queuePermission(bot, client, prompt, turnSeq);
@@ -606,6 +645,96 @@ export class BotStore {
       this.home.updateMessageCard(message.id, originalCard);
       throw err;
     }
+  }
+
+  async resolveNeedsYou(
+    id: string,
+    cardId: string,
+    eventId: string,
+    resolution: string,
+  ): Promise<PublicBot> {
+    const bot = this.require(id);
+    if (!cardId) throw Object.assign(new Error("cardId is required"), { status: 400 });
+    if (!eventId) throw Object.assign(new Error("eventId is required"), { status: 400 });
+    if (resolution !== "done" && resolution !== "skip") {
+      throw Object.assign(new Error("resolution must be done or skip"), { status: 400 });
+    }
+    return this.enqueueComputerHelp(bot, async () => {
+      const channelId = this.channelId(bot.id);
+      const message = this.home.getMessage(channelId, cardId);
+      if (!message?.card || message.card.kind !== "computer") {
+        throw Object.assign(new Error("needs-you Computer Card not found"), { status: 404 });
+      }
+      const pendingCard = message.card;
+      const resolved = resolvedNeedsYouComputerCard(pendingCard, eventId, resolution);
+      const active = bot.computerHelp;
+      if (
+        !active
+        || active.eventId !== eventId
+        || active.cardId !== cardId
+        || active.client !== bot.client
+        || active.turnSeq !== bot.turnSeq
+        || bot.needsYou?.reason !== "computer-help"
+        || bot.needsYou.eventId !== eventId
+        || bot.needsYou.cardId !== cardId
+        || !active.client.respondComputerHelp
+      ) {
+        throw Object.assign(new Error("needs-you event is no longer active"), { status: 409 });
+      }
+      let committed = false;
+      try {
+        await active.client.respondComputerHelp(active.rpcId, resolution, () => {
+          if (
+            bot.computerHelp !== active
+            || bot.client !== active.client
+            || bot.turnSeq !== active.turnSeq
+            || bot.needsYou?.reason !== "computer-help"
+            || bot.needsYou.eventId !== eventId
+            || bot.needsYou.cardId !== cardId
+          ) {
+            throw new Error("needs-you event changed before response flush");
+          }
+          this.home.updateMessageCard(cardId, resolved);
+          bot.computerHelp = null;
+          bot.needsYou = null;
+          bot.eyesMode = bot.permission ? "needs-you" : bot.write ? "write" : "idle";
+          committed = true;
+        });
+      } catch (err) {
+        if (!committed && bot.computerHelp === active) {
+          if (computerHelpResponseWasFlushed(err)) {
+            try {
+              this.home.updateMessageCard(
+                cardId,
+                unconfirmedNeedsYouComputerCard(pendingCard, eventId),
+              );
+            } catch {
+              // The exact event is still cleared below so it cannot advertise a dead retry.
+            }
+            bot.computerHelp = null;
+            if (
+              bot.needsYou?.reason === "computer-help"
+              && bot.needsYou.eventId === eventId
+              && bot.needsYou.cardId === cardId
+            ) {
+              bot.needsYou = null;
+            }
+            bot.eyesMode = bot.permission ? "needs-you" : bot.write ? "write" : "idle";
+            throw Object.assign(
+              new Error("The response was sent, but OpenBot could not confirm this Card."),
+              { status: 409 },
+            );
+          }
+          this.home.updateMessageCard(cardId, failedNeedsYouResumeCard(pendingCard, eventId));
+          bot.eyesMode = "needs-you";
+        }
+        throw Object.assign(new Error("The Bot could not receive your response. Try again."), { status: 409 });
+      }
+      if (!committed) {
+        throw Object.assign(new Error("needs-you event is no longer active"), { status: 409 });
+      }
+      return this.toPublic(bot, true);
+    });
   }
 
   async answerPermission(id: string, optionId: string, cardId: string): Promise<PublicBot> {
@@ -739,6 +868,7 @@ export class BotStore {
       display,
       eyesMode: "idle",
       needsYou: null,
+      computerHelp: null,
       permission: null,
       pendingAssistant: null,
       assistantMessageIds: new Map(),
@@ -746,6 +876,7 @@ export class BotStore {
       turnSeq: 0,
       startingTurn: false,
       permissionQueue: Promise.resolve(),
+      computerHelpQueue: Promise.resolve(),
       client: null,
     };
   }
@@ -784,6 +915,7 @@ export class BotStore {
     } catch (err) {
       if (this.spawnAcpFn === spawnAcp) {
         bot.eyesMode = "needs-you";
+        bot.computerHelp = null;
         bot.needsYou = { reason: "login", hint: loginHint(harness) };
         throw Object.assign(err instanceof Error ? err : new Error(loginHint(harness)), { status: 409 });
       }
@@ -798,6 +930,14 @@ export class BotStore {
     let client: AcpSession | undefined;
     try {
       client = this.spawnAcpFn(spec, cwd, {
+        onComputerHelp: (prompt) => {
+          if (!client) return;
+          this.queueComputerHelp(bot, client, prompt, bot.turnSeq);
+        },
+        onComputerHelpCancelled: (prompt) => {
+          if (!client) return;
+          this.queueComputerHelpCancellation(bot, client, prompt, bot.turnSeq);
+        },
         onPermission: (prompt) => {
           if (!client) return;
           this.queuePermission(bot, client, prompt, bot.turnSeq);
@@ -812,6 +952,7 @@ export class BotStore {
       this.spawnEnvs.set(bot.id, spec.env);
       this.spawnCwds.set(bot.id, cwd);
       bot.eyesMode = "idle";
+      bot.computerHelp = null;
       bot.needsYou = null;
       return { client, skipHistory: restored };
     } catch (err) {
@@ -819,6 +960,7 @@ export class BotStore {
       bot.client = null;
       const needsSignIn = isAuthError(err) || isLikelyLogin(err);
       bot.eyesMode = needsSignIn ? "needs-you" : "idle";
+      bot.computerHelp = null;
       bot.needsYou = needsSignIn ? { reason: "login", hint: loginHint(harness) } : null;
       throw Object.assign(new Error(needsSignIn ? loginHint(harness) : "Harness could not start"), {
         status: 409,
@@ -943,6 +1085,7 @@ export class BotStore {
       recipientBotId: bot.id,
     });
     bot.write = false;
+    bot.computerHelp = null;
     bot.needsYou = needsSignIn ? { reason: "login", hint: loginHint("codex") } : null;
     bot.eyesMode = needsSignIn ? "needs-you" : "idle";
     this.appendFailureCard(bot, channelId, userMessage.id, needsSignIn);
@@ -1006,6 +1149,91 @@ export class BotStore {
     if (turnSeq !== bot.turnSeq || bot.client !== client || bot.permission !== active) return false;
     this.expireActivePermission(bot);
     return true;
+  }
+
+  private queueComputerHelp(
+    bot: Bot,
+    client: AcpSession,
+    prompt: ComputerHelpPrompt,
+    turnSeq: number,
+  ): void {
+    void this.enqueueComputerHelp(bot, async () => {
+      if (turnSeq !== bot.turnSeq || bot.client !== client) return;
+      if (!await this.supersedeActivePermission(bot, client, turnSeq)) return;
+      if (turnSeq !== bot.turnSeq || bot.client !== client || bot.computerHelp) return;
+      const stale = this.home.pendingNeedsYouCard(this.channelId(bot.id));
+      if (stale?.card) {
+        this.home.updateMessageCard(stale.id, unavailableNeedsYouComputerCard(stale.card));
+      }
+      const event = { id: crypto.randomUUID(), reason: "computer-help" as const };
+      const card = needsYouComputerCard(event, prompt.instruction);
+      const cardId = crypto.randomUUID();
+      this.home.appendMessage(this.channelId(bot.id), {
+        id: cardId,
+        role: "assistant",
+        kind: "card",
+        card,
+        text: transcriptCardSummary(card),
+        createdAt: nowIso(),
+        senderId: bot.id,
+      });
+      bot.computerHelp = {
+        eventId: event.id,
+        cardId,
+        rpcId: prompt.rpcId,
+        client,
+        turnSeq,
+      };
+      bot.needsYou = {
+        reason: "computer-help",
+        hint: prompt.instruction,
+        eventId: event.id,
+        cardId,
+      };
+      bot.eyesMode = "needs-you";
+    }).catch(() => {
+      void Promise.resolve(client.respondComputerHelp?.(prompt.rpcId, "cancel")).catch(() => undefined);
+    });
+  }
+
+  private queueComputerHelpCancellation(
+    bot: Bot,
+    client: AcpSession,
+    prompt: ComputerHelpPrompt,
+    turnSeq: number,
+  ): void {
+    void this.enqueueComputerHelp(bot, async () => {
+      const active = bot.computerHelp;
+      if (
+        !active
+        || active.client !== client
+        || active.rpcId !== prompt.rpcId
+        || active.turnSeq !== turnSeq
+      ) {
+        return;
+      }
+      const message = this.home.getMessage(this.channelId(bot.id), active.cardId);
+      if (message?.card) {
+        this.home.updateMessageCard(message.id, unavailableNeedsYouComputerCard(message.card));
+      }
+      bot.computerHelp = null;
+      if (
+        bot.needsYou?.reason === "computer-help"
+        && bot.needsYou.eventId === active.eventId
+        && bot.needsYou.cardId === active.cardId
+      ) {
+        bot.needsYou = null;
+      }
+      bot.eyesMode = bot.permission || bot.needsYou
+        ? "needs-you"
+        : bot.write ? "write" : "idle";
+    }).catch(() => undefined);
+  }
+
+  private enqueueComputerHelp<T>(bot: Bot, task: () => Promise<T>): Promise<T> {
+    const result = bot.computerHelpQueue.then(task);
+    bot.computerHelpQueue = result.then(() => undefined, () => undefined);
+    return result;
   }
 
   private queuePermission(

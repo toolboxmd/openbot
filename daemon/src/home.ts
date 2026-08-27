@@ -15,9 +15,11 @@ import {
 } from "./harness-home.ts";
 import {
   expiredTranscriptCard,
+  isPendingNeedsYouComputerCard,
   legacyHostGrantTranscriptCard,
   parseTranscriptCard,
   transcriptCardSummary,
+  unavailableNeedsYouComputerCard,
   type TranscriptCard,
 } from "./transcript-card.ts";
 
@@ -278,6 +280,15 @@ export class HomeStore {
       .get(channelId, messageId) as SqlRow | undefined;
     if (!row) return null;
     return this.reviveMessage(row)[0] ?? null;
+  }
+
+  pendingNeedsYouCard(channelId: string): TranscriptMessage | null {
+    const messages = this.listMessages(channelId);
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message?.card && isPendingNeedsYouComputerCard(message.card)) return message;
+    }
+    return null;
   }
 
   directChannelId(botId: string): string | null {
@@ -665,6 +676,10 @@ export class HomeStore {
       if (typeof row.id !== "string" || typeof row.card_json !== "string") continue;
       try {
         const card = parseTranscriptCard(JSON.parse(row.card_json) as unknown);
+        if (card && isPendingNeedsYouComputerCard(card)) {
+          this.updateMessageCard(row.id, unavailableNeedsYouComputerCard(card), updatedAt);
+          continue;
+        }
         if (!card || card.status.tone !== "waiting" || card.actions.length === 0) continue;
         this.updateMessageCard(row.id, expiredTranscriptCard(card), updatedAt);
       } catch {

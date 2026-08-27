@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.0] - 2026-08-27
+
+### Added
+
+- Add first-party Computer-help Cards and Waiting state
+
 ## [0.9.5] - 2026-08-27
 
 ### Changed
