@@ -152,9 +152,9 @@ export function pinchTabWrapperCommand(): { command: string; args: string[] } | 
   return { command: process.execPath, args: [script] };
 }
 
-export function pinchTabWrapperArgs(bin: string, server: string, token: string): string[] {
+export function pinchTabWrapperArgs(bin: string, server: string): string[] {
   const wrapper = pinchTabWrapperCommand();
-  return [...(wrapper?.args ?? [pinchTabMcpScript()]), "--bin", bin, "--server", server, "--token", token];
+  return [...(wrapper?.args ?? [pinchTabMcpScript()]), "--bin", bin, "--server", server];
 }
 
 export function pinchTabBridgeConfig(token: string, port: number): Record<string, unknown> {
@@ -352,7 +352,7 @@ export async function pinchTabMcpServers(
     {
       name: PINCHTAB_MCP_NAME,
       command: wrapper.command,
-      args: pinchTabWrapperArgs(bin, bridge.url, bridge.token),
+      args: pinchTabWrapperArgs(bin, bridge.url),
       env: [
         ...mcpInheritEnv(inheritEnv),
         { name: "OPENBOT_PINCHTAB", value: bin },

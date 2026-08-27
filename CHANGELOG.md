@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.6] - 2026-08-28
+
+### Changed
+
+- Protect PinchTab credentials and serialize cookie synchronization
+
 ## [0.9.5] - 2026-08-28
 
 ### Changed
