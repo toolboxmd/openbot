@@ -333,6 +333,77 @@ function dockerChecked(args: string[]): string {
   return result.stdout;
 }
 
+type SharedScreenSnapshot = {
+  container: {
+    id: string;
+    imageId: string;
+    portBindings: unknown;
+    restartCount: number;
+    running: boolean;
+    startedAt: string;
+    status: string;
+  } | null;
+  tagImageId: string | null;
+};
+
+function optionalDockerInspect<T>(args: string[], missing: RegExp): T | undefined {
+  const result = spawnSync("docker", args, { cwd: repoRoot, encoding: "utf8" });
+  if (result.error) throw result.error;
+  if (result.status === 0) {
+    const values = JSON.parse(result.stdout) as T[];
+    assert.equal(values.length, 1, `docker ${args.join(" ")} returned ${values.length} objects`);
+    return values[0];
+  }
+  assert.equal(result.status, 1, `docker ${args.join(" ")} failed\n${result.stdout}\n${result.stderr}`);
+  assert.match(`${result.stdout}\n${result.stderr}`, missing, `docker ${args.join(" ")} failed unexpectedly`);
+  return undefined;
+}
+
+function sharedScreenSnapshot(): SharedScreenSnapshot {
+  const container = optionalDockerInspect<{
+    Id: string;
+    Image: string;
+    HostConfig: { PortBindings: unknown };
+    RestartCount: number;
+    State: { Running: boolean; StartedAt: string; Status: string };
+  }>(["container", "inspect", "openbot-screen"], /no such container/iu);
+  const image = optionalDockerInspect<{
+    Id: string;
+  }>(["image", "inspect", "openbot-screen:latest"], /no such image/iu);
+  return {
+    container: container
+      ? {
+          id: container.Id,
+          imageId: container.Image,
+          portBindings: container.HostConfig.PortBindings,
+          restartCount: container.RestartCount,
+          running: container.State.Running,
+          startedAt: container.State.StartedAt,
+          status: container.State.Status,
+        }
+      : null,
+    tagImageId: image?.Id ?? null,
+  };
+}
+
+function composeImages(composeArgs: string[], env: NodeJS.ProcessEnv): string[] {
+  const result = spawnSync("docker", [...composeArgs, "config", "--images"], {
+    cwd: repoRoot,
+    env,
+    encoding: "utf8",
+  });
+  assert.equal(
+    result.status,
+    0,
+    `docker ${[...composeArgs, "config", "--images"].join(" ")} failed\n${result.stdout}\n${result.stderr}`,
+  );
+  return result.stdout.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+}
+
+function dockerImageExists(image: string): boolean {
+  return optionalDockerInspect(["image", "inspect", image], /no such image/iu) !== undefined;
+}
+
 type LiveOwner = {
   display: number;
   port: number;
@@ -369,16 +440,33 @@ function assertSingleLiveOwner(container: string, display: number, owner: LiveOw
 
 async function waitScreen(url: string, timeoutMs = 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  let lastObservation = "no HTTP response";
+  while (true) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
-      if (response.ok) return;
-    } catch {
-      /* wait for KasmVNC */
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(Math.max(1, Math.min(2_000, remainingMs))),
+      });
+      lastObservation = `HTTP ${response.status}`;
+      void response.body?.cancel().catch(() => undefined);
+      if (screenHttpReady(response.status)) return;
+    } catch (error) {
+      lastObservation =
+        error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    const retryDelayMs = Math.min(500, Math.max(0, deadline - Date.now()));
+    if (retryDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+    }
   }
-  throw new Error(`Screen did not become ready at ${url}`);
+  throw new Error(
+    `Screen did not become ready at ${url} within ${timeoutMs}ms; last observation: ${lastObservation}`,
+  );
+}
+
+function screenHttpReady(status: number): boolean {
+  return status === 401 || (status >= 200 && status < 300);
 }
 
 function startLiveProofPage(
@@ -512,9 +600,45 @@ async function waitForNetworkCookieHost(
 }
 
 if (SUPERVISION_SCOPE) {
+  describe("Screen HTTP readiness contract", () => {
+    test("accepts exactly 2xx or the KasmVNC 401 challenge", () => {
+      for (const status of [200, 204, 299, 401]) {
+        assert.equal(screenHttpReady(status), true, `expected HTTP ${status} to be ready`);
+      }
+      for (const status of [199, 300, 400, 403, 404, 500]) {
+        assert.equal(screenHttpReady(status), false, `expected HTTP ${status} not to be ready`);
+      }
+    });
+
+    test("reports the last non-ready status within the total deadline", async () => {
+      const server = http.createServer((_req, res) => {
+        res.writeHead(503, { "content-type": "text/plain" });
+        res.end("starting");
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const address = server.address();
+      assert.ok(address && typeof address !== "string");
+
+      try {
+        const startedAt = Date.now();
+        await assert.rejects(
+          waitScreen(`http://127.0.0.1:${address.port}`, 100),
+          /within 100ms; last observation: HTTP 503/,
+        );
+        assert.ok(Date.now() - startedAt < 750, "Screen readiness exceeded its total deadline bound");
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+  });
+
   describe("Live Screen and PinchTab supervision", { timeout: 1_200_000 }, () => {
     const nonce = randomUUID().replaceAll("-", "").slice(0, 12);
     const container = `openbot-screen-pt94-${nonce}`;
+    const disposableImage = `openbot-screen-pt94-${nonce}:live`;
     const project = `openbot-pt94-${nonce}`;
     const vncUser = `pt94${nonce.slice(0, 8)}`;
     const screenHome = `/home/${vncUser}`;
@@ -528,8 +652,15 @@ if (SUPERVISION_SCOPE) {
     let pinchTabPorts: number[] = [];
     let token = "";
     let proofPage: { port: number; close: () => Promise<void> } | undefined;
+    let sharedBefore: SharedScreenSnapshot | undefined;
 
     before(async () => {
+      sharedBefore = sharedScreenSnapshot();
+      assert.equal(
+        dockerImageExists(disposableImage),
+        false,
+        `disposable image already exists: ${disposableImage}`,
+      );
       hostBin = requireHostPinchTab();
       runtimeRoot = await mkdtemp(join(tmpdir(), "openbot-pt94-live-"));
       const homeDir = join(runtimeRoot, "home");
@@ -547,6 +678,7 @@ if (SUPERVISION_SCOPE) {
           services: {
             screen: {
               container_name: container,
+              image: disposableImage,
               restart: "no",
               environment: { VNC_USER: vncUser },
             },
@@ -578,6 +710,12 @@ if (SUPERVISION_SCOPE) {
       pinchTabPorts.forEach((port, i) => {
         env[`PINCHTAB_PORT_${i + 1}`] = String(port);
       });
+      assert.deepEqual(
+        composeImages(composeArgs, env),
+        [disposableImage],
+        "isolated supervision compose config must not target openbot-screen:latest",
+      );
+      assert.deepEqual(sharedScreenSnapshot(), sharedBefore, "compose preflight mutated the shared Screen");
       proofPage = await startLiveProofPage(marker);
 
       await run(
@@ -585,6 +723,12 @@ if (SUPERVISION_SCOPE) {
         [...composeArgs, "up", "--detach", "--build", "--force-recreate", "screen"],
         env,
       );
+      assert.equal(
+        dockerChecked(["container", "inspect", "--format", "{{.Config.Image}}", container]).trim(),
+        disposableImage,
+        "isolated supervision container used the shared Screen image tag",
+      );
+      assert.deepEqual(sharedScreenSnapshot(), sharedBefore, "isolated compose up mutated the shared Screen");
       await run("docker", ["exec", container, DISPLAY_BIN, "start", String(display)], env);
       await waitScreen(`http://127.0.0.1:${screenPorts[display - 1]}`);
       assert.equal(
@@ -599,7 +743,12 @@ if (SUPERVISION_SCOPE) {
     });
 
     after(async () => {
-      await proofPage?.close();
+      const cleanupErrors: string[] = [];
+      try {
+        await proofPage?.close();
+      } catch (error) {
+        cleanupErrors.push(`proof page cleanup failed: ${String(error)}`);
+      }
       if (composeArgs.length > 0) {
         const stopped = spawnSync("docker", [...composeArgs, "down", "--volumes", "--remove-orphans"], {
           cwd: repoRoot,
@@ -608,10 +757,36 @@ if (SUPERVISION_SCOPE) {
         });
         if (stopped.status !== 0) {
           spawnSync("docker", ["rm", "--force", container], { cwd: repoRoot, encoding: "utf8" });
-          assert.fail(`live container cleanup failed: ${stopped.stdout}\n${stopped.stderr}`);
+          cleanupErrors.push(`live container cleanup failed: ${stopped.stdout}\n${stopped.stderr}`);
         }
       }
-      if (runtimeRoot) rmSync(runtimeRoot, { recursive: true, force: true });
+      if (dockerImageExists(disposableImage)) {
+        const removed = spawnSync("docker", ["image", "rm", disposableImage], {
+          cwd: repoRoot,
+          encoding: "utf8",
+        });
+        if (removed.status !== 0) {
+          cleanupErrors.push(`disposable image cleanup failed: ${removed.stdout}\n${removed.stderr}`);
+        }
+      }
+      if (dockerImageExists(disposableImage)) {
+        cleanupErrors.push(`disposable image survived cleanup: ${disposableImage}`);
+      }
+      if (sharedBefore) {
+        try {
+          assert.deepEqual(sharedScreenSnapshot(), sharedBefore);
+        } catch (error) {
+          cleanupErrors.push(`shared Screen changed during isolated live proof: ${String(error)}`);
+        }
+      }
+      if (runtimeRoot) {
+        try {
+          rmSync(runtimeRoot, { recursive: true, force: true });
+        } catch (error) {
+          cleanupErrors.push(`runtime root cleanup failed: ${String(error)}`);
+        }
+      }
+      if (cleanupErrors.length > 0) assert.fail(cleanupErrors.join("\n"));
     });
 
     test("one durable owner survives concurrent starts, restarts cleanly, and serializes real tools", async () => {

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.4] - 2026-08-27
+
+### Changed
+
+- Preserve bounded PinchTab lifecycle with isolated live supervision resources
+
 ## [0.9.3] - 2026-08-27
 
 ### Changed

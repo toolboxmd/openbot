@@ -205,6 +205,25 @@ rl.on("line", (line) => {
   return file;
 }
 
+async function writeCleanExitOnListPinchTab(dir: string): Promise<string> {
+  const file = join(dir, "pinchtab");
+  const body = `#!/usr/bin/env node
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "clean-exit-on-list" } } }) + "\\n");
+    return;
+  }
+  if (msg.method === "tools/list") process.exit(0);
+});
+`;
+  await writeFile(file, body, { encoding: "utf8", mode: 0o755 });
+  chmodSync(file, 0o755);
+  return file;
+}
+
 async function writeMalformedListPinchTab(dir: string): Promise<string> {
   const file = join(dir, "pinchtab");
   const body = `#!/usr/bin/env node
@@ -488,20 +507,82 @@ async function writeStubbornOutputPinchTab(dir: string): Promise<string> {
 import fs from "node:fs";
 import readline from "node:readline";
 if (process.env.OPENBOT_OUTPUT_CHILD_PID_FILE) fs.writeFileSync(process.env.OPENBOT_OUTPUT_CHILD_PID_FILE, String(process.pid));
-process.on("SIGTERM", () => {});
+process.on("SIGTERM", () => {
+  if (process.env.OPENBOT_OUTPUT_EXIT_ON_TERM === "1") process.exit(0);
+});
 setInterval(() => {}, 1000);
 const rl = readline.createInterface({ input: process.stdin });
+const batched = [];
+let mixedTool;
+let mixedList;
+const response = (msg, padding) => JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "pinchtab_navigate" }], ...(padding ? { padding } : {}) } }) + "\\n";
+const emitMixed = () => {
+  if (!mixedTool || !mixedList) return;
+  process.stdout.write(response(mixedTool) + response(mixedList, "x".repeat(1536)));
+  mixedTool = undefined;
+  mixedList = undefined;
+};
 rl.on("line", (line) => {
   const msg = JSON.parse(line);
   if (msg.method === "initialize") {
     process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "stubborn-output" } } }) + "\\n");
     return;
   }
+  if (msg.method === "tools/call" && process.env.OPENBOT_OUTPUT_MIXED === "1") {
+    if (process.env.OPENBOT_OUTPUT_CHILD_CALL_LOG) fs.appendFileSync(process.env.OPENBOT_OUTPUT_CHILD_CALL_LOG, String(msg.id) + "\\n");
+    mixedTool = msg;
+    emitMixed();
+    return;
+  }
   if (msg.method === "tools/list") {
     if (process.env.OPENBOT_OUTPUT_CHILD_CALL_LOG) fs.appendFileSync(process.env.OPENBOT_OUTPUT_CHILD_CALL_LOG, String(msg.id) + "\\n");
+    if (process.env.OPENBOT_OUTPUT_CHILD_REQUEST_EXIT_BATCH === "1") {
+      process.stdout.write(
+        response(msg, "x".repeat(1536)) + JSON.stringify({ jsonrpc: "2.0", id: 91, method: "sampling/createMessage", params: {} }) + "\\n",
+        () => process.exit(0),
+      );
+      return;
+    }
+    if (process.env.OPENBOT_OUTPUT_EXIT_BATCH === "1") {
+      batched.push(msg);
+      if (batched.length === 2) {
+        process.stdout.write(
+          response(batched[1], "x".repeat(1536)) + response(batched[0]),
+          () => process.exit(0),
+        );
+      }
+      return;
+    }
+    if (process.env.OPENBOT_OUTPUT_OVERFLOW === "1") {
+      batched.push(msg);
+      if (batched.length === 18) {
+        process.stdout.write(
+          batched.map((item, index) => response(item, index === 0 ? "x".repeat(1536) : undefined)).join(""),
+        );
+      }
+      return;
+    }
+    if (process.env.OPENBOT_OUTPUT_MIXED === "1") {
+      if (msg.id > 2) {
+        process.stdout.write(response(msg));
+      } else {
+        mixedList = msg;
+        emitMixed();
+      }
+      return;
+    }
+    if (process.env.OPENBOT_OUTPUT_BATCH === "1") {
+      batched.push(msg);
+      if (batched.length === 2) {
+        process.stdout.write(response(batched[0], "x".repeat(1536)) + response(batched[1]));
+      } else if (batched.length > 2) {
+        process.stdout.write(response(msg));
+      }
+      return;
+    }
     setTimeout(() => {
       const padding = process.env.OPENBOT_OUTPUT_LARGE === "1" ? "x".repeat(512 * 1024) : undefined;
-      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "pinchtab_navigate" }], ...(padding ? { padding } : {}) } }) + "\\n");
+      process.stdout.write(response(msg, padding));
     }, 50);
   }
 });
@@ -1198,6 +1279,44 @@ describe("PinchTab MCP allowlist proxy", () => {
       assert.match(JSON.stringify(failed.error ?? {}), /exit|closed|transport/i);
     } finally {
       child.kill("SIGTERM");
+    }
+  });
+
+  test("a clean child exit with a pending client request makes the wrapper fail", async () => {
+    const bin = await writeCleanExitOnListPinchTab(await tempDir("openbot-pt-child-clean-exit-"));
+    const child = spawn(process.execPath, [wrapper], {
+      env: {
+        ...process.env,
+        OPENBOT_PINCHTAB: bin,
+        OPENBOT_PINCHTAB_SERVER: "http://127.0.0.1:9867",
+        PINCHTAB_TOKEN: "t",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    try {
+      let output = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        output += chunk.toString("utf8");
+      });
+      rpc(child, 1, "initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test" } });
+      await readRpc(child, 1);
+      const closed = new Promise<number | null>((resolve) => child.once("close", resolve));
+      rpc(child, 2, "tools/list");
+      const code = await Promise.race([
+        closed,
+        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 1_500)),
+      ]);
+      assert.notEqual(code, "timeout", "wrapper stayed alive after its child exited");
+      assert.notEqual(code, 0, "wrapper reported success with a pending client request");
+      const replies = output
+        .split("\n")
+        .filter((line) => line.trim())
+        .map((line) => JSON.parse(line) as { id?: unknown; error?: unknown })
+        .filter((message) => message.id === 2);
+      assert.equal(replies.length, 1, `request 2 replies: ${JSON.stringify(replies)}`);
+      assert.match(JSON.stringify(replies[0]?.error ?? {}), /exit|transport/i);
+    } finally {
+      child.kill("SIGKILL");
     }
   });
 
@@ -1951,6 +2070,482 @@ describe("PinchTab MCP allowlist proxy", () => {
       ]);
       assert.equal(boundedExit, true, "drained transport did not retain bounded shutdown");
     } finally {
+      input.destroy();
+      output.destroy();
+      if (existsSync(pidFile)) {
+        const pid = Number(readFileSync(pidFile, "utf8"));
+        if (processAlive(pid)) process.kill(pid, "SIGKILL");
+      }
+    }
+  });
+
+  test("batched child responses wait for client output drain and remain ordered", async () => {
+    const dir = await tempDir("openbot-pt-client-backpressure-batch-");
+    const bin = await writeStubbornOutputPinchTab(dir);
+    const pidFile = join(dir, "child.pid");
+    const callLog = join(dir, "calls.log");
+    const input = new PassThrough();
+    const frames: Array<{ id?: number; result?: unknown; error?: unknown }> = [];
+    let releaseFirstWrite: (() => void) | undefined;
+    const output = new Writable({
+      highWaterMark: 1_024,
+      write(chunk, _encoding, callback) {
+        const frame = JSON.parse(chunk.toString("utf8")) as (typeof frames)[number];
+        frames.push(frame);
+        if (frame.id === 1) {
+          releaseFirstWrite = () => {
+            releaseFirstWrite = undefined;
+            callback();
+          };
+        } else callback();
+      },
+    });
+    const running = runPinchTabAllowlistProxy(input, output, {
+      ...process.env,
+      OPENBOT_OUTPUT_BATCH: "1",
+      OPENBOT_OUTPUT_CHILD_CALL_LOG: callLog,
+      OPENBOT_OUTPUT_CHILD_PID_FILE: pidFile,
+      OPENBOT_PINCHTAB: bin,
+      OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS: "1500",
+      OPENBOT_PINCHTAB_SERVER: "http://127.0.0.1:9867",
+      PINCHTAB_TOKEN: "t",
+    });
+    try {
+      input.write(
+        `${JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test" } } })}\n`,
+      );
+      await waitUntil(() => frames.some((frame) => frame.id === 0), 750);
+      await waitUntil(() => existsSync(pidFile), 750);
+      input.write(
+        `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })}\n${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`,
+      );
+
+      await waitUntil(() => frames.some((frame) => frame.id === 1), 750);
+      assert.equal(output.writableNeedDrain, true, "first large response did not apply backpressure");
+      assert.equal(input.isPaused(), true, "client ingress stayed flowing before output drain");
+      assert.ok(releaseFirstWrite, "first output write was not held for the drain assertion");
+      releaseFirstWrite();
+      await waitUntil(() => frames.some((frame) => frame.id === 2), 750);
+      await waitUntil(() => !input.isPaused(), 750);
+
+      const batchedReplies = frames.filter((frame) => frame.id === 1 || frame.id === 2);
+      assert.deepEqual(batchedReplies.map((frame) => frame.id), [1, 2], JSON.stringify(frames));
+      assert.equal(batchedReplies.filter((frame) => frame.error !== undefined).length, 0, JSON.stringify(frames));
+
+      input.write(`${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" })}\n`);
+      await waitUntil(() => frames.some((frame) => frame.id === 3), 750);
+      assert.deepEqual(readFileSync(callLog, "utf8").trim().split("\n"), ["1", "2", "3"]);
+
+      input.end();
+      const boundedExit = await Promise.race([
+        running.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 2_500)),
+      ]);
+      assert.equal(boundedExit, true, "drained batch transport did not shut down boundedly");
+      assert.equal(
+        processAlive(Number(readFileSync(pidFile, "utf8"))),
+        false,
+        "PinchTab child survived drained batch cleanup",
+      );
+    } finally {
+      releaseFirstWrite?.();
+      input.destroy();
+      output.destroy();
+      if (existsSync(pidFile)) {
+        const pid = Number(readFileSync(pidFile, "utf8"));
+        if (processAlive(pid)) process.kill(pid, "SIGKILL");
+      }
+    }
+  });
+
+  test("a queued child response cannot succeed after its deadline when the child exits", async () => {
+    const dir = await tempDir("openbot-pt-client-backpressure-exit-deadline-");
+    const bin = await writeStubbornOutputPinchTab(dir);
+    const pidFile = join(dir, "child.pid");
+    const input = new PassThrough();
+    const frames: Array<{ id?: number; result?: unknown; error?: { message?: string } }> = [];
+    let releaseTriggerWrite: (() => void) | undefined;
+    const output = new Writable({
+      highWaterMark: 1_024,
+      write(chunk, _encoding, callback) {
+        const frame = JSON.parse(chunk.toString("utf8")) as (typeof frames)[number];
+        frames.push(frame);
+        if (frame.id === 2) {
+          releaseTriggerWrite = () => {
+            releaseTriggerWrite = undefined;
+            callback();
+          };
+        } else callback();
+      },
+    });
+    const requestTimeoutMs = 900;
+    const running = runPinchTabAllowlistProxy(input, output, {
+      ...process.env,
+      OPENBOT_OUTPUT_CHILD_PID_FILE: pidFile,
+      OPENBOT_OUTPUT_EXIT_BATCH: "1",
+      OPENBOT_PINCHTAB: bin,
+      OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS: String(requestTimeoutMs),
+      OPENBOT_PINCHTAB_SERVER: "http://127.0.0.1:9867",
+      PINCHTAB_TOKEN: "t",
+    });
+    try {
+      input.write(
+        `${JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test" } } })}\n`,
+      );
+      await waitUntil(() => frames.some((frame) => frame.id === 0), 750);
+      await waitUntil(() => existsSync(pidFile), 750);
+
+      const firstAcceptedAt = Date.now();
+      input.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })}\n`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      input.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`);
+
+      await waitUntil(() => frames.some((frame) => frame.id === 2), 750);
+      assert.equal(output.writableNeedDrain, true, "trigger response did not apply backpressure");
+      assert.ok(releaseTriggerWrite, "trigger response was not held before drain");
+      await waitUntil(() => !processAlive(Number(readFileSync(pidFile, "utf8"))), 750);
+      const remainingToExpiry = firstAcceptedAt + requestTimeoutMs + 100 - Date.now();
+      if (remainingToExpiry > 0) {
+        await new Promise((resolve) => setTimeout(resolve, remainingToExpiry));
+      }
+      releaseTriggerWrite();
+
+      await waitUntil(() => frames.some((frame) => frame.id === 1), 750);
+      const expiredReplies = frames.filter((frame) => frame.id === 1);
+      assert.equal(expiredReplies.length, 1, JSON.stringify(frames));
+      assert.equal(expiredReplies[0]?.result, undefined, JSON.stringify(frames));
+      assert.match(expiredReplies[0]?.error?.message ?? "", /timed out/);
+      const triggerReplies = frames.filter((frame) => frame.id === 2);
+      assert.equal(triggerReplies.length, 1, JSON.stringify(frames));
+      assert.notEqual(triggerReplies[0]?.result, undefined, JSON.stringify(frames));
+      assert.equal(triggerReplies[0]?.error, undefined, JSON.stringify(frames));
+
+      const boundedExit = await Promise.race([
+        running.then((code) => ({ exited: true, code })),
+        new Promise<{ exited: false; code: null }>((resolve) =>
+          setTimeout(() => resolve({ exited: false, code: null }), 2_000),
+        ),
+      ]);
+      assert.equal(boundedExit.exited, true, "post-exit output deadline left the proxy unsettled");
+      assert.notEqual(boundedExit.code, 0, JSON.stringify({ boundedExit, frames }));
+    } finally {
+      releaseTriggerWrite?.();
+      input.destroy();
+      output.destroy();
+      if (existsSync(pidFile)) {
+        const pid = Number(readFileSync(pidFile, "utf8"));
+        if (processAlive(pid)) process.kill(pid, "SIGKILL");
+      }
+    }
+  });
+
+  test("a clean child exit reports failure when queued client output never drains", async () => {
+    const dir = await tempDir("openbot-pt-client-backpressure-exit-no-drain-");
+    const bin = await writeStubbornOutputPinchTab(dir);
+    const pidFile = join(dir, "child.pid");
+    const input = new PassThrough();
+    const frames: Array<{ id?: number; result?: unknown; error?: unknown }> = [];
+    let releaseBlockedWrite: (() => void) | undefined;
+    const output = new Writable({
+      highWaterMark: 1_024,
+      write(chunk, _encoding, callback) {
+        const frame = JSON.parse(chunk.toString("utf8")) as (typeof frames)[number];
+        frames.push(frame);
+        if (frame.id === 2) {
+          releaseBlockedWrite = () => {
+            releaseBlockedWrite = undefined;
+            callback();
+          };
+        } else callback();
+      },
+    });
+    const running = runPinchTabAllowlistProxy(input, output, {
+      ...process.env,
+      OPENBOT_OUTPUT_CHILD_PID_FILE: pidFile,
+      OPENBOT_OUTPUT_EXIT_BATCH: "1",
+      OPENBOT_PINCHTAB: bin,
+      OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS: "180",
+      OPENBOT_PINCHTAB_SERVER: "http://127.0.0.1:9867",
+      PINCHTAB_TOKEN: "t",
+    });
+    try {
+      await waitUntil(() => existsSync(pidFile), 1_500);
+      input.write(
+        `${JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test" } } })}\n`,
+      );
+      await waitUntil(() => frames.some((frame) => frame.id === 0), 750);
+      input.write(
+        `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })}\n${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`,
+      );
+
+      await waitUntil(() => frames.some((frame) => frame.id === 2), 750);
+      assert.equal(output.writableNeedDrain, true, "large response did not hold client output");
+      assert.ok(releaseBlockedWrite, "large response write was not held");
+      await waitUntil(() => !processAlive(Number(readFileSync(pidFile, "utf8"))), 750);
+
+      const boundedExit = await Promise.race([
+        running.then((code) => ({ exited: true, code })),
+        new Promise<{ exited: false; code: null }>((resolve) =>
+          setTimeout(() => resolve({ exited: false, code: null }), 1_500),
+        ),
+      ]);
+      assert.equal(boundedExit.exited, true, "post-exit no-drain deadline left the proxy alive");
+      assert.notEqual(boundedExit.code, 0, JSON.stringify({ boundedExit, frames }));
+      assert.equal(frames.filter((frame) => frame.id === 1).length, 0, JSON.stringify(frames));
+      assert.equal(frames.filter((frame) => frame.id === 2).length, 1, JSON.stringify(frames));
+    } finally {
+      releaseBlockedWrite?.();
+      input.destroy();
+      output.destroy();
+      if (existsSync(pidFile)) {
+        const pid = Number(readFileSync(pidFile, "utf8"));
+        if (processAlive(pid)) process.kill(pid, "SIGKILL");
+      }
+    }
+  });
+
+  test("a child request queued behind backpressure is not relayed after its child exits", async () => {
+    const dir = await tempDir("openbot-pt-child-request-exit-backpressure-");
+    const bin = await writeStubbornOutputPinchTab(dir);
+    const pidFile = join(dir, "child.pid");
+    const input = new PassThrough();
+    const frames: Array<{ id?: number; method?: string; result?: unknown; error?: unknown }> = [];
+    let releaseBlockedWrite: (() => void) | undefined;
+    const output = new Writable({
+      highWaterMark: 1_024,
+      write(chunk, _encoding, callback) {
+        const frame = JSON.parse(chunk.toString("utf8")) as (typeof frames)[number];
+        frames.push(frame);
+        if (frame.id === 1) {
+          releaseBlockedWrite = () => {
+            releaseBlockedWrite = undefined;
+            callback();
+          };
+        } else callback();
+      },
+    });
+    const running = runPinchTabAllowlistProxy(input, output, {
+      ...process.env,
+      OPENBOT_OUTPUT_CHILD_PID_FILE: pidFile,
+      OPENBOT_OUTPUT_CHILD_REQUEST_EXIT_BATCH: "1",
+      OPENBOT_PINCHTAB: bin,
+      OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS: "1000",
+      OPENBOT_PINCHTAB_SERVER: "http://127.0.0.1:9867",
+      PINCHTAB_TOKEN: "t",
+    });
+    try {
+      await waitUntil(() => existsSync(pidFile), 1_500);
+      input.write(
+        `${JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test" } } })}\n`,
+      );
+      await waitUntil(() => frames.some((frame) => frame.id === 0), 750);
+      input.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })}\n`);
+
+      await waitUntil(() => frames.some((frame) => frame.id === 1), 750);
+      assert.equal(output.writableNeedDrain, true, "client response did not apply backpressure");
+      assert.ok(releaseBlockedWrite, "client response write was not held");
+      await waitUntil(() => !processAlive(Number(readFileSync(pidFile, "utf8"))), 750);
+      assert.equal(frames.some((frame) => frame.method === "sampling/createMessage"), false);
+      releaseBlockedWrite();
+
+      const boundedExit = await Promise.race([
+        running.then((code) => ({ exited: true, code })),
+        new Promise<{ exited: false; code: null }>((resolve) =>
+          setTimeout(() => resolve({ exited: false, code: null }), 1_500),
+        ),
+      ]);
+      assert.equal(boundedExit.exited, true, "child-request cleanup left the proxy alive");
+      assert.notEqual(boundedExit.code, 0, JSON.stringify({ boundedExit, frames }));
+      assert.equal(
+        frames.some((frame) => frame.method === "sampling/createMessage"),
+        false,
+        JSON.stringify(frames),
+      );
+      assert.equal(frames.filter((frame) => frame.id === 1 && frame.result !== undefined).length, 1);
+    } finally {
+      releaseBlockedWrite?.();
+      input.destroy();
+      output.destroy();
+      if (existsSync(pidFile)) {
+        const pid = Number(readFileSync(pidFile, "utf8"));
+        if (processAlive(pid)) process.kill(pid, "SIGKILL");
+      }
+    }
+  });
+
+  test("child output queue overflow rejects pending IDs once and reaps the child", async () => {
+    const dir = await tempDir("openbot-pt-client-backpressure-overflow-");
+    const bin = await writeStubbornOutputPinchTab(dir);
+    const pidFile = join(dir, "child.pid");
+    const callLog = join(dir, "calls.log");
+    const input = new PassThrough();
+    const frames: Array<{ id?: number; result?: unknown; error?: unknown }> = [];
+    let buffered = "";
+    let releaseFirstWrite: (() => void) | undefined;
+    let firstWriteHeld = false;
+    const output = new Writable({
+      highWaterMark: 1_024,
+      write(chunk, _encoding, callback) {
+        buffered += chunk.toString("utf8");
+        let newline = buffered.indexOf("\n");
+        while (newline !== -1) {
+          const line = buffered.slice(0, newline);
+          buffered = buffered.slice(newline + 1);
+          if (line) frames.push(JSON.parse(line) as (typeof frames)[number]);
+          newline = buffered.indexOf("\n");
+        }
+        if (!firstWriteHeld && frames.some((frame) => frame.id === 1)) {
+          firstWriteHeld = true;
+          releaseFirstWrite = () => {
+            releaseFirstWrite = undefined;
+            callback();
+          };
+        } else {
+          callback();
+        }
+      },
+    });
+    const running = runPinchTabAllowlistProxy(input, output, {
+      ...process.env,
+      OPENBOT_OUTPUT_CHILD_CALL_LOG: callLog,
+      OPENBOT_OUTPUT_CHILD_PID_FILE: pidFile,
+      OPENBOT_OUTPUT_EXIT_ON_TERM: "1",
+      OPENBOT_OUTPUT_OVERFLOW: "1",
+      OPENBOT_PINCHTAB: bin,
+      OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS: "3000",
+      OPENBOT_PINCHTAB_SERVER: "http://127.0.0.1:9867",
+      PINCHTAB_TOKEN: "t",
+    });
+    try {
+      input.write(
+        `${JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test" } } })}\n`,
+      );
+      await waitUntil(() => frames.some((frame) => frame.id === 0), 750);
+      await waitUntil(() => existsSync(pidFile), 750);
+      input.write(
+        Array.from({ length: 18 }, (_, index) =>
+          `${JSON.stringify({ jsonrpc: "2.0", id: index + 1, method: "tools/list" })}\n`,
+        ).join(""),
+      );
+
+      await waitUntil(() => frames.some((frame) => frame.id === 1), 750);
+      assert.equal(output.writableNeedDrain, true, "overflow batch did not apply backpressure");
+      assert.equal(input.isPaused(), true, "client ingress stayed flowing during overflow");
+      assert.ok(releaseFirstWrite, "overflow batch first write was not held");
+      await waitUntil(() => !processAlive(Number(readFileSync(pidFile, "utf8"))), 750);
+      const settledBeforeDrain = await Promise.race([
+        running.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 100)),
+      ]);
+      assert.equal(settledBeforeDrain, false, "transport settled before queued terminal replies drained");
+      releaseFirstWrite();
+
+      const boundedExit = await Promise.race([
+        running.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 2_500)),
+      ]);
+      assert.equal(boundedExit, true, "overflowed child output queue did not terminate boundedly");
+      await waitUntil(() => frames.filter((frame) => frame.id !== 0).length === 18, 750);
+      const terminal = frames.filter((frame) => frame.id !== 0);
+      assert.deepEqual(terminal.map((frame) => frame.id), Array.from({ length: 18 }, (_, index) => index + 1));
+      assert.equal(terminal.filter((frame) => frame.id === 1 && frame.result !== undefined).length, 1);
+      assert.equal(terminal.filter((frame) => frame.id !== 1 && frame.error !== undefined).length, 17);
+      assert.equal(new Set(terminal.map((frame) => frame.id)).size, terminal.length, JSON.stringify(frames));
+      assert.deepEqual(
+        readFileSync(callLog, "utf8").trim().split("\n"),
+        Array.from({ length: 18 }, (_, index) => String(index + 1)),
+      );
+      assert.equal(
+        processAlive(Number(readFileSync(pidFile, "utf8"))),
+        false,
+        "PinchTab child survived output queue overflow",
+      );
+    } finally {
+      releaseFirstWrite?.();
+      input.destroy();
+      output.destroy();
+      if (existsSync(pidFile)) {
+        const pid = Number(readFileSync(pidFile, "utf8"));
+        if (processAlive(pid)) process.kill(pid, "SIGKILL");
+      }
+    }
+  });
+
+  test("deferred tool response survives list-response output backpressure from the same child batch", async () => {
+    const dir = await tempDir("openbot-pt-client-backpressure-mixed-");
+    const bin = await writeStubbornOutputPinchTab(dir);
+    const pidFile = join(dir, "child.pid");
+    const callLog = join(dir, "calls.log");
+    const input = new PassThrough();
+    const frames: Array<{ id?: number; result?: unknown; error?: unknown }> = [];
+    let releaseListWrite: (() => void) | undefined;
+    const output = new Writable({
+      highWaterMark: 1_024,
+      write(chunk, _encoding, callback) {
+        const frame = JSON.parse(chunk.toString("utf8")) as (typeof frames)[number];
+        frames.push(frame);
+        if (frame.id === 2) {
+          releaseListWrite = () => {
+            releaseListWrite = undefined;
+            callback();
+          };
+        } else {
+          callback();
+        }
+      },
+    });
+    const running = runPinchTabAllowlistProxy(input, output, {
+      ...process.env,
+      OPENBOT_OUTPUT_CHILD_CALL_LOG: callLog,
+      OPENBOT_OUTPUT_CHILD_PID_FILE: pidFile,
+      OPENBOT_OUTPUT_MIXED: "1",
+      OPENBOT_PINCHTAB: bin,
+      OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS: "1500",
+      OPENBOT_PINCHTAB_SERVER: "http://127.0.0.1:9867",
+      PINCHTAB_TOKEN: "t",
+    });
+    try {
+      input.write(
+        `${JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test" } } })}\n`,
+      );
+      await waitUntil(() => frames.some((frame) => frame.id === 0), 750);
+      await waitUntil(() => existsSync(pidFile), 750);
+      input.write(
+        `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "pinchtab_snapshot", arguments: {} } })}\n${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`,
+      );
+
+      await waitUntil(() => frames.some((frame) => frame.id === 2), 750);
+      assert.equal(output.writableNeedDrain, true, "large list response did not apply backpressure");
+      assert.equal(input.isPaused(), true, "client ingress stayed flowing before mixed-batch drain");
+      assert.ok(releaseListWrite, "large list response was not held for the drain assertion");
+      releaseListWrite();
+      await waitUntil(() => frames.some((frame) => frame.id === 1), 750);
+      await waitUntil(() => !input.isPaused(), 750);
+
+      const mixedReplies = frames.filter((frame) => frame.id === 1 || frame.id === 2);
+      assert.deepEqual([...mixedReplies.map((frame) => frame.id)].sort(), [1, 2], JSON.stringify(frames));
+      assert.equal(new Set(mixedReplies.map((frame) => frame.id)).size, 2, JSON.stringify(frames));
+      assert.equal(mixedReplies.filter((frame) => frame.error !== undefined).length, 0, JSON.stringify(frames));
+
+      input.write(`${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" })}\n`);
+      await waitUntil(() => frames.some((frame) => frame.id === 3), 750);
+      const childCalls = readFileSync(callLog, "utf8").trim().split("\n");
+      assert.deepEqual([...childCalls.slice(0, 2)].sort(), ["1", "2"]);
+      assert.equal(childCalls[2], "3");
+
+      input.end();
+      const boundedExit = await Promise.race([
+        running.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 2_500)),
+      ]);
+      assert.equal(boundedExit, true, "mixed-batch transport did not shut down boundedly");
+      assert.equal(
+        processAlive(Number(readFileSync(pidFile, "utf8"))),
+        false,
+        "PinchTab child survived mixed-batch cleanup",
+      );
+    } finally {
+      releaseListWrite?.();
       input.destroy();
       output.destroy();
       if (existsSync(pidFile)) {
