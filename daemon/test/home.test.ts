@@ -385,6 +385,56 @@ describe("HomeStore sqlite", () => {
     home.close();
   });
 
+  test("returns stable sender identity for same-role messages from different Channel members", async () => {
+    const homeDir = await tempHome();
+    const home = new HomeStore(homeDir);
+    const adaId = crypto.randomUUID();
+    const bobId = crypto.randomUUID();
+    const adaChannelId = crypto.randomUUID();
+    const bobChannelId = crypto.randomUUID();
+    home.createBot(
+      {
+        id: adaId,
+        name: "Ada",
+        color: "#ff3b5c",
+        shape: "capsule",
+        harness: null,
+        createdAt: iso(),
+      },
+      adaChannelId,
+    );
+    home.createBot(
+      {
+        id: bobId,
+        name: "Bob",
+        color: "#2457ff",
+        shape: "rounded-cube",
+        harness: null,
+        createdAt: iso(1000),
+      },
+      bobChannelId,
+    );
+    const group = home.createGroup({ title: "Ada & Bob", memberBotIds: [adaId, bobId] });
+    home.appendMessage(group.id, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: "Ada here",
+      createdAt: iso(2000),
+      senderId: adaId,
+    });
+    home.appendMessage(group.id, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: "Bob here",
+      createdAt: iso(3000),
+      senderId: bobId,
+    });
+
+    const messages = home.listMessages(group.id) as Array<{ senderId?: string }>;
+    assert.deepEqual(messages.map((message) => message.senderId), [adaId, bobId]);
+    home.close();
+  });
+
   test("migrates schema 2 Homes by baselining existing activity as read", async () => {
     const homeDir = await tempHome();
     const databasePath = join(homeDir, "talk.sqlite");
@@ -741,12 +791,14 @@ describe("channelHistory and talkPrompt", () => {
       messages.push({
         id: `u${i}`,
         role: "user" as const,
+        senderId: HUMAN_MEMBER_ID,
         text: `user-${i}`,
         createdAt: iso(i * 1000),
       });
       messages.push({
         id: `a${i}`,
         role: "assistant" as const,
+        senderId: "ada",
         text: `asst-${i}`,
         createdAt: iso(i * 1000 + 1),
       });
@@ -761,7 +813,13 @@ describe("channelHistory and talkPrompt", () => {
 
   test("clips a 64000-character history and marks the cut", () => {
     const huge = "x".repeat(70_000);
-    const history = channelHistory([{ id: "u1", role: "user", text: huge, createdAt: iso() }], "Ada");
+    const history = channelHistory([{
+      id: "u1",
+      role: "user",
+      senderId: HUMAN_MEMBER_ID,
+      text: huge,
+      createdAt: iso(),
+    }], "Ada");
     assert.match(history, /\[Earlier transcript clipped\]/);
     assert.equal(history.length, 64_000);
     assert.match(history, /^Recent Channel transcript:\n/);
@@ -769,10 +827,11 @@ describe("channelHistory and talkPrompt", () => {
 
   test("keeps Cards out of the speech transcript injected into ACP", () => {
     const history = channelHistory([
-      { id: "u1", role: "user", text: "hello", createdAt: iso() },
+      { id: "u1", role: "user", senderId: HUMAN_MEMBER_ID, text: "hello", createdAt: iso() },
       {
         id: "c1",
         role: "assistant",
+        senderId: "ada",
         kind: "card",
         text: "Permission requested: Waiting for you",
         createdAt: iso(1),
@@ -784,7 +843,7 @@ describe("channelHistory and talkPrompt", () => {
           actions: [],
         },
       },
-      { id: "a1", role: "assistant", text: "done", createdAt: iso(2) },
+      { id: "a1", role: "assistant", senderId: "ada", text: "done", createdAt: iso(2) },
     ], "Ada");
     assert.equal(history, "Recent Channel transcript:\nYou: hello\nAda: done");
   });

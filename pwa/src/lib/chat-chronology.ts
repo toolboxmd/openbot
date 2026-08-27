@@ -3,6 +3,7 @@ export type ChatReceipt = "sent" | "delivered" | "read";
 export type ChronologyMessage = {
   id: string;
   role: "user" | "assistant";
+  senderId: string;
   kind?: string;
   createdAt?: string;
   receipt?: ChatReceipt;
@@ -80,7 +81,7 @@ function isTextBubble(message: ChronologyMessage): boolean {
 
 function sharesBurst(previous: ChronologyMessage | undefined, current: ChronologyMessage | undefined): boolean {
   if (!previous || !current || !isTextBubble(previous) || !isTextBubble(current)) return false;
-  if (previous.role !== current.role || current.replyTo) return false;
+  if (previous.senderId !== current.senderId || previous.replyTo || current.replyTo) return false;
   const previousDay = localDayKey(previous.createdAt);
   return previousDay !== null && previousDay === localDayKey(current.createdAt);
 }

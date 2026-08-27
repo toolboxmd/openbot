@@ -68,6 +68,7 @@ export type Bot = {
   messages?: Array<{
     id: string;
     role: "user" | "assistant";
+    senderId: string;
     text: string;
     createdAt?: string;
     receipt?: "sent" | "delivered" | "read";

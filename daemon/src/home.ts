@@ -36,6 +36,7 @@ export type TranscriptKind = "text" | "host-grant" | "card";
 export type TranscriptMessage = {
   id: string;
   role: "user" | "assistant";
+  senderId: string;
   text: string;
   createdAt: string;
   kind?: TranscriptKind;
@@ -86,7 +87,6 @@ export type ChannelCursor = {
 };
 
 export type NewMessage = TranscriptMessage & {
-  senderId: string;
   recipientBotId?: string;
 };
 
@@ -262,7 +262,7 @@ export class HomeStore {
   listMessages(channelId: string): TranscriptMessage[] {
     return this.db
       .prepare(
-        `SELECT id, kind, sender_kind, text, created_at, reply_to, card_json
+        `SELECT id, kind, sender_kind, sender_id, text, created_at, reply_to, card_json
          FROM messages WHERE channel_id = ? ORDER BY sequence`,
       )
       .all(channelId)
@@ -272,7 +272,7 @@ export class HomeStore {
   getMessage(channelId: string, messageId: string): TranscriptMessage | null {
     const row = this.db
       .prepare(
-        `SELECT id, kind, sender_kind, text, created_at, reply_to, card_json
+        `SELECT id, kind, sender_kind, sender_id, text, created_at, reply_to, card_json
          FROM messages WHERE channel_id = ? AND id = ?`,
       )
       .get(channelId, messageId) as SqlRow | undefined;
@@ -965,7 +965,12 @@ export class HomeStore {
   }
 
   private reviveMessage(row: SqlRow): TranscriptMessage[] {
-    if (typeof row.id !== "string" || typeof row.text !== "string" || typeof row.created_at !== "string") return [];
+    if (
+      typeof row.id !== "string"
+      || typeof row.sender_id !== "string"
+      || typeof row.text !== "string"
+      || typeof row.created_at !== "string"
+    ) return [];
     if (row.sender_kind !== "user" && row.sender_kind !== "bot") return [];
     const receiptRow = this.db
       .prepare(
@@ -985,6 +990,7 @@ export class HomeStore {
     const message: TranscriptMessage = {
       id: row.id,
       role: row.sender_kind === "user" ? "user" : "assistant",
+      senderId: row.sender_id,
       text: row.text,
       createdAt: row.created_at,
     };

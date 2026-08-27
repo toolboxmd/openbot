@@ -1,10 +1,16 @@
 # Changelog
 
+## [0.9.1] - 2026-08-27
+
+### Changed
+
+- Keep ACP chunks private and group complete bubbles by sender
+
 ## [0.9.0] - 2026-08-27
 
 ### Added
 
-- Add persistent Transcript Cards and permissions
+- Add focused deterministic and explicit live test lanes
 
 ## [0.8.0] - 2026-08-27
 
