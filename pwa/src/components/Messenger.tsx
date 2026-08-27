@@ -1,5 +1,15 @@
-import { FormEvent, Fragment, useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
-import { ArrowUp, Menu, MessageSquare, Monitor, Plug, Plus, Reply, Search, Settings, Smile, X } from "lucide-react";
+import {
+  FormEvent,
+  Fragment,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type MouseEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from "react";
+import { ArrowUp, Check, Menu, MessageSquare, Monitor, Plug, Plus, Reply, Search, Settings, Smile, X } from "lucide-react";
 import { AppSettings } from "@/components/AppSettings";
 import { BotSettings } from "@/components/BotSettings";
 import { ComputerScreen } from "@/components/Computer";
@@ -20,7 +30,9 @@ import { useUiPreferences } from "@/components/UiPreferencesProvider";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuItemIndicator,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -100,11 +112,24 @@ import {
 } from "@/lib/session";
 import {
   buildChatChronology,
-  orderThreadedChatMessages,
   parseChatText,
   type ChatChronologyItem,
   type ChatInline,
 } from "@/lib/chat-chronology";
+import {
+  buildFlatTranscriptRows,
+  isNearTranscriptBottom,
+  isPrimaryLongPressPointer,
+  LONG_PRESS_DELAY_MS,
+  observeTranscriptViewport,
+  PHONE_ACTION_TARGET_CLASS,
+  remountedTranscriptScrollTop,
+  subscribeTranscriptBreakpoint,
+  TRANSCRIPT_DESKTOP_QUERY,
+  transcriptHasLayout,
+  transcriptContentRevision,
+  transcriptViewportDecision,
+} from "@/lib/chat-interactions";
 
 
 type ChatMessage = NonNullable<Bot["messages"]>[number];
@@ -186,56 +211,53 @@ function previewText(text: string, max = 72): string {
   return `${one.slice(0, max - 1)}…`;
 }
 
-function rootsOf(messages: ChatMessage[]): ChatMessage[] {
-  const ids = new Set(messages.map((m) => m.id));
-  return messages.filter((m) => !m.replyTo || !ids.has(m.replyTo));
-}
-
-function childrenOf(messages: ChatMessage[], id: string): ChatMessage[] {
-  return messages.filter((m) => m.replyTo === id);
-}
-
-function TypingDots() {
-  return (
-    <span data-testid="typing-dots" aria-label="typing" className="inline-flex items-center gap-[5px] px-0.5 py-1">
-      {[0, 1, 2].map((i) => (
-        <span
-          key={i}
-          className="openbot-typing-dot inline-block size-[7px] rounded-full bg-muted-foreground/55"
-          style={{ animationDelay: `${i * 140}ms` }}
-        />
-      ))}
-    </span>
-  );
-}
-
 function HoverActions({
   user,
   open,
   onReply,
-  onReact,
+  pickerOpen,
+  onPickerOpenChange,
   picker,
 }: {
   user: boolean;
   open: boolean;
   onReply: () => void;
-  onReact: () => void;
+  pickerOpen: boolean;
+  onPickerOpenChange: (open: boolean) => void;
   picker: ReactNode;
 }) {
   const reactBtn = (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button type="button" size="icon-sm" variant="ghost" aria-label="React" onClick={onReact}>
-          <Smile />
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>React</TooltipContent>
-    </Tooltip>
+    <DropdownMenu open={pickerOpen} onOpenChange={onPickerOpenChange}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              aria-label="React"
+              className={PHONE_ACTION_TARGET_CLASS}
+            >
+              <Smile />
+            </Button>
+          </DropdownMenuTrigger>
+        </TooltipTrigger>
+        <TooltipContent>React</TooltipContent>
+      </Tooltip>
+      {picker}
+    </DropdownMenu>
   );
   const replyBtn = (
     <Tooltip>
       <TooltipTrigger asChild>
-        <Button type="button" size="icon-sm" variant="ghost" aria-label="Reply" onClick={onReply}>
+        <Button
+          type="button"
+          size="icon-sm"
+          variant="ghost"
+          aria-label="Reply"
+          onClick={onReply}
+          className={PHONE_ACTION_TARGET_CLASS}
+        >
           <Reply />
         </Button>
       </TooltipTrigger>
@@ -247,9 +269,9 @@ function HoverActions({
       data-testid="bubble-hover-actions"
       onClick={(event) => event.stopPropagation()}
       className={cn(
-        "relative flex shrink-0 items-center rounded-full border border-border bg-background/95 shadow-sm",
-        "opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100",
-        open && "opacity-100",
+        "pointer-events-none relative flex shrink-0 items-center rounded-full border border-border bg-background/95 opacity-0 shadow-sm transition-opacity",
+        "group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100",
+        open && "pointer-events-auto opacity-100",
       )}
     >
       {user ? (
@@ -263,7 +285,6 @@ function HoverActions({
           {replyBtn}
         </>
       )}
-      {picker}
     </div>
   );
 }
@@ -300,11 +321,26 @@ export function Messenger() {
   const [error, setError] = useState<string | null>(null);
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
   const [reactingId, setReactingId] = useState<string | null>(null);
+  const [actionMessageId, setActionMessageId] = useState<string | null>(null);
+  const [newMessagesAvailable, setNewMessagesAvailable] = useState(false);
+  const [desktopLayout, setDesktopLayout] = useState(
+    () => window.matchMedia(TRANSCRIPT_DESKTOP_QUERY).matches,
+  );
   const openChatsButtonRef = useRef<HTMLButtonElement | null>(null);
   const closeChatsButtonRef = useRef<HTMLButtonElement | null>(null);
   const computerButtonRef = useRef<HTMLButtonElement | null>(null);
   const closeComputerButtonRef = useRef<HTMLButtonElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
+  const transcriptNearBottomRef = useRef(true);
+  const transcriptScrollTopByChatRef = useRef(new Map<string, number>());
+  const previousTranscriptBotIdRef = useRef<string | null>(null);
+  const previousTranscriptRevisionRef = useRef("");
+  const previousTranscriptWritingRef = useRef(false);
+  const previousTranscriptMountedRef = useRef(false);
+  const previousTranscriptDesktopRef = useRef(desktopLayout);
+  const messageBubbleRefs = useRef(new Map<string, HTMLDivElement>());
+  const longPressTimerRef = useRef<number | null>(null);
   const inboxSearchRef = useRef<HTMLInputElement | null>(null);
   const createMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
   const newBotOpenerRef = useRef<HTMLButtonElement | null>(null);
@@ -338,6 +374,7 @@ export function Messenger() {
   const botSettingsOpenRef = useRef(botSettingsOpen);
   const globalRouteRef = useRef(globalRoute);
   const mobileSurfaceRef = useRef(mobileSurface);
+  const desktopLayoutRef = useRef(desktopLayout);
   const { preferences, updateComputerPane } = useUiPreferences();
   const computerOpen = computerPaneIsOpen(preferences, activeId);
   const visibleComputerOpen = computerVisibleDuringPluginsReturn({
@@ -347,6 +384,7 @@ export function Messenger() {
   const visibleComputerOpenRef = useRef(visibleComputerOpen);
   globalRouteRef.current = globalRoute;
   mobileSurfaceRef.current = mobileSurface;
+  desktopLayoutRef.current = desktopLayout;
   visibleComputerOpenRef.current = visibleComputerOpen;
   const blockingChatSurfaceOpen = appSettingsOpen || botSettingsOpen || newBotOpen;
   const composerKind = activeGroup ? "group" : active?.messages !== undefined ? "direct" : null;
@@ -374,6 +412,60 @@ export function Messenger() {
 
   function blockingChatSurfaceIsOpen(): boolean {
     return appSettingsOpenRef.current || newBotOpenRef.current || botSettingsOpenRef.current;
+  }
+
+  function clearLongPressTimer() {
+    if (longPressTimerRef.current === null) return;
+    window.clearTimeout(longPressTimerRef.current);
+    longPressTimerRef.current = null;
+  }
+
+  function startLongPress(event: ReactPointerEvent<HTMLDivElement>, messageId: string) {
+    if (!isPrimaryLongPressPointer(event)) return;
+    clearLongPressTimer();
+    longPressTimerRef.current = window.setTimeout(() => {
+      longPressTimerRef.current = null;
+      setReactingId(null);
+      setActionMessageId(messageId);
+    }, LONG_PRESS_DELAY_MS);
+  }
+
+  function focusTranscriptMessage(messageId: string) {
+    const target = messageBubbleRefs.current.get(messageId);
+    if (!target) return;
+    const behavior = window.matchMedia("(prefers-reduced-motion: reduce)").matches
+      ? "auto"
+      : "smooth";
+    target.scrollIntoView({ behavior, block: "center" });
+    target.focus({ preventScroll: true });
+  }
+
+  function onTranscriptScroll() {
+    const transcript = transcriptScrollRef.current;
+    if (!transcript) return;
+    if (activeDraftKey) {
+      transcriptScrollTopByChatRef.current.set(activeDraftKey, transcript.scrollTop);
+    }
+    const nearBottom = isNearTranscriptBottom(transcript);
+    transcriptNearBottomRef.current = nearBottom;
+    if (nearBottom) setNewMessagesAvailable(false);
+  }
+
+  function scrollToLatest() {
+    const transcript = transcriptScrollRef.current;
+    if (!transcript) return;
+    const bubbles = Array.from(messageBubbleRefs.current.values());
+    const latestBubble = bubbles.at(-1);
+    transcriptNearBottomRef.current = true;
+    if (activeDraftKey) {
+      transcriptScrollTopByChatRef.current.set(activeDraftKey, transcript.scrollHeight);
+    }
+    transcript.scrollTo({
+      top: transcript.scrollHeight,
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+    });
+    latestBubble?.focus({ preventScroll: true });
+    setNewMessagesAvailable(false);
   }
 
   function storeDraft(key: string, text: string): number {
@@ -543,7 +635,7 @@ export function Messenger() {
   function chatIsVisible(): boolean {
     return chatSurfaceIsVisible({
       route: globalRouteRef.current,
-      desktop: window.matchMedia("(min-width: 48rem)").matches,
+      desktop: desktopLayoutRef.current,
       mobileSurface: mobileSurfaceRef.current,
       computerVisible: visibleComputerOpenRef.current,
       documentVisible: document.visibilityState === "visible",
@@ -564,6 +656,13 @@ export function Messenger() {
       .then((activity) => applyBotActivity(bot.id, activity))
       .catch(() => undefined);
   }
+
+  useEffect(() => {
+    const media = window.matchMedia(TRANSCRIPT_DESKTOP_QUERY);
+    const sync = () => setDesktopLayout(media.matches);
+    sync();
+    return subscribeTranscriptBreakpoint(media, sync);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -788,16 +887,23 @@ export function Messenger() {
   }, [activeId, bots.length, botsLoadError, botsReady, computerOpen, globalRoute, mobileSurface]);
 
   useEffect(() => {
+    clearLongPressTimer();
     setReplyTo(null);
     setReactingId(null);
+    setActionMessageId(null);
   }, [activeId]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setReactingId(null);
+      if (event.key === "Escape") {
+        setActionMessageId(null);
+      }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      clearLongPressTimer();
+    };
   }, []);
 
   useEffect(() => {
@@ -995,7 +1101,10 @@ export function Messenger() {
     const botId = activeId;
     try {
       await performBotMutation(botId, () => toggleReaction(botId, messageId, emoji));
-      if (activeIdRef.current === botId) setReactingId(null);
+      if (activeIdRef.current === botId) {
+        setReactingId(null);
+        setActionMessageId(null);
+      }
     } catch (err) {
       if (activeIdRef.current === botId) {
         setError(err instanceof Error ? err.message : "Could not react.");
@@ -1021,7 +1130,7 @@ export function Messenger() {
   function renderBubble(
     message: ChatMessage,
     presentation: ChatChronologyItem | undefined,
-    nested: boolean,
+    replyTarget: ChatMessage | null,
   ) {
     const spacingClass = presentation?.spacing === "compact"
       ? "mt-[var(--message-burst-gap)]"
@@ -1029,6 +1138,10 @@ export function Messenger() {
     if (message.kind === "host-grant") {
       const card = (
         <div
+          ref={(node) => {
+            if (node) messageBubbleRefs.current.set(message.id, node);
+            else messageBubbleRefs.current.delete(message.id);
+          }}
           data-testid="host-grant-history"
           tabIndex={0}
           className="rounded-2xl bg-secondary px-4 py-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
@@ -1058,119 +1171,140 @@ export function Messenger() {
     }
     const user = message.role === "user";
     const receipt = presentation?.receipt ?? null;
-    const kids = childrenOf(visible, message.id);
-    const open = reactingId === message.id;
+    const pickerOpen = reactingId === message.id;
+    const actionsOpen = actionMessageId === message.id || pickerOpen;
     const mine = (message.reactions ?? []).map((item) => item.emoji);
-    const picker = open ? (
-      <div
+    const picker = pickerOpen ? (
+      <DropdownMenuContent
         data-testid="emoji-picker"
-        className={cn(
-          "absolute top-full z-20 mt-1 flex gap-1 rounded-full border border-border bg-background px-1.5 py-1 shadow-md",
-          user ? "right-0" : "left-0",
-        )}
+        side="bottom"
+        align={user ? "end" : "start"}
+        className="flex min-w-0 gap-1 rounded-full p-1"
       >
         {TAPBACKS.map((emoji) => (
-          <button
+          <DropdownMenuCheckboxItem
             key={emoji}
-            type="button"
             aria-label={`React ${emoji}`}
-            aria-pressed={mine.includes(emoji)}
-            onClick={() => void onReact(message.id, emoji)}
-            className={cn(
-              "flex size-8 items-center justify-center rounded-full text-base hover:bg-accent",
-              mine.includes(emoji) && "bg-accent",
-            )}
+            checked={mine.includes(emoji)}
+            onSelect={() => void onReact(message.id, emoji)}
+            className={cn("relative size-8 justify-center rounded-full p-0 text-base", PHONE_ACTION_TARGET_CLASS)}
           >
             {emoji}
-          </button>
+            <DropdownMenuItemIndicator>
+              <Check aria-hidden="true" className="absolute right-0.5 top-0.5 size-3 rounded-full bg-background" />
+            </DropdownMenuItemIndicator>
+          </DropdownMenuCheckboxItem>
         ))}
-      </div>
+      </DropdownMenuContent>
     ) : null;
     const bubble = (
       <div
+        ref={(node) => {
+          if (node) messageBubbleRefs.current.set(message.id, node);
+          else messageBubbleRefs.current.delete(message.id);
+        }}
         data-testid="message-bubble"
         data-message-id={message.id}
         data-tail={presentation?.tail ?? "none"}
         tabIndex={0}
+        onPointerDown={(event) => startLongPress(event, message.id)}
+        onPointerUp={clearLongPressTimer}
+        onPointerCancel={clearLongPressTimer}
+        onPointerLeave={clearLongPressTimer}
+        onContextMenu={(event) => {
+          if (!window.matchMedia("(pointer: coarse)").matches) return;
+          event.preventDefault();
+          clearLongPressTimer();
+          setReactingId(null);
+          setActionMessageId(message.id);
+        }}
         className={cn(
-          "openbot-chat-bubble relative rounded-[var(--radius-bubble)] px-4 py-2.5 text-sm break-words focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+          "openbot-chat-bubble relative touch-manipulation rounded-[var(--radius-bubble)] px-4 py-2.5 text-sm break-words focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
           user
             ? "bg-bubble-outgoing text-bubble-outgoing-foreground"
             : "bg-bubble-incoming text-bubble-incoming-foreground",
-          nested && "text-[13px]",
         )}
       >
+        {replyTarget ? (
+          <button
+            type="button"
+            data-testid="reply-quote"
+            aria-label={`View replied message from ${replyTarget.role === "user" ? "You" : (active?.name ?? "Bot")}: ${previewText(replyTarget.text)}`}
+            onClick={(event) => {
+              event.stopPropagation();
+              focusTranscriptMessage(replyTarget.id);
+            }}
+            className={cn(
+              "mb-2 flex w-full min-w-0 items-center gap-1.5 rounded-lg border-l-2 border-current/30 bg-[var(--message-code-surface)] px-2 py-1 text-left text-[11px] leading-snug hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current",
+              PHONE_ACTION_TARGET_CLASS,
+            )}
+          >
+            <Reply className="size-3 shrink-0" aria-hidden="true" />
+            <span className="shrink-0 font-medium">
+              {replyTarget.role === "user" ? "You" : (active?.name ?? "Bot")}
+            </span>
+            <span className="truncate opacity-75">{previewText(replyTarget.text)}</span>
+          </button>
+        ) : null}
         <ChatMessageText text={message.text} />
       </div>
     );
     return (
-      <>
-        <li
-          key={message.id}
-          data-testid={nested ? "reply-thread" : undefined}
-          data-message-id={message.id}
-          data-burst={presentation?.burst ?? "none"}
-          data-tail={presentation?.tail ?? "none"}
-          data-reply-to={message.replyTo}
-          className={cn(
-            "group flex flex-col gap-1",
-            spacingClass,
-            nested
-              ? cn(
-                  "max-w-[calc(var(--message-max-width-compact)-1rem)] border-border min-[48rem]:max-w-[calc(var(--message-max-width)-1rem)]",
-                  user ? "mr-4 border-r pr-3" : "ml-4 border-l pl-3",
-                )
-              : "max-w-[var(--message-max-width-compact)] min-[48rem]:max-w-[var(--message-max-width)]",
-            user ? "self-end items-end" : "self-start items-start",
-          )}
-        >
-          <div className={cn("flex items-end gap-1", user ? "flex-row-reverse" : "flex-row")}>
-            <div className={cn("relative", message.reactions && message.reactions.length > 0 && "mb-2 pb-1")}>
-              {presentation?.exactTime ? (
-                <Tooltip>
-                  <TooltipTrigger asChild>{bubble}</TooltipTrigger>
-                  <TooltipContent>
-                    <time dateTime={message.createdAt}>{presentation.exactTime}</time>
-                  </TooltipContent>
-                </Tooltip>
-              ) : bubble}
-              {message.reactions && message.reactions.length > 0 ? (
-                <div
-                  data-testid="reaction-badge"
-                  className={cn(
-                    "absolute -bottom-2 flex gap-0.5 rounded-full border border-border bg-background px-1.5 py-0.5 text-[13px] leading-none shadow-sm",
-                    user ? "left-1" : "right-1",
-                  )}
-                >
-                  {message.reactions.map((item) => (
-                    <span key={`${item.emoji}:${item.by}`}>{item.emoji}</span>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-            <HoverActions
-              user={user}
-              open={open}
-              onReply={() => {
-                setReplyTo(message);
-                setReactingId(null);
-              }}
-              onReact={() => setReactingId(open ? null : message.id)}
-              picker={picker}
-            />
+      <li
+        key={message.id}
+        data-message-id={message.id}
+        data-burst={presentation?.burst ?? "none"}
+        data-tail={presentation?.tail ?? "none"}
+        data-reply-to={message.replyTo}
+        className={cn(
+          "group flex max-w-[var(--message-max-width-compact)] flex-col gap-1 min-[48rem]:max-w-[var(--message-max-width)]",
+          spacingClass,
+          user ? "self-end items-end" : "self-start items-start",
+        )}
+      >
+        <div className={cn("flex items-end gap-1", user ? "flex-row-reverse" : "flex-row")}>
+          <div className={cn("relative", message.reactions && message.reactions.length > 0 && "mb-2 pb-1")}>
+            {presentation?.exactTime ? (
+              <Tooltip>
+                <TooltipTrigger asChild>{bubble}</TooltipTrigger>
+                <TooltipContent>
+                  <time dateTime={message.createdAt}>{presentation.exactTime}</time>
+                </TooltipContent>
+              </Tooltip>
+            ) : bubble}
+            {message.reactions && message.reactions.length > 0 ? (
+              <div
+                data-testid="reaction-badge"
+                className={cn(
+                  "absolute -bottom-2 flex gap-0.5 rounded-full border border-border bg-background px-1.5 py-0.5 text-[13px] leading-none shadow-sm",
+                  user ? "left-1" : "right-1",
+                )}
+              >
+                {message.reactions.map((item) => (
+                  <span key={`${item.emoji}:${item.by}`}>{item.emoji}</span>
+                ))}
+              </div>
+            ) : null}
           </div>
-          {receipt ? <span className="px-1 text-[11px] text-muted-foreground">{receipt}</span> : null}
-        </li>
-        {kids.map((child) => {
-          const childPresentation = chronologyById.get(child.id);
-          return (
-            <Fragment key={child.id}>
-              {renderDaySeparator(child, childPresentation)}
-              {renderBubble(child, childPresentation, true)}
-            </Fragment>
-          );
-        })}
-      </>
+          <HoverActions
+            user={user}
+            open={actionsOpen}
+            onReply={() => {
+              setReplyTo(message);
+              setReactingId(null);
+              setActionMessageId(null);
+              window.requestAnimationFrame(() => composerRef.current?.focus());
+            }}
+            pickerOpen={pickerOpen}
+            onPickerOpenChange={(nextOpen) => {
+              setActionMessageId(nextOpen ? message.id : null);
+              setReactingId(nextOpen ? message.id : null);
+            }}
+            picker={picker}
+          />
+        </div>
+        {receipt ? <span className="px-1 text-[11px] text-muted-foreground">{receipt}</span> : null}
+      </li>
     );
   }
 
@@ -1182,16 +1316,73 @@ export function Messenger() {
       })
     : null;
   const visible = messages.filter((message) => message.text.length > 0);
-  const rootMessages = rootsOf(visible);
+  const transcriptRows = buildFlatTranscriptRows(visible);
+  const transcriptRevision = transcriptContentRevision(visible);
   const chronologyNow = new Date();
   const chronology = buildChatChronology(
-    orderThreadedChatMessages(visible),
+    visible,
     chronologyNow,
     undefined,
     { receiptOrder: visible },
   );
   const chronologyById = new Map(chronology.map((item) => [item.id, item]));
   const writing = isWorkingMode(active?.eyes.mode);
+  useLayoutEffect(() => {
+    const transcript = transcriptScrollRef.current;
+    const transcriptMounted = transcriptHasLayout(transcript);
+    const observation = observeTranscriptViewport(
+      {
+        botId: previousTranscriptBotIdRef.current,
+        revision: previousTranscriptRevisionRef.current,
+        writing: previousTranscriptWritingRef.current,
+        mounted: previousTranscriptMountedRef.current,
+      },
+      { botId: activeId, revision: transcriptRevision, writing },
+      transcriptMounted,
+    );
+    previousTranscriptBotIdRef.current = observation.snapshot.botId;
+    previousTranscriptRevisionRef.current = observation.snapshot.revision;
+    previousTranscriptWritingRef.current = observation.snapshot.writing;
+    previousTranscriptMountedRef.current = observation.snapshot.mounted;
+    const layoutChanged = previousTranscriptDesktopRef.current !== desktopLayout;
+    previousTranscriptDesktopRef.current = desktopLayout;
+    if (!transcript || !transcriptMounted) return;
+    const { chatChanged, remounted, revisionChanged, writingChanged } = observation;
+
+    const decision = transcriptViewportDecision({
+      chatChanged,
+      remounted,
+      revisionChanged,
+      writingChanged,
+      layoutChanged,
+      nearBottom: transcriptNearBottomRef.current,
+    });
+    const restoredScrollTop = remountedTranscriptScrollTop({
+      remounted,
+      chatChanged,
+      nearBottom: transcriptNearBottomRef.current,
+      savedScrollTop: activeDraftKey
+        ? transcriptScrollTopByChatRef.current.get(activeDraftKey)
+        : undefined,
+    });
+    transcriptNearBottomRef.current = decision.nearBottom;
+    if (restoredScrollTop !== null) transcript.scrollTop = restoredScrollTop;
+    else if (decision.scrollToBottom) transcript.scrollTop = transcript.scrollHeight;
+    if (activeDraftKey) {
+      transcriptScrollTopByChatRef.current.set(activeDraftKey, transcript.scrollTop);
+    }
+    if (decision.newMessages !== null) setNewMessagesAvailable(decision.newMessages);
+  }, [
+    activeId,
+    activeDraftKey,
+    chatDetailState,
+    desktopLayout,
+    globalRoute,
+    mobileSurface,
+    transcriptRevision,
+    visibleComputerOpen,
+    writing,
+  ]);
   const inboxRows = buildChatInbox({ bots, channels, drafts });
   const filteredInboxRows = filterChatInbox(inboxRows, inboxQuery);
   const inboxRowsSignature = inboxRows
@@ -1709,29 +1900,34 @@ export function Messenger() {
         ) : active && chatDetailState === "error" ? (
           <ChatDetailError bot={active} onRetry={retryActiveChat} />
         ) : active && chatDetailState === "populated" ? (
-          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-[var(--phone-edge)] py-4 min-[48rem]:px-6">
+          <div className="relative flex min-h-0 flex-1">
+            <div
+              ref={transcriptScrollRef}
+              onScroll={onTranscriptScroll}
+              className="flex min-h-0 flex-1 flex-col overflow-y-auto px-[var(--phone-edge)] py-4 min-[48rem]:px-6"
+            >
             <ul className="mx-auto flex w-full max-w-[var(--transcript-max-width)] flex-1 flex-col">
-              {rootMessages.map((message) => {
+              {transcriptRows.map(({ message, replyTarget }) => {
                 const presentation = chronologyById.get(message.id);
                 return (
                   <Fragment key={message.id}>
                     {renderDaySeparator(message, presentation)}
-                    {renderBubble(message, presentation, false)}
+                    {renderBubble(message, presentation, replyTarget)}
                   </Fragment>
                 );
               })}
               {writing ? (
                 <li
                   data-testid="working-indicator"
-                  className="mt-[var(--message-inter-burst-gap)] flex max-w-[85%] flex-col items-start gap-1.5 self-start"
+                  role="status"
+                  className="mt-[var(--message-inter-burst-gap)] flex max-w-[85%] items-start self-start"
                 >
-                  <TypingDots />
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <span
                         data-testid="working-eyes"
-                        className="inline-flex"
-                        title={`${active.name} is working`}
+                        tabIndex={0}
+                        className="inline-flex rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background motion-reduce:ring-2 motion-reduce:ring-primary motion-reduce:ring-offset-2 motion-reduce:ring-offset-background"
                         aria-label={`${active.name} is working`}
                       >
                         <Eyes
@@ -1776,6 +1972,21 @@ export function Messenger() {
                 </div>
               </div>
             ) : null}
+            </div>
+            {newMessagesAvailable ? (
+              <Button
+                type="button"
+                size="sm"
+                data-testid="new-messages"
+                onClick={scrollToLatest}
+                className={cn(
+                  "absolute bottom-3 left-1/2 z-10 -translate-x-1/2 rounded-full shadow-md",
+                  PHONE_ACTION_TARGET_CLASS,
+                )}
+              >
+                New messages
+              </Button>
+            ) : null}
           </div>
         ) : active && chatDetailState === "empty" ? (
           <EmptyChatStart bot={active} onSuggestion={chooseSuggestion} onOpenSettings={openBotSettings} />
@@ -1810,6 +2021,7 @@ export function Messenger() {
                   variant="ghost"
                   aria-label="Cancel reply"
                   onClick={() => setReplyTo(null)}
+                  className={PHONE_ACTION_TARGET_CLASS}
                 >
                   <X />
                 </Button>

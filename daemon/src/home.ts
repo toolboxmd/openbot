@@ -14,7 +14,7 @@ import {
   type HostGrantDuration,
 } from "./harness-home.ts";
 
-export const HOME_SCHEMA_VERSION = 3;
+export const HOME_SCHEMA_VERSION = 4;
 export const HUMAN_MEMBER_ID = "you";
 
 export type MessageReceipt = "sent" | "delivered" | "read";
@@ -106,30 +106,30 @@ const CHANNEL_SUMMARY_SELECT = `SELECT
     WHERE messages.channel_id = channels.id
       AND messages.kind = 'text'
       AND trim(messages.text) <> ''
-    ORDER BY messages.sequence DESC
+    ORDER BY messages.activity_sequence DESC
     LIMIT 1
   ) AS latest_text,
   COALESCE((
-    SELECT messages.created_at
+    SELECT messages.activity_at
     FROM messages
     WHERE messages.channel_id = channels.id
       AND messages.kind = 'text'
       AND trim(messages.text) <> ''
-    ORDER BY messages.sequence DESC
+    ORDER BY messages.activity_sequence DESC
     LIMIT 1
   ), channels.created_at) AS last_activity_at,
   COALESCE((
-    SELECT messages.sequence
+    SELECT messages.activity_sequence
     FROM messages
     WHERE messages.channel_id = channels.id
-    ORDER BY messages.sequence DESC
+    ORDER BY messages.activity_sequence DESC
     LIMIT 1
   ), 0) AS cursor_sequence,
   COALESCE((
     SELECT messages.revision
     FROM messages
     WHERE messages.channel_id = channels.id
-    ORDER BY messages.sequence DESC
+    ORDER BY messages.activity_sequence DESC
     LIMIT 1
   ), 0) AS cursor_revision,
   EXISTS(
@@ -141,9 +141,9 @@ const CHANNEL_SUMMARY_SELECT = `SELECT
       AND messages.sender_kind = 'bot'
       AND trim(messages.text) <> ''
       AND (
-        messages.sequence > COALESCE(channel_reads.last_read_sequence, 0)
+        messages.activity_sequence > COALESCE(channel_reads.last_read_sequence, 0)
         OR (
-          messages.sequence = COALESCE(channel_reads.last_read_sequence, 0)
+          messages.activity_sequence = COALESCE(channel_reads.last_read_sequence, 0)
           AND messages.revision > COALESCE(channel_reads.last_read_revision, 0)
         )
       )
@@ -319,14 +319,10 @@ export class HomeStore {
       throw Object.assign(new Error("invalid Channel cursor"), { status: 400 });
     }
     if (cursor.sequence > 0) {
-      const message = this.db
-        .prepare("SELECT revision FROM messages WHERE channel_id = ? AND sequence = ?")
-        .get(channelId, cursor.sequence) as SqlRow | undefined;
-      if (
-        typeof message?.revision !== "number"
-        || cursor.revision === 0
-        || cursor.revision > message.revision
-      ) {
+      const latest = this.db
+        .prepare("SELECT activity_sequence AS sequence FROM channels WHERE id = ?")
+        .get(channelId) as SqlRow | undefined;
+      if (cursor.revision === 0 || typeof latest?.sequence !== "number" || cursor.sequence > latest.sequence) {
         throw Object.assign(new Error("invalid Channel cursor"), { status: 400 });
       }
     }
@@ -542,11 +538,13 @@ export class HomeStore {
   appendMessage(channelId: string, message: NewMessage): void {
     if (this.closed) return;
     this.transaction(() => {
+      const activitySequence = this.nextChannelActivitySequence(channelId);
       this.db
         .prepare(
           `INSERT INTO messages
-            (id, channel_id, kind, sender_kind, sender_id, text, created_at, reply_to)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            (id, channel_id, kind, sender_kind, sender_id, text, created_at, reply_to,
+             activity_sequence, activity_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           message.id,
@@ -557,6 +555,8 @@ export class HomeStore {
           message.text,
           message.createdAt,
           message.replyTo ?? null,
+          activitySequence,
+          message.createdAt,
         );
       if (message.receipt && message.recipientBotId) {
         this.db
@@ -570,9 +570,31 @@ export class HomeStore {
     });
   }
 
-  updateMessageText(messageId: string, text: string): void {
+  updateMessageText(messageId: string, text: string, updatedAt = new Date().toISOString()): void {
     if (this.closed) return;
-    this.db.prepare("UPDATE messages SET text = ?, revision = revision + 1 WHERE id = ?").run(text, messageId);
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT channel_id FROM messages WHERE id = ?").get(messageId) as SqlRow | undefined;
+      if (typeof row?.channel_id !== "string") return;
+      const activitySequence = this.nextChannelActivitySequence(row.channel_id);
+      this.db
+        .prepare(
+          `UPDATE messages
+           SET text = ?, revision = revision + 1, activity_sequence = ?, activity_at = ?
+           WHERE id = ?`,
+        )
+        .run(text, activitySequence, updatedAt, messageId);
+    });
+  }
+
+  deleteMessage(messageId: string): boolean {
+    if (this.closed) return false;
+    return this.transaction(() => {
+      this.db
+        .prepare("UPDATE messages SET reply_to = NULL, revision = revision + 1 WHERE reply_to = ?")
+        .run(messageId);
+      const deleted = this.db.prepare("DELETE FROM messages WHERE id = ?").run(messageId);
+      return deleted.changes === 1;
+    });
   }
 
   setReceipt(messageId: string, recipientBotId: string, receipt: MessageReceipt, updatedAt: string): void {
@@ -636,6 +658,7 @@ export class HomeStore {
           id TEXT PRIMARY KEY,
           kind TEXT NOT NULL CHECK (kind IN ('direct', 'group', 'bot-to-bot')),
           title TEXT,
+          activity_sequence INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL
         );
 
@@ -650,6 +673,8 @@ export class HomeStore {
         CREATE TABLE messages (
           sequence INTEGER PRIMARY KEY AUTOINCREMENT,
           revision INTEGER NOT NULL DEFAULT 1,
+          activity_sequence INTEGER NOT NULL,
+          activity_at TEXT NOT NULL,
           id TEXT NOT NULL UNIQUE,
           channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
           kind TEXT NOT NULL DEFAULT 'text',
@@ -661,6 +686,7 @@ export class HomeStore {
         );
 
         CREATE INDEX messages_channel_sequence ON messages(channel_id, sequence);
+        CREATE INDEX messages_channel_activity ON messages(channel_id, activity_sequence DESC);
 
         CREATE TABLE reactions (
           message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -757,6 +783,35 @@ export class HomeStore {
           `);
         }
       }
+      if (version <= 3) {
+        if (!tableHasColumn(this.db, "messages", "activity_sequence")) {
+          this.db.exec("ALTER TABLE messages ADD COLUMN activity_sequence INTEGER NOT NULL DEFAULT 0;");
+        }
+        if (!tableHasColumn(this.db, "messages", "activity_at")) {
+          this.db.exec("ALTER TABLE messages ADD COLUMN activity_at TEXT NOT NULL DEFAULT '';");
+        }
+        this.db.exec(`
+          UPDATE messages
+          SET activity_sequence = sequence
+          WHERE activity_sequence = 0;
+          UPDATE messages
+          SET activity_at = created_at
+          WHERE activity_at = '';
+        `);
+        if (!tableHasColumn(this.db, "channels", "activity_sequence")) {
+          this.db.exec("ALTER TABLE channels ADD COLUMN activity_sequence INTEGER NOT NULL DEFAULT 0;");
+        }
+        this.db.exec(`
+          UPDATE channels
+          SET activity_sequence = COALESCE((
+            SELECT MAX(messages.activity_sequence)
+            FROM messages
+            WHERE messages.channel_id = channels.id
+          ), 0);
+          CREATE INDEX IF NOT EXISTS messages_channel_activity
+            ON messages(channel_id, activity_sequence DESC);
+        `);
+      }
       this.db.exec(`PRAGMA user_version = ${HOME_SCHEMA_VERSION};`);
     });
   }
@@ -834,6 +889,20 @@ export class HomeStore {
     if (typeof row.reply_to === "string" && row.reply_to) message.replyTo = row.reply_to;
     if (reactions.length) message.reactions = reactions;
     return [message];
+  }
+
+  private nextChannelActivitySequence(channelId: string): number {
+    const changed = this.db
+      .prepare("UPDATE channels SET activity_sequence = activity_sequence + 1 WHERE id = ?")
+      .run(channelId);
+    if (changed.changes !== 1) throw Object.assign(new Error("Channel not found"), { status: 404 });
+    const row = this.db
+      .prepare("SELECT activity_sequence FROM channels WHERE id = ?")
+      .get(channelId) as SqlRow | undefined;
+    if (typeof row?.activity_sequence !== "number") {
+      throw new Error("could not allocate Channel activity sequence");
+    }
+    return row.activity_sequence;
   }
 
   private transaction<T>(action: () => T): T {

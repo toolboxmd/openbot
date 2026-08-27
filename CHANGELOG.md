@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.8.0] - 2026-08-27
+
+### Added
+
+- Complete flat replies, message actions, Working state, interruption, and transcript scrolling
+
 ## [0.7.0] - 2026-08-27
 
 ### Added

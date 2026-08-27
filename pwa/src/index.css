@@ -244,23 +244,6 @@
   animation: openbot-dialog-in var(--motion-entrance) var(--motion-easing);
 }
 
-@keyframes openbot-typing {
-  0%,
-  70%,
-  100% {
-    opacity: 0.28;
-    transform: translateY(0);
-  }
-  35% {
-    opacity: 1;
-    transform: translateY(-2px);
-  }
-}
-
-.openbot-typing-dot {
-  animation: openbot-typing 1.05s ease-in-out infinite;
-}
-
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -269,11 +252,6 @@
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
-  }
-
-  .openbot-typing-dot {
-    animation: none;
-    opacity: 0.65;
   }
 }
 

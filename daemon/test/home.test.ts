@@ -35,6 +35,32 @@ function modeOf(path: string): number {
 }
 
 describe("HomeStore sqlite", () => {
+  test("indexes the monotonic activity cursor used by inbox summaries and migrations", async () => {
+    const homeDir = await tempHome();
+    const databasePath = join(homeDir, "talk.sqlite");
+    const fresh = new HomeStore(homeDir);
+    fresh.close();
+
+    const seed = new DatabaseSync(databasePath);
+    seed.exec(`
+      DROP INDEX IF EXISTS messages_channel_activity;
+      PRAGMA user_version = 3;
+    `);
+    seed.close();
+
+    const migrated = new HomeStore(homeDir);
+    migrated.close();
+    const probe = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const columns = probe
+        .prepare("PRAGMA index_info(messages_channel_activity)")
+        .all() as Array<{ name?: string }>;
+      assert.deepEqual(columns.map((column) => column.name), ["channel_id", "activity_sequence"]);
+    } finally {
+      probe.close();
+    }
+  });
+
   test("Channel activity exposes only safe text and persists the human read cursor", async () => {
     const homeDir = await tempHome();
     const adaId = crypto.randomUUID();
@@ -153,8 +179,15 @@ describe("HomeStore sqlite", () => {
     home.markChannelRead(channelId, latest, iso(4000));
     assert.equal(home.channelActivity(channelId).unread, false);
 
-    home.updateMessageText(firstId, "first chunk, completed later");
-    assert.equal(home.channelActivity(channelId).unread, false, "older completed bubbles stay behind the cursor");
+    home.updateMessageText(firstId, "first chunk, completed later", iso(4500));
+    assert.deepEqual(home.channelActivity(channelId), {
+      latestText: "first chunk, completed later",
+      lastActivityAt: iso(4500),
+      unread: true,
+      cursor: { sequence: 3, revision: 2 },
+    }, "an earlier visible revision owns new Channel activity after the read cursor advanced");
+    home.markChannelRead(channelId, { sequence: 3, revision: 2 }, iso(4750));
+    assert.equal(home.channelActivity(channelId).unread, false);
 
     const streamingId = crypto.randomUUID();
     home.appendMessage(channelId, {
@@ -168,6 +201,100 @@ describe("HomeStore sqlite", () => {
     home.markChannelRead(channelId, streaming, iso(6000));
     home.updateMessageText(streamingId, "streaming completed");
     assert.equal(home.channelActivity(channelId).unread, true, "a later revision is new activity");
+    home.close();
+  });
+
+  test("resumed assistant content after a read Host-grant Card owns new activity", async () => {
+    const homeDir = await tempHome();
+    const adaId = crypto.randomUUID();
+    const channelId = crypto.randomUUID();
+    const assistantId = crypto.randomUUID();
+    const home = new HomeStore(homeDir);
+    home.createBot(
+      {
+        id: adaId,
+        name: "Ada",
+        color: "#ff3b5c",
+        shape: "capsule",
+        harness: null,
+        createdAt: iso(),
+      },
+      channelId,
+    );
+    home.appendMessage(channelId, {
+      id: assistantId,
+      role: "assistant",
+      text: "Before permission.",
+      createdAt: iso(1000),
+      senderId: adaId,
+    });
+    home.appendMessage(channelId, {
+      id: crypto.randomUUID(),
+      role: "user",
+      kind: "host-grant",
+      text: "Read · once\n/tmp/outside.txt",
+      createdAt: iso(2000),
+      senderId: HUMAN_MEMBER_ID,
+    });
+
+    const throughCard = home.channelActivity(channelId).cursor;
+    assert.deepEqual(throughCard, { sequence: 2, revision: 1 });
+    home.markChannelRead(channelId, throughCard, iso(2500));
+    assert.equal(home.channelActivity(channelId).unread, false);
+
+    home.updateMessageText(assistantId, "Before permission. After permission.", iso(3000));
+    assert.deepEqual(home.channelActivity(channelId), {
+      latestText: "Before permission. After permission.",
+      lastActivityAt: iso(3000),
+      unread: true,
+      cursor: { sequence: 3, revision: 2 },
+    });
+    home.markChannelRead(channelId, { sequence: 3, revision: 2 }, iso(3500));
+    assert.equal(home.channelActivity(channelId).unread, false);
+    home.close();
+  });
+
+  test("Channel activity sequence does not reuse an interrupted partial's position", async () => {
+    const homeDir = await tempHome();
+    const adaId = crypto.randomUUID();
+    const channelId = crypto.randomUUID();
+    const partialId = crypto.randomUUID();
+    const home = new HomeStore(homeDir);
+    home.createBot(
+      {
+        id: adaId,
+        name: "Ada",
+        color: "#ff3b5c",
+        shape: "capsule",
+        harness: null,
+        createdAt: iso(),
+      },
+      channelId,
+    );
+    home.appendMessage(channelId, {
+      id: crypto.randomUUID(),
+      role: "user",
+      text: "Start",
+      createdAt: iso(1000),
+      senderId: HUMAN_MEMBER_ID,
+    });
+    home.appendMessage(channelId, {
+      id: partialId,
+      role: "assistant",
+      text: "unfinished",
+      createdAt: iso(2000),
+      senderId: adaId,
+    });
+    assert.equal(home.deleteMessage(partialId), true);
+    home.appendMessage(channelId, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: "replacement",
+      createdAt: iso(3000),
+      senderId: adaId,
+    });
+
+    assert.deepEqual(home.channelActivity(channelId).cursor, { sequence: 3, revision: 1 });
     home.close();
   });
 
@@ -297,7 +424,7 @@ describe("HomeStore sqlite", () => {
     try {
       const version = probe.prepare("PRAGMA user_version").get() as { user_version?: number };
       assert.equal(version.user_version, HOME_SCHEMA_VERSION);
-      assert.equal(HOME_SCHEMA_VERSION, 3);
+      assert.equal(HOME_SCHEMA_VERSION, 4);
       const table = probe
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'channel_reads'")
         .get() as { name?: string } | undefined;

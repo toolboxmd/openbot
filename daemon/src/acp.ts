@@ -23,6 +23,7 @@ export type PermissionPrompt = {
 export type AssistantDelta = {
   start?: boolean;
   done?: boolean;
+  messageId?: string;
 };
 
 export type AcpHandlers = {
@@ -89,6 +90,10 @@ export class AcpClient {
   private generation = 0;
   private activeGen = 0;
   private promptId: RpcId | null = null;
+  private activeHandlers: AcpHandlers | null = null;
+  private promptDrain: Promise<void> | null = null;
+  private abortPrompt: (() => void) | null = null;
+  private pendingPermissions = new Map<RpcId, number>();
   readonly spec: SpawnSpec;
 
   constructor(
@@ -140,6 +145,27 @@ export class AcpClient {
     return new Promise((resolve) => this.idleResolvers.push(resolve));
   }
 
+  private cancelPermission(rpcId: RpcId): void {
+    this.pendingPermissions.delete(rpcId);
+    this.send({
+      jsonrpc: "2.0",
+      id: rpcId,
+      result: { outcome: { outcome: "cancelled" } },
+    });
+  }
+
+  private finishStreamingMessage(): void {
+    if (!this.streaming) return;
+    this.streaming = false;
+    const text = this.messageText;
+    if (text) {
+      (this.activeHandlers ?? this.handlers).onAssistant?.(text, {
+        done: true,
+        ...(this.openMessageId ? { messageId: this.openMessageId } : {}),
+      });
+    }
+  }
+
   private onLine(line: string): void {
     const trimmed = line.trim();
     if (!trimmed) return;
@@ -165,6 +191,12 @@ export class AcpClient {
       return;
     }
     if (msg.method === "session/request_permission") {
+      if (msg.id === undefined) return;
+      const rpcId = msg.id as RpcId;
+      if (this.activeGen !== this.generation) {
+        this.cancelPermission(rpcId);
+        return;
+      }
       const params = (msg.params ?? {}) as {
         title?: string;
         toolCall?: {
@@ -177,8 +209,14 @@ export class AcpClient {
         options?: Array<{ optionId: string; name: string; kind?: string }>;
         _meta?: unknown;
       };
-      this.handlers.onPermission?.({
-        rpcId: msg.id as RpcId,
+      const handler = (this.activeHandlers ?? this.handlers).onPermission;
+      this.pendingPermissions.set(rpcId, this.activeGen);
+      if (!handler) {
+        this.cancelPermission(rpcId);
+        return;
+      }
+      handler({
+        rpcId,
         title: params.title ?? params.toolCall?.title ?? "Allow this tool?",
         description: params.description ?? params.toolCall?.title,
         options: Array.isArray(params.options) ? params.options : [],
@@ -212,12 +250,22 @@ export class AcpClient {
       if (!piece) return;
       const messageId = readMessageId(update);
       const start = messageId !== undefined ? shouldStartBubble(this.openMessageId, messageId) : !this.streaming;
-      if (start) this.messageText = "";
+      if (start) {
+        this.messageText = "";
+        if (messageId === undefined) this.openMessageId = null;
+      }
       if (messageId !== undefined) this.openMessageId = messageId;
       this.streaming = true;
       this.messageText += piece;
       this.turnText += piece;
-      this.handlers.onAssistant?.(this.messageText, start ? { start: true } : undefined);
+      (this.activeHandlers ?? this.handlers).onAssistant?.(
+        this.messageText,
+        messageId !== undefined
+          ? { ...(start ? { start: true } : {}), messageId }
+          : start
+            ? { start: true }
+            : undefined,
+      );
       return;
     }
     if (kind === "agent_message") {
@@ -227,18 +275,22 @@ export class AcpClient {
       this.messageText = piece;
       this.turnText += piece;
       const messageId = readMessageId(update);
-      if (messageId !== undefined) this.openMessageId = messageId;
-      this.handlers.onAssistant?.(piece, { start: true, done: true });
+      this.openMessageId = messageId ?? null;
+      (this.activeHandlers ?? this.handlers).onAssistant?.(piece, {
+        start: true,
+        done: true,
+        ...(messageId !== undefined ? { messageId } : {}),
+      });
       return;
     }
     if (kind === "tool_call" || kind === "agent_thought_chunk") {
-      this.streaming = false;
+      this.finishStreamingMessage();
       return;
     }
     if (kind === "state_update") {
       if (update.state === "idle") {
+        this.finishStreamingMessage();
         this.gotIdle = true;
-        this.streaming = false;
         for (const resolve of this.idleResolvers) resolve();
         this.idleResolvers = [];
       }
@@ -296,9 +348,15 @@ export class AcpClient {
     return id;
   }
 
-  async prompt(text: string): Promise<string> {
+  async prompt(text: string, handlers?: AcpHandlers): Promise<string> {
     if (!this.sessionId) throw new Error("no ACP session");
-    this.activeGen = ++this.generation;
+    const myGen = ++this.generation;
+    const priorDrain = this.promptDrain;
+    if (priorDrain) await priorDrain;
+    if (myGen !== this.generation) throw cancelledError();
+    this.activeGen = myGen;
+    const promptHandlers = handlers ?? this.handlers;
+    this.activeHandlers = promptHandlers;
     this.turnText = "";
     this.messageText = "";
     this.streaming = false;
@@ -309,6 +367,16 @@ export class AcpClient {
     const rpc = new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
     });
+    const drain = rpc.then(() => undefined, () => undefined);
+    this.promptDrain = drain;
+    void drain.then(() => {
+      if (this.promptDrain === drain) this.promptDrain = null;
+    });
+    let abortPrompt!: () => void;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      abortPrompt = () => reject(cancelledError());
+    });
+    this.abortPrompt = abortPrompt;
     const payload = `${JSON.stringify({
       jsonrpc: "2.0",
       id,
@@ -326,22 +394,23 @@ export class AcpClient {
         else resolve();
       });
     });
-    const myGen = this.activeGen;
-    this.handlers.onPromptWritten?.();
+    promptHandlers.onPromptWritten?.();
     await flushed;
     if (myGen !== this.generation) {
       throw cancelledError();
     }
-    this.handlers.onPromptFlushed?.();
+    promptHandlers.onPromptFlushed?.();
     try {
-      const result = (await rpc) as { stopReason?: string } | undefined;
+      const result = (await Promise.race([rpc, aborted])) as { stopReason?: string } | undefined;
       if (!this.gotIdle && !(result && result.stopReason)) {
         await this.waitIdle();
       }
-      this.streaming = false;
+      this.finishStreamingMessage();
       return this.turnText;
     } finally {
       if (this.promptId === id) this.promptId = null;
+      if (this.abortPrompt === abortPrompt) this.abortPrompt = null;
+      if (this.activeGen === myGen) this.activeHandlers = null;
     }
   }
 
@@ -351,16 +420,18 @@ export class AcpClient {
     this.messageText = "";
     this.turnText = "";
     this.openMessageId = null;
+    this.activeHandlers = null;
+    const abort = this.abortPrompt;
+    this.abortPrompt = null;
+    abort?.();
     this.gotIdle = true;
     for (const resolve of this.idleResolvers) resolve();
     this.idleResolvers = [];
     if (this.promptId !== null) {
-      const pending = this.pending.get(this.promptId);
-      if (pending) {
-        this.pending.delete(this.promptId);
-        pending.reject(cancelledError());
-      }
       this.promptId = null;
+    }
+    for (const [rpcId, permissionGen] of this.pendingPermissions) {
+      if (permissionGen === this.activeGen) this.cancelPermission(rpcId);
     }
     if (this.sessionId) {
       this.send({
@@ -372,6 +443,7 @@ export class AcpClient {
   }
 
   respondPermission(rpcId: RpcId, optionId: string): void {
+    this.pendingPermissions.delete(rpcId);
     this.send({
       jsonrpc: "2.0",
       id: rpcId,

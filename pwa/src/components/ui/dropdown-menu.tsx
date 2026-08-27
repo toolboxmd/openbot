@@ -4,6 +4,7 @@ import { cn } from "@/lib/utils";
 
 const DropdownMenu = DropdownMenuPrimitive.Root;
 const DropdownMenuTrigger = DropdownMenuPrimitive.Trigger;
+const DropdownMenuItemIndicator = DropdownMenuPrimitive.ItemIndicator;
 
 function DropdownMenuContent({
   className,
@@ -39,4 +40,26 @@ function DropdownMenuItem({
   );
 }
 
-export { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger };
+function DropdownMenuCheckboxItem({
+  className,
+  ...props
+}: React.ComponentProps<typeof DropdownMenuPrimitive.CheckboxItem>) {
+  return (
+    <DropdownMenuPrimitive.CheckboxItem
+      className={cn(
+        "flex min-h-10 cursor-default select-none items-center gap-2 rounded-[var(--radius-control)] px-3 py-2 text-sm outline-none data-[disabled]:pointer-events-none data-[highlighted]:bg-muted data-[state=checked]:bg-muted data-[disabled]:opacity-50 max-[47.999rem]:min-h-[var(--touch-min)] [&_svg]:pointer-events-none [&_svg]:size-[var(--icon-default)] [&_svg]:shrink-0 [&_svg]:[stroke-width:var(--icon-stroke)]",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+export {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuItemIndicator,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+};

@@ -113,7 +113,7 @@ export type AcpSession = {
   newSession(cwd: string): Promise<string>;
   loadSession?(sessionId: string): Promise<unknown>;
   resumeSession?(sessionId: string): Promise<unknown>;
-  prompt(text: string): Promise<string>;
+  prompt(text: string, handlers?: AcpHandlers): Promise<string>;
   cancel(): void;
   respondPermission(rpcId: PermissionPrompt["rpcId"], optionId: string): void;
 };
@@ -134,6 +134,8 @@ type Bot = {
   needsYou: { reason: "login"; hint: string } | null;
   permission: BotPermission | null;
   openAssistantId: string | null;
+  openAssistantCheckpoint: { id: string; text: string } | null;
+  assistantMessageIds: Map<string, string>;
   activeUserId: string | null;
   turnSeq: number;
   client: AcpSession | null;
@@ -411,10 +413,12 @@ export class BotStore {
     }
 
     const channelId = this.channelId(bot.id);
-    const prior = this.home.listMessages(channelId);
-    const replyTarget = this.resolveReplyTarget(prior, replyTo);
+    const beforeInterrupt = this.home.listMessages(channelId);
+    const replyTarget = this.resolveReplyTarget(beforeInterrupt, replyTo);
+    if (bot.write && bot.openAssistantId && replyTarget?.id === bot.openAssistantId) {
+      throw Object.assign(new Error("cannot reply to an unfinished response"), { status: 409 });
+    }
     const attached = await this.ensureClient(bot);
-    const history = attached.skipHistory ? "" : channelHistory(prior, bot.name);
     const client = attached.client;
 
     if (bot.write) {
@@ -423,7 +427,20 @@ export class BotStore {
       } catch {
         /* local cancel still proceeds */
       }
+      if (bot.openAssistantId) {
+        if (bot.openAssistantCheckpoint?.id === bot.openAssistantId) {
+          this.home.updateMessageText(bot.openAssistantId, bot.openAssistantCheckpoint.text);
+        } else {
+          this.home.deleteMessage(bot.openAssistantId);
+        }
+      }
+      bot.openAssistantId = null;
+      bot.openAssistantCheckpoint = null;
     }
+    bot.assistantMessageIds.clear();
+
+    const prior = this.home.listMessages(channelId);
+    const history = attached.skipHistory ? "" : channelHistory(prior, bot.name);
 
     bot.turnSeq += 1;
     const turnSeq = bot.turnSeq;
@@ -442,13 +459,31 @@ export class BotStore {
     });
     bot.activeUserId = userMessage.id;
     bot.openAssistantId = null;
+    bot.openAssistantCheckpoint = null;
     bot.write = true;
     bot.eyesMode = "write";
     bot.permission = null;
 
     void (async () => {
       try {
-        const reply = await client.prompt(talkPrompt(trimmed, replyTarget?.text, history));
+        const reply = await client.prompt(talkPrompt(trimmed, replyTarget?.text, history), {
+          onPermission: (prompt) => {
+            if (turnSeq !== bot.turnSeq) return;
+            this.handlePermission(bot, client, prompt);
+          },
+          onAssistant: (assistantText, delta) => {
+            if (turnSeq !== bot.turnSeq) return;
+            this.applyAssistant(bot, channelId, assistantText, delta);
+          },
+          onPromptWritten: () => {
+            if (turnSeq !== bot.turnSeq) return;
+            this.setUserReceipt(bot, channelId, "delivered");
+          },
+          onPromptFlushed: () => {
+            if (turnSeq !== bot.turnSeq) return;
+            this.setUserReceipt(bot, channelId, "read");
+          },
+        });
         if (turnSeq !== bot.turnSeq) return;
         const messages = this.home.listMessages(channelId);
         const userIdx = messages.findIndex((item) => item.id === userMessage.id);
@@ -467,6 +502,8 @@ export class BotStore {
       } finally {
         if (turnSeq !== bot.turnSeq) return;
         bot.openAssistantId = null;
+        bot.openAssistantCheckpoint = null;
+        bot.assistantMessageIds.clear();
         bot.activeUserId = null;
         bot.write = false;
         if (bot.eyesMode === "write") bot.eyesMode = bot.needsYou ? "needs-you" : "idle";
@@ -546,6 +583,8 @@ export class BotStore {
       needsYou: null,
       permission: null,
       openAssistantId: null,
+      openAssistantCheckpoint: null,
+      assistantMessageIds: new Map(),
       activeUserId: null,
       turnSeq: 0,
       client: null,
@@ -675,6 +714,7 @@ export class BotStore {
 
   private pushAssistant(bot: Bot, channelId: string, text: string): void {
     bot.openAssistantId = null;
+    bot.openAssistantCheckpoint = null;
     const message: PublicMessage = {
       id: crypto.randomUUID(),
       role: "assistant",
@@ -686,6 +726,22 @@ export class BotStore {
 
   private applyAssistant(bot: Bot, channelId: string, text: string, delta?: AssistantDelta): void {
     const capped = capTalkBubble(text);
+    const protocolMessageId = delta?.messageId;
+    const existingMessageId = protocolMessageId
+      ? bot.assistantMessageIds.get(protocolMessageId)
+      : undefined;
+    if (existingMessageId) {
+      if (!delta?.done && bot.openAssistantId !== existingMessageId) {
+        const completed = this.home.getMessage(channelId, existingMessageId);
+        bot.openAssistantCheckpoint = completed
+          ? { id: existingMessageId, text: completed.text }
+          : null;
+      }
+      this.home.updateMessageText(existingMessageId, capped);
+      bot.openAssistantId = delta?.done ? null : existingMessageId;
+      if (delta?.done) bot.openAssistantCheckpoint = null;
+      return;
+    }
     const startNew = Boolean(delta?.start) || !bot.openAssistantId;
     if (startNew) {
       const id = crypto.randomUUID();
@@ -697,10 +753,15 @@ export class BotStore {
         senderId: bot.id,
       });
       bot.openAssistantId = id;
+      bot.openAssistantCheckpoint = null;
+      if (protocolMessageId) bot.assistantMessageIds.set(protocolMessageId, id);
     } else if (bot.openAssistantId) {
       this.home.updateMessageText(bot.openAssistantId, capped);
     }
-    if (delta?.done) bot.openAssistantId = null;
+    if (delta?.done) {
+      bot.openAssistantId = null;
+      bot.openAssistantCheckpoint = null;
+    }
   }
 
   private setUserReceipt(bot: Bot, channelId: string, next: MessageReceipt): void {
@@ -717,6 +778,7 @@ export class BotStore {
     if (bot.openAssistantId) {
       this.home.updateMessageText(bot.openAssistantId, text);
       bot.openAssistantId = null;
+      bot.openAssistantCheckpoint = null;
       return;
     }
     this.pushAssistant(bot, channelId, text);

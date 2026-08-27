@@ -106,6 +106,19 @@ describe("box HTTP session", () => {
     assert.ok(bots.ok, `session cookie should authenticate GET /api/bots, got ${bots.status}`);
   });
 
+  test("dynamic API responses cannot leave polling on a cached Working snapshot", async () => {
+    const login = await fetch(`${box.url}/api/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: PASSWORD }),
+    });
+    const bots = await fetch(`${box.url}/api/bots`, {
+      headers: { cookie: cookieHeader(login) },
+    });
+
+    assert.equal(bots.headers.get("cache-control"), "no-store");
+  });
+
   test("GET / serves the PWA HTML", async () => {
     const res = await fetch(`${box.url}/`);
     assert.equal(res.status, 200);

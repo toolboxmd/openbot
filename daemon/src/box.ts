@@ -116,6 +116,7 @@ function sendJson(
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(body),
+    "Cache-Control": "no-store",
     ...headers,
   });
   res.end(body);
