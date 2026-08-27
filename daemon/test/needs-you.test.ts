@@ -160,6 +160,7 @@ input.on("line", (line) => {
         id: 800,
         method: "session/request_permission",
         params: {
+          sessionId: "session-1",
           title: "Permission after Computer help",
           options: [
             { optionId: "allow-once", name: "Allow", kind: "allow_once" },

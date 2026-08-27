@@ -85,9 +85,13 @@ input.on("line", (line) => {
       return;
     }
     if (text === "new") {
-      setTimeout(() => send({ jsonrpc: "2.0", id: message.id, result: {} }), 5);
-      setTimeout(() => update("fresh"), 10);
-      setTimeout(idle, 14);
+      setTimeout(() => update("fresh"), 5);
+      setTimeout(idle, 10);
+      setTimeout(() => send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { stopReason: "end_turn" }
+      }), 14);
     }
     if (text === "boundary-tool") {
       chunk("Complete ", "tool-message");
@@ -239,7 +243,7 @@ describe("AcpClient cancellation boundary", () => {
     }
   });
 
-  test("rejects a permission response when the real child transport is closed", async () => {
+  test("rejects a permission response when no server request is active", async () => {
     const client = new AcpClient({
       command: process.execPath,
       args: ["-e", "process.exit(0)"],
@@ -257,7 +261,10 @@ describe("AcpClient cancellation boundary", () => {
         }
         if (!transportFailure) await new Promise((resolve) => setImmediate(resolve));
       }
-      assert.match(String((transportFailure as Error)?.message ?? transportFailure), /closed|exited|write|pipe/i);
+      assert.match(
+        String((transportFailure as Error)?.message ?? transportFailure),
+        /Permission request is no longer active/,
+      );
     } finally {
       client.close();
     }

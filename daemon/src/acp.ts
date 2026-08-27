@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import { TextDecoder } from "node:util";
 import {
   COMPUTER_HELP_COMPLETE_FIELD,
   COMPUTER_HELP_COMPLETE_VALUE,
@@ -15,6 +16,135 @@ import type { SpawnSpec } from "./harness.ts";
 
 type RpcId = number | string;
 const TERMINAL_ELICITATION_LIMIT = 128;
+const ACP_PROTOCOL_ERROR_MESSAGE = "ACP transport protocol error";
+/** ACP is newline-delimited JSON. One input frame may occupy at most 1 MiB before its newline. */
+const MAX_ACP_INPUT_LINE_BYTES = 1024 * 1024;
+/** ACP content may nest deeply enough for normal structured output without risking parser exhaustion. */
+const MAX_ACP_CONTENT_DEPTH = 256;
+/** Each startup/attach request, local prompt handoff, and cancelled-prompt drain gets 60 seconds. A flushed, uncancelled Bot Turn has no transport deadline. */
+const ACP_START_DEADLINE_MS = 60_000;
+/** A failed ACP transport gets one second after TERM before its owned process group is force-killed. */
+const ACP_TERMINATE_GRACE_MS = 1_000;
+
+function hasOwn(record: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isRpcId(value: unknown): value is RpcId {
+  return typeof value === "string"
+    || (typeof value === "number" && Number.isSafeInteger(value));
+}
+
+function isJsonRpcError(value: unknown): value is { code: number; message: string } {
+  if (!isObjectRecord(value)) return false;
+  const error = value as Record<string, unknown>;
+  return typeof error.code === "number"
+    && Number.isSafeInteger(error.code)
+    && typeof error.message === "string";
+}
+
+function isPromptResponse(value: unknown): value is { stopReason: string } {
+  return isObjectRecord(value)
+    && typeof value.stopReason === "string"
+    && value.stopReason.trim().length > 0;
+}
+
+function jsonValuesEqual(left: unknown, right: unknown): boolean {
+  const pending: Array<{ left: unknown; right: unknown }> = [{ left, right }];
+  while (pending.length > 0) {
+    const pair = pending.pop();
+    if (!pair) break;
+    if (pair.left === pair.right) continue;
+    if (
+      typeof pair.left !== "object"
+      || pair.left === null
+      || typeof pair.right !== "object"
+      || pair.right === null
+    ) {
+      return false;
+    }
+    const leftArray = Array.isArray(pair.left);
+    if (leftArray !== Array.isArray(pair.right)) return false;
+    if (leftArray) {
+      const leftItems = pair.left as unknown[];
+      const rightItems = pair.right as unknown[];
+      if (leftItems.length !== rightItems.length) return false;
+      for (let index = 0; index < leftItems.length; index += 1) {
+        pending.push({ left: leftItems[index], right: rightItems[index] });
+      }
+      continue;
+    }
+    const leftRecord = pair.left as Record<string, unknown>;
+    const rightRecord = pair.right as Record<string, unknown>;
+    const leftKeys = Object.keys(leftRecord);
+    if (leftKeys.length !== Object.keys(rightRecord).length) return false;
+    for (const key of leftKeys) {
+      if (!hasOwn(rightRecord, key)) return false;
+      pending.push({ left: leftRecord[key], right: rightRecord[key] });
+    }
+  }
+  return true;
+}
+
+function isJsonRpcEnvelope(message: Record<string, unknown>): boolean {
+  if (message.jsonrpc !== "2.0") return false;
+  const hasMethod = hasOwn(message, "method");
+  const hasResult = hasOwn(message, "result");
+  const hasError = hasOwn(message, "error");
+  const hasId = hasOwn(message, "id");
+  if (hasMethod) {
+    if (typeof message.method !== "string" || message.method.length === 0) return false;
+    if (hasResult || hasError) return false;
+    if (hasId && !isRpcId(message.id)) return false;
+    if (
+      hasOwn(message, "params")
+      && (typeof message.params !== "object" || message.params === null)
+    ) {
+      return false;
+    }
+    return true;
+  }
+  if (!hasId || !isRpcId(message.id)) return false;
+  if (hasResult === hasError || hasOwn(message, "params")) return false;
+  return !hasError || isJsonRpcError(message.error);
+}
+
+function hasValidAcpMethodRole(message: Record<string, unknown>): boolean {
+  if (
+    message.method === "session/request_permission"
+    || message.method === "elicitation/create"
+  ) {
+    return hasOwn(message, "id") && isObjectRecord(message.params);
+  }
+  if (message.method === "session/update") {
+    return !hasOwn(message, "id")
+      && isObjectRecord(message.params)
+      && typeof message.params.sessionId === "string"
+      && isObjectRecord(message.params.update);
+  }
+  return true;
+}
+
+function sanitizedRpcError(value: { code: number; message: string }): Error {
+  const message = /cancel/i.test(value.message)
+    ? "ACP request cancelled"
+    : value.code === -32_000
+      ? "ACP authentication failed"
+      : "ACP request failed";
+  return Object.assign(new Error(message), { code: value.code });
+}
+
+function startTimeoutError(): Error {
+  return Object.assign(new Error("ACP start timed out"), { code: "ACP_START_TIMEOUT" });
+}
+
+function transportFailureError(): Error {
+  return new Error("ACP transport closed");
+}
 
 type ComputerHelpGenerationState = {
   directory: string;
@@ -84,6 +214,18 @@ export function permissionOptionKind(option: PermissionOptionIdentity): Permissi
 type Pending = {
   resolve: (value: unknown) => void;
   reject: (err: Error) => void;
+  settlementQueued?: boolean;
+};
+
+type SessionAttachment = {
+  requestId: RpcId;
+  method: "session/new" | "session/load" | "session/resume";
+  sessionId: string | null;
+};
+
+type ActiveServerRequest = {
+  kind: "permission" | "elicitation";
+  generation: number;
 };
 
 export type PermissionPrompt = {
@@ -120,16 +262,39 @@ export type AcpHandlers = {
   onStderr?: (line: string) => void;
 };
 
-function extractText(content: unknown): string {
-  if (!content) return "";
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) return content.map(extractText).join("");
-  if (typeof content === "object") {
-    const c = content as Record<string, unknown>;
-    if (typeof c.text === "string") return c.text;
-    if (c.content !== undefined) return extractText(c.content);
+export type AcpClientOptions = {
+  /** Tests may shorten the production 60-second start/drain deadline without changing uncancelled Turn duration. */
+  startDeadlineMs?: number;
+  /** Tests may shorten the production TERM-to-KILL grace period. */
+  terminateGraceMs?: number;
+};
+
+function extractText(content: unknown): string | null {
+  const pieces: string[] = [];
+  const pending: Array<{ value: unknown; depth: number }> = [{ value: content, depth: 0 }];
+  while (pending.length > 0) {
+    const entry = pending.pop();
+    if (!entry) break;
+    if (entry.depth > MAX_ACP_CONTENT_DEPTH) return null;
+    if (typeof entry.value === "string") {
+      pieces.push(entry.value);
+      continue;
+    }
+    if (Array.isArray(entry.value)) {
+      for (let index = entry.value.length - 1; index >= 0; index -= 1) {
+        pending.push({ value: entry.value[index], depth: entry.depth + 1 });
+      }
+      continue;
+    }
+    if (typeof entry.value !== "object" || entry.value === null) continue;
+    const record = entry.value as Record<string, unknown>;
+    if (typeof record.text === "string") {
+      pieces.push(record.text);
+    } else if (record.content !== undefined) {
+      pending.push({ value: record.content, depth: entry.depth + 1 });
+    }
   }
-  return "";
+  return pieces.join("");
 }
 
 export function isAuthError(err: unknown): boolean {
@@ -150,6 +315,10 @@ export function computerHelpResponseWasFlushed(err: unknown): boolean {
   return (err as { responseFlushed?: unknown })?.responseFlushed === true;
 }
 
+export function cancellationClosedTransport(err: unknown): boolean {
+  return (err as { transportClosed?: unknown })?.transportClosed === true;
+}
+
 /** ACP v1 messageId is optional. Missing nextId keeps glue-by-streaming. A present id starts a bubble when it differs from the open one. */
 export function shouldStartBubble(prevId: string | null, nextId: string | undefined): boolean {
   if (nextId == null || nextId === "") return false;
@@ -161,14 +330,19 @@ function readMessageId(update: Record<string, unknown>): string | undefined {
   return typeof raw === "string" && raw.length > 0 ? raw : undefined;
 }
 
-function cancelledError(): Error {
-  return Object.assign(new Error("cancelled"), { code: "cancelled" });
+function cancelledError(transportClosed = false): Error {
+  return Object.assign(new Error("cancelled"), {
+    code: "cancelled",
+    ...(transportClosed ? { transportClosed: true } : {}),
+  });
 }
 
 export class AcpClient {
   private child: ChildProcessWithoutNullStreams;
   private nextId = 1;
   private pending = new Map<RpcId, Pending>();
+  private pendingWriteRejectors = new Set<(error: Error) => void>();
+  private stdoutBuffer = Buffer.alloc(0);
   private closed = false;
   private transportError: Error | null = null;
   private sessionId: string | null = null;
@@ -182,13 +356,23 @@ export class AcpClient {
   private generation = 0;
   private activeGen = 0;
   private promptId: RpcId | null = null;
+  private promptHandoffPending = false;
   private activeHandlers: AcpHandlers | null = null;
   private promptDrain: Promise<void> | null = null;
+  private cancelledPromptDrain: {
+    promptId: RpcId;
+    resolve: () => void;
+    reject: (error: Error) => void;
+    timer: NodeJS.Timeout;
+  } | null = null;
   private abortPrompt: (() => void) | null = null;
-  private pendingPermissions = new Map<RpcId, number>();
+  private sessionAttachment: SessionAttachment | null = null;
+  private activeServerRequests = new Map<RpcId, ActiveServerRequest>();
+  private pendingPermissions = new Map<RpcId, { generation: number; responding: boolean }>();
   private pendingComputerHelp = new Map<RpcId, {
     generation: number;
     prompt: ComputerHelpPrompt;
+    requestParams: Record<string, unknown>;
     handlers: AcpHandlers;
     responding: boolean;
   }>();
@@ -200,44 +384,63 @@ export class AcpClient {
   private computerHelpGenerationStateClosed = false;
   private readonly computerHelpIdentity = crypto.randomBytes(32).toString("base64url");
   private readonly mcpServers: ComputerHelpMcpServer[];
+  private readonly startDeadlineMs: number;
+  private readonly terminateGraceMs: number;
+  private forceKillTimer: NodeJS.Timeout | null = null;
+  private childExited = false;
+  private readonly ownedProcessGroupId: number | null;
   readonly spec: SpawnSpec;
 
   constructor(
     spec: SpawnSpec,
     private cwd: string,
     private handlers: AcpHandlers = {},
+    options: AcpClientOptions = {},
   ) {
     this.spec = spec;
+    this.startDeadlineMs = options.startDeadlineMs ?? ACP_START_DEADLINE_MS;
+    this.terminateGraceMs = options.terminateGraceMs ?? ACP_TERMINATE_GRACE_MS;
+    if (
+      !Number.isFinite(this.startDeadlineMs)
+      || this.startDeadlineMs <= 0
+      || !Number.isFinite(this.terminateGraceMs)
+      || this.terminateGraceMs <= 0
+    ) {
+      this.closeComputerHelpGenerationState();
+      throw new TypeError("ACP transport deadlines must be positive durations");
+    }
     this.mcpServers = [computerHelpMcpServer(
       this.computerHelpIdentity,
       this.computerHelpGenerationState.file,
     )];
     const childEnv = { ...spec.env };
     delete childEnv.APP_SERVER_LOGS;
+    const ownsProcessGroup = process.platform !== "win32";
     this.child = spawn(spec.command, spec.args, {
       cwd,
       env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
+      detached: ownsProcessGroup,
     });
-    const out = readline.createInterface({ input: this.child.stdout });
-    out.on("line", (line) => this.onLine(line));
+    this.ownedProcessGroupId = ownsProcessGroup ? (this.child.pid ?? null) : null;
+    this.child.stdout.on("data", (chunk: Buffer) => this.onStdoutData(chunk));
     const err = readline.createInterface({ input: this.child.stderr });
     err.on("line", (line) => this.handlers.onStderr?.(line));
-    this.child.stdin.on("error", (writeError) => {
-      this.transportError = writeError;
-      this.failAll(writeError);
+    this.child.stdin.on("error", () => {
+      this.failTransport(transportFailureError());
     });
-    this.child.on("error", (err) => {
-      this.transportError = err;
-      this.failAll(err);
-      this.closeComputerHelpGenerationState();
+    this.child.on("error", () => {
+      this.failTransport(transportFailureError());
     });
-    this.child.on("exit", () => {
-      const err = new Error("ACP child exited");
-      this.transportError = err;
-      this.failAll(err);
-      this.closeComputerHelpGenerationState();
+    this.child.once("exit", () => {
+      this.childExited = true;
+      if (!this.ownedProcessGroupExists()) this.clearForceKillTimer();
+      this.failTransport(new Error("ACP child exited"));
+    });
+    this.child.once("close", () => {
+      this.childExited = true;
+      if (!this.ownedProcessGroupExists()) this.clearForceKillTimer();
     });
   }
 
@@ -246,7 +449,12 @@ export class AcpClient {
   }
 
   private send(obj: unknown): void {
-    this.child.stdin.write(`${JSON.stringify(obj)}\n`);
+    if (this.transportError || this.closed || this.child.stdin.destroyed) return;
+    try {
+      this.child.stdin.write(`${JSON.stringify(obj)}\n`);
+    } catch {
+      this.failTransport(transportFailureError());
+    }
   }
 
   private sendConfirmed(obj: unknown, onFlushed?: () => void): Promise<void> {
@@ -255,28 +463,81 @@ export class AcpClient {
       return Promise.reject(new Error("ACP transport is closed"));
     }
     return new Promise((resolve, reject) => {
-      this.child.stdin.write(`${JSON.stringify(obj)}\n`, (err) => {
-        if (err) reject(err);
-        else {
+      let settled = false;
+      const rejectWrite = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        this.pendingWriteRejectors.delete(rejectWrite);
+        reject(error);
+      };
+      this.pendingWriteRejectors.add(rejectWrite);
+      try {
+        this.child.stdin.write(`${JSON.stringify(obj)}\n`, (err) => {
+          if (settled) return;
+          if (err) {
+            this.failTransport(transportFailureError());
+            return;
+          }
+          settled = true;
+          this.pendingWriteRejectors.delete(rejectWrite);
           try {
             onFlushed?.();
             resolve();
-          } catch (flushError) {
-            const error = flushError instanceof Error
-              ? flushError
-              : new Error(String(flushError));
-            reject(Object.assign(error, { responseFlushed: true }));
+          } catch {
+            reject(Object.assign(new Error("ACP response handoff failed"), {
+              responseFlushed: true,
+            }));
           }
-        }
-      });
+        });
+      } catch {
+        this.failTransport(transportFailureError());
+      }
     });
   }
 
+  private rejectPendingWrites(error: Error): void {
+    for (const reject of this.pendingWriteRejectors) reject(error);
+    this.pendingWriteRejectors.clear();
+  }
+
   private request(method: string, params: unknown): Promise<unknown> {
+    if (this.transportError) return Promise.reject(this.transportError);
+    if (this.closed || this.child.stdin.destroyed) {
+      return Promise.reject(new Error("ACP transport is closed"));
+    }
     const id = this.nextId++;
-    return new Promise((resolve, reject) => {
+    const response = new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       this.send({ jsonrpc: "2.0", id, method, params });
+    });
+    return this.withStartDeadline(response);
+  }
+
+  private withStartDeadline<T>(operation: Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        const error = startTimeoutError();
+        this.failTransport(error);
+        reject(error);
+      }, this.startDeadlineMs);
+      timer.unref();
+      operation.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
     });
   }
 
@@ -288,17 +549,246 @@ export class AcpClient {
     this.cancelComputerHelpWhere(() => true, false);
   }
 
+  private failTransport(err: Error): void {
+    if (this.transportError) return;
+    this.transportError = err;
+    this.closed = true;
+    this.stdoutBuffer = Buffer.alloc(0);
+    this.rejectPendingWrites(err);
+    this.failAll(err);
+    this.generation += 1;
+    this.activeGen = this.generation;
+    this.sessionId = null;
+    this.sessionAttachment = null;
+    this.promptId = null;
+    this.promptHandoffPending = false;
+    this.finishCancelledPromptDrain(undefined, err);
+    this.promptDrain = null;
+    this.abortPrompt = null;
+    this.activeHandlers = null;
+    this.pendingPermissions.clear();
+    this.activeServerRequests.clear();
+    this.resetElicitationLifecycle();
+    this.streaming = false;
+    this.turnText = "";
+    this.messageText = "";
+    this.openMessageId = null;
+    this.nonTextBoundary = false;
+    this.gotIdle = true;
+    this.closeComputerHelpGenerationState();
+    this.terminateChild();
+  }
+
+  private clearForceKillTimer(): void {
+    if (!this.forceKillTimer) return;
+    clearTimeout(this.forceKillTimer);
+    this.forceKillTimer = null;
+  }
+
+  private terminateChild(): void {
+    if (this.forceKillTimer) return;
+    const groupId = this.ownedProcessGroupId;
+    const child = this.child;
+    if (
+      groupId === null
+      && (this.childExited || child.exitCode !== null || child.signalCode !== null)
+    ) {
+      return;
+    }
+    if (groupId !== null && !this.ownedProcessGroupExists(groupId)) return;
+    this.signalOwnedTransport("SIGTERM", child, groupId);
+    if (
+      groupId === null
+      && (this.childExited || child.exitCode !== null || child.signalCode !== null)
+    ) {
+      return;
+    }
+    if (groupId !== null && !this.ownedProcessGroupExists(groupId)) return;
+    const timer = setTimeout(() => {
+      if (this.forceKillTimer === timer) this.forceKillTimer = null;
+      if (this.child !== child || this.ownedProcessGroupId !== groupId) return;
+      if (
+        groupId === null
+        && (this.childExited || child.exitCode !== null || child.signalCode !== null)
+      ) {
+        return;
+      }
+      if (groupId !== null && !this.ownedProcessGroupExists(groupId)) return;
+      this.signalOwnedTransport("SIGKILL", child, groupId);
+    }, this.terminateGraceMs);
+    this.forceKillTimer = timer;
+    timer.unref();
+  }
+
+  private signalOwnedTransport(
+    signal: NodeJS.Signals,
+    child: ChildProcessWithoutNullStreams,
+    groupId: number | null,
+  ): void {
+    if (groupId !== null && groupId > 0) {
+      try {
+        // A detached POSIX child is the leader of this exact owned process group.
+        process.kill(-groupId, signal);
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      }
+    }
+    try {
+      child.kill(signal);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private ownedProcessGroupExists(groupId = this.ownedProcessGroupId): boolean {
+    if (groupId === null || groupId <= 0) return false;
+    try {
+      process.kill(-groupId, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  }
+
   private waitIdle(): Promise<void> {
     if (this.gotIdle) return Promise.resolve();
     return new Promise((resolve) => this.idleResolvers.push(resolve));
   }
 
+  private beginCancelledPromptDrain(promptId: RpcId): void {
+    this.finishCancelledPromptDrain();
+    let resolve!: () => void;
+    let reject!: (error: Error) => void;
+    const drain = new Promise<void>((done, fail) => {
+      resolve = done;
+      reject = fail;
+    });
+    const timer = setTimeout(() => {
+      if (this.cancelledPromptDrain?.promptId !== promptId) return;
+      this.failTransport(cancelledError(true));
+    }, this.startDeadlineMs);
+    timer.unref();
+    this.cancelledPromptDrain = { promptId, resolve, reject, timer };
+    this.promptDrain = drain;
+    void drain.then(
+      () => {
+        if (this.promptDrain === drain) this.promptDrain = null;
+      },
+      () => {
+        if (this.promptDrain === drain) this.promptDrain = null;
+      },
+    );
+  }
+
+  private finishCancelledPromptDrain(promptId?: RpcId, error?: Error): boolean {
+    const drain = this.cancelledPromptDrain;
+    if (!drain || (promptId !== undefined && drain.promptId !== promptId)) return false;
+    this.cancelledPromptDrain = null;
+    clearTimeout(drain.timer);
+    if (error) drain.reject(error);
+    else drain.resolve();
+    return true;
+  }
+
+  private hasActivePromptMessageWindow(): boolean {
+    if (this.cancelledPromptDrain) return true;
+    if (this.promptId === null || this.activeGen !== this.generation) return false;
+    const pending = this.pending.get(this.promptId);
+    return pending !== undefined && !pending.settlementQueued;
+  }
+
+  private claimServerRequest(
+    rpcId: RpcId,
+    kind: ActiveServerRequest["kind"],
+    requestParams?: Record<string, unknown>,
+  ): boolean {
+    const active = this.activeServerRequests.get(rpcId);
+    if (active) {
+      const computerHelp = this.pendingComputerHelp.get(rpcId);
+      if (
+        kind === "elicitation"
+        && active.kind === "elicitation"
+        && computerHelp?.generation === active.generation
+        && requestParams !== undefined
+        && jsonValuesEqual(computerHelp.requestParams, requestParams)
+      ) {
+        return false;
+      }
+      this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+      return false;
+    }
+    this.activeServerRequests.set(rpcId, { kind, generation: this.activeGen });
+    return true;
+  }
+
+  private releaseServerRequest(
+    rpcId: RpcId,
+    kind: ActiveServerRequest["kind"],
+    generation: number,
+  ): void {
+    const active = this.activeServerRequests.get(rpcId);
+    if (active?.kind === kind && active.generation === generation) {
+      this.activeServerRequests.delete(rpcId);
+    }
+  }
+
+  private hasPendingPermission(generation: number): boolean {
+    for (const pending of this.pendingPermissions.values()) {
+      if (pending.generation === generation) return true;
+    }
+    return false;
+  }
+
+  private inboundSessionId(): string | null {
+    return this.sessionAttachment?.sessionId ?? this.sessionId;
+  }
+
+  private stageSessionAttachmentResponse(
+    rpcId: RpcId,
+    message: Record<string, unknown>,
+  ): boolean {
+    const attachment = this.sessionAttachment;
+    if (!attachment || attachment.requestId !== rpcId || hasOwn(message, "error")) return true;
+    const result = message.result;
+    const record = isObjectRecord(result) ? result : null;
+    const returnedId = record?.sessionId ?? record?.session_id;
+    if (attachment.method === "session/new") {
+      if (typeof returnedId !== "string" || returnedId.length === 0) {
+        this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+        return false;
+      }
+      attachment.sessionId = returnedId;
+      return true;
+    }
+    if (
+      returnedId !== undefined
+      && (
+        typeof returnedId !== "string"
+        || returnedId.length === 0
+        || returnedId !== attachment.sessionId
+      )
+    ) {
+      this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+      return false;
+    }
+    return true;
+  }
+
   private cancelPermission(rpcId: RpcId): void {
-    this.pendingPermissions.delete(rpcId);
-    this.send({
+    const pending = this.pendingPermissions.get(rpcId);
+    if (!pending || pending.responding) return;
+    pending.responding = true;
+    void this.sendConfirmed({
       jsonrpc: "2.0",
       id: rpcId,
       result: { outcome: { outcome: "cancelled" } },
+    }, () => {
+      if (this.pendingPermissions.get(rpcId) === pending) this.pendingPermissions.delete(rpcId);
+      this.releaseServerRequest(rpcId, "permission", pending.generation);
+    }).catch(() => {
+      const current = this.pendingPermissions.get(rpcId);
+      if (current === pending && !this.transportError) current.responding = false;
     });
   }
 
@@ -311,7 +801,12 @@ export class AcpClient {
       this.pendingComputerHelp.delete(rpcId);
       this.rememberTerminalElicitation(rpcId);
       if (respond && !this.transportError && !this.closed && !this.child.stdin.destroyed) {
-        this.send({ jsonrpc: "2.0", id: rpcId, result: { action: "cancel" } });
+        void this.sendConfirmed(
+          { jsonrpc: "2.0", id: rpcId, result: { action: "cancel" } },
+          () => this.releaseServerRequest(rpcId, "elicitation", pending.generation),
+        ).catch(() => undefined);
+      } else {
+        this.releaseServerRequest(rpcId, "elicitation", pending.generation);
       }
       pending.handlers.onComputerHelpCancelled?.(pending.prompt);
     }
@@ -369,18 +864,19 @@ export class AcpClient {
     this.terminalElicitations.add(rpcId);
   }
 
-  private rejectElicitation(rpcId: RpcId): void {
+  private rejectElicitation(rpcId: RpcId, generation = this.activeGen): void {
     this.rememberTerminalElicitation(rpcId);
     const response = { jsonrpc: "2.0", id: rpcId, result: { action: "cancel" } };
-    if (!this.terminalElicitationLimitReached) {
-      this.send(response);
-      return;
+    const closeAfterResponse = this.terminalElicitationLimitReached;
+    if (closeAfterResponse) {
+      if (this.elicitationOverflowClosing) return;
+      this.elicitationOverflowClosing = true;
     }
-    if (this.elicitationOverflowClosing) return;
-    this.elicitationOverflowClosing = true;
-    void this.sendConfirmed(response).then(
-      () => this.close(),
-      () => this.close(),
+    void this.sendConfirmed(response, () => {
+      this.releaseServerRequest(rpcId, "elicitation", generation);
+    }).then(
+      () => { if (closeAfterResponse) this.close(); },
+      () => { if (closeAfterResponse) this.close(); },
     );
   }
 
@@ -398,33 +894,110 @@ export class AcpClient {
     this.nonTextBoundary = false;
   }
 
+  private onStdoutData(chunk: Buffer): void {
+    if (this.transportError || this.closed) return;
+    let offset = 0;
+    while (offset < chunk.length) {
+      const newline = chunk.indexOf(0x0a, offset);
+      const end = newline === -1 ? chunk.length : newline;
+      const segment = chunk.subarray(offset, end);
+      const lineLength = this.stdoutBuffer.length + segment.length;
+      if (lineLength > MAX_ACP_INPUT_LINE_BYTES) {
+        this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+        return;
+      }
+      if (segment.length > 0) {
+        this.stdoutBuffer = Buffer.concat([this.stdoutBuffer, segment], lineLength);
+      }
+      if (newline === -1) return;
+      let line = this.stdoutBuffer;
+      this.stdoutBuffer = Buffer.alloc(0);
+      if (line.at(-1) === 0x0d) line = line.subarray(0, -1);
+      let decoded: string;
+      try {
+        decoded = new TextDecoder("utf-8", { fatal: true }).decode(line);
+      } catch {
+        this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+        return;
+      }
+      this.onLine(decoded);
+      if (this.transportError || this.closed) return;
+      offset = newline + 1;
+    }
+  }
+
   private onLine(line: string): void {
     const trimmed = line.trim();
     if (!trimmed) return;
-    let msg: Record<string, unknown>;
+    let parsed: unknown;
     try {
-      msg = JSON.parse(trimmed) as Record<string, unknown>;
+      parsed = JSON.parse(trimmed) as unknown;
     } catch {
+      this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
       return;
     }
-    if (msg.id !== undefined && msg.method === undefined && (msg.result !== undefined || msg.error !== undefined)) {
-      const p = this.pending.get(msg.id as RpcId);
-      if (!p) return;
-      this.pending.delete(msg.id as RpcId);
-      if (msg.error) {
-        const errObj = msg.error as { message?: string; code?: number };
-        const err = Object.assign(new Error(errObj.message ?? "ACP error"), {
-          code: errObj.code,
-        });
-        p.reject(err);
-      } else {
-        p.resolve(msg.result);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+      return;
+    }
+    const msg = parsed as Record<string, unknown>;
+    if (!isJsonRpcEnvelope(msg) || !hasValidAcpMethodRole(msg)) {
+      this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+      return;
+    }
+    if (
+      (msg.method === "session/update" || msg.method === "session/request_permission")
+      && (msg.params as Record<string, unknown>).sessionId !== this.inboundSessionId()
+    ) {
+      this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+      return;
+    }
+    if (msg.id !== undefined && msg.method === undefined && (hasOwn(msg, "result") || hasOwn(msg, "error"))) {
+      const id = msg.id as RpcId;
+      const p = this.pending.get(id);
+      if (!p) {
+        const drain = this.cancelledPromptDrain;
+        if (
+          !drain
+          || drain.promptId !== id
+          || (hasOwn(msg, "result") && !isPromptResponse(msg.result))
+        ) {
+          this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+          return;
+        }
+        this.finishCancelledPromptDrain(id);
+        return;
       }
+      if (p.settlementQueued) {
+        this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+        return;
+      }
+      if (!this.stageSessionAttachmentResponse(id, msg)) return;
+      p.settlementQueued = true;
+      const error = hasOwn(msg, "error")
+        ? sanitizedRpcError(msg.error as { code: number; message: string })
+        : null;
+      const result = msg.result;
+      queueMicrotask(() => {
+        if (this.pending.get(id) !== p) return;
+        this.pending.delete(id);
+        if (error) p.reject(error);
+        else p.resolve(result);
+      });
+      return;
+    }
+    if (
+      (msg.method === "session/request_permission" || msg.method === "elicitation/create")
+      && !this.hasActivePromptMessageWindow()
+    ) {
+      this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
       return;
     }
     if (msg.method === "session/request_permission") {
       if (msg.id === undefined) return;
       const rpcId = msg.id as RpcId;
+      if (!this.claimServerRequest(rpcId, "permission")) return;
+      this.pendingPermissions.set(rpcId, { generation: this.activeGen, responding: false });
       if (this.activeGen !== this.generation) {
         this.cancelPermission(rpcId);
         return;
@@ -442,7 +1015,6 @@ export class AcpClient {
         _meta?: unknown;
       };
       const handler = (this.activeHandlers ?? this.handlers).onPermission;
-      this.pendingPermissions.set(rpcId, this.activeGen);
       if (!handler) {
         this.cancelPermission(rpcId);
         return;
@@ -462,7 +1034,9 @@ export class AcpClient {
     if (msg.method === "elicitation/create") {
       if (msg.id === undefined) return;
       const rpcId = msg.id as RpcId;
-      if (this.terminalElicitations.has(rpcId) || this.pendingComputerHelp.has(rpcId)) return;
+      if (this.terminalElicitations.has(rpcId)) return;
+      const requestParams = msg.params as Record<string, unknown>;
+      if (!this.claimServerRequest(rpcId, "elicitation", requestParams)) return;
       if (
         this.terminalElicitationLimitReached
         || this.terminalElicitations.size >= TERMINAL_ELICITATION_LIMIT
@@ -496,6 +1070,7 @@ export class AcpClient {
       this.pendingComputerHelp.set(rpcId, {
         generation: this.activeGen,
         prompt: computerHelp,
+        requestParams,
         handlers,
         responding: false,
       });
@@ -503,8 +1078,16 @@ export class AcpClient {
       return;
     }
     if (msg.method === "session/update") {
-      const params = msg.params as { update?: Record<string, unknown> } | undefined;
-      this.handleUpdate(params?.update ?? (params as { sessionUpdate?: unknown } | undefined));
+      const params = msg.params as { update: Record<string, unknown> };
+      if (this.sessionAttachment?.method === "session/load") return;
+      if (!this.hasActivePromptMessageWindow()) {
+        const kind = String(params.update.sessionUpdate ?? params.update.session_update ?? "");
+        if (kind === "agent_message" || kind === "agent_message_chunk") {
+          this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+        }
+        return;
+      }
+      this.handleUpdate(params.update);
       return;
     }
     if (typeof msg.method === "string" && msg.id !== undefined) {
@@ -522,6 +1105,10 @@ export class AcpClient {
     const kind = String(update.sessionUpdate ?? update.session_update ?? "");
     if (kind === "agent_message_chunk") {
       const piece = extractText(update.content);
+      if (piece === null) {
+        this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+        return;
+      }
       if (!piece) return;
       const messageId = readMessageId(update);
       const startsIdentifiedMessage = messageId !== undefined
@@ -545,6 +1132,10 @@ export class AcpClient {
     }
     if (kind === "agent_message") {
       const piece = extractText(update.content);
+      if (piece === null) {
+        this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+        return;
+      }
       if (!piece) return;
       const messageId = readMessageId(update);
       const completesOpenStream = this.streaming && (
@@ -594,17 +1185,27 @@ export class AcpClient {
   }
 
   async newSession(cwd: string): Promise<string> {
-    const result = (await this.request("session/new", {
-      cwd,
-      mcpServers: this.mcpServers,
-    })) as { sessionId?: string; session_id?: string };
-    const id = result?.sessionId ?? result?.session_id;
-    if (typeof id !== "string" || !id) {
-      throw new Error("session/new did not return a sessionId");
+    const attachment: SessionAttachment = {
+      requestId: this.nextId,
+      method: "session/new",
+      sessionId: null,
+    };
+    this.sessionAttachment = attachment;
+    try {
+      await this.request("session/new", {
+        cwd,
+        mcpServers: this.mcpServers,
+      });
+      const id = attachment.sessionId;
+      if (typeof id !== "string" || !id) {
+        throw new Error("session/new did not return a sessionId");
+      }
+      this.sessionId = id;
+      this.resetElicitationLifecycle();
+      return id;
+    } finally {
+      if (this.sessionAttachment === attachment) this.sessionAttachment = null;
     }
-    this.sessionId = id;
-    this.resetElicitationLifecycle();
-    return id;
   }
 
   async loadSession(sessionId: string): Promise<string> {
@@ -622,25 +1223,33 @@ export class AcpClient {
     this.messageText = "";
     this.openMessageId = null;
     this.nonTextBoundary = false;
-    const result = (await this.request(method, {
+    const attachment: SessionAttachment = {
+      requestId: this.nextId,
+      method,
       sessionId,
-      cwd: this.cwd,
-      mcpServers: this.mcpServers,
-    })) as { sessionId?: string; session_id?: string } | null | undefined;
-    const id = result?.sessionId ?? result?.session_id ?? sessionId;
-    if (typeof id !== "string" || !id) {
-      throw new Error(`${method} did not return a sessionId`);
+    };
+    this.sessionAttachment = attachment;
+    try {
+      await this.request(method, {
+        sessionId,
+        cwd: this.cwd,
+        mcpServers: this.mcpServers,
+      });
+      this.sessionId = sessionId;
+      this.resetElicitationLifecycle();
+      return sessionId;
+    } finally {
+      if (this.sessionAttachment === attachment) this.sessionAttachment = null;
     }
-    this.sessionId = id;
-    this.resetElicitationLifecycle();
-    return id;
   }
 
   async prompt(text: string, handlers?: AcpHandlers): Promise<string> {
+    if (this.transportError) throw this.transportError;
     if (!this.sessionId) throw new Error("no ACP session");
     const myGen = ++this.generation;
     const priorDrain = this.promptDrain;
     if (priorDrain) await priorDrain;
+    if (this.transportError) throw this.transportError;
     if (myGen !== this.generation) throw cancelledError();
     this.activeGen = myGen;
     this.resetElicitationLifecycle();
@@ -658,6 +1267,7 @@ export class AcpClient {
     this.gotIdle = false;
     const id = this.nextId++;
     this.promptId = id;
+    this.promptHandoffPending = true;
     const rpc = new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
     });
@@ -670,8 +1280,9 @@ export class AcpClient {
     const aborted = new Promise<never>((_resolve, reject) => {
       abortPrompt = () => reject(cancelledError());
     });
+    void aborted.catch(() => undefined);
     this.abortPrompt = abortPrompt;
-    const payload = `${JSON.stringify({
+    const promptWrite = this.sendConfirmed({
       jsonrpc: "2.0",
       id,
       method: "session/prompt",
@@ -679,38 +1290,49 @@ export class AcpClient {
         sessionId: this.sessionId,
         prompt: [{ type: "text", text }],
       },
-    })}\n`;
-    const stdin = this.child.stdin;
-    if (!stdin) throw new Error("ACP stdin closed");
-    const flushed = new Promise<void>((resolve, reject) => {
-      stdin.write(payload, (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
     });
-    promptHandlers.onPromptWritten?.();
-    await flushed;
-    if (myGen !== this.generation) {
-      throw cancelledError();
-    }
-    promptHandlers.onPromptFlushed?.();
     try {
-      const result = (await Promise.race([rpc, aborted])) as { stopReason?: string } | undefined;
-      if (!this.gotIdle && !(result && result.stopReason)) {
-        await this.waitIdle();
+      promptHandlers.onPromptWritten?.();
+      await this.withStartDeadline(promptWrite);
+      if (this.promptId === id) this.promptHandoffPending = false;
+      if (myGen !== this.generation) {
+        throw cancelledError();
+      }
+      promptHandlers.onPromptFlushed?.();
+      const result = await Promise.race([rpc, aborted]);
+      if (!isPromptResponse(result)) {
+        const error = new Error(ACP_PROTOCOL_ERROR_MESSAGE);
+        this.failTransport(error);
+        throw error;
+      }
+      if (this.hasPendingPermission(myGen)) {
+        const error = new Error(ACP_PROTOCOL_ERROR_MESSAGE);
+        this.failTransport(error);
+        throw error;
       }
       this.finishStreamingMessage();
       return this.turnText;
     } finally {
+      for (const [rpcId, permission] of this.pendingPermissions) {
+        if (permission.generation === myGen) this.cancelPermission(rpcId);
+      }
       this.cancelComputerHelpWhere((pending) => pending.generation === myGen, true);
       this.invalidateComputerHelpGeneration(myGen);
-      if (this.promptId === id) this.promptId = null;
+      if (this.promptId === id) {
+        this.promptId = null;
+        this.promptHandoffPending = false;
+      }
       if (this.abortPrompt === abortPrompt) this.abortPrompt = null;
       if (this.activeGen === myGen) this.activeHandlers = null;
     }
   }
 
-  cancel(): void {
+  cancel(): boolean {
+    if (this.transportError || this.closed) return false;
+    if (this.promptHandoffPending) {
+      this.failTransport(cancelledError(true));
+      return false;
+    }
     const cancelledGeneration = this.activeGen;
     this.generation += 1;
     this.streaming = false;
@@ -719,17 +1341,23 @@ export class AcpClient {
     this.openMessageId = null;
     this.nonTextBoundary = false;
     this.activeHandlers = null;
+    const error = cancelledError();
+    if (this.promptId !== null) {
+      const cancelledPromptId = this.promptId;
+      const pending = this.pending.get(cancelledPromptId);
+      this.pending.delete(cancelledPromptId);
+      pending?.reject(error);
+      this.promptId = null;
+      this.beginCancelledPromptDrain(cancelledPromptId);
+    }
     const abort = this.abortPrompt;
     this.abortPrompt = null;
     abort?.();
     this.gotIdle = true;
     for (const resolve of this.idleResolvers) resolve();
     this.idleResolvers = [];
-    if (this.promptId !== null) {
-      this.promptId = null;
-    }
-    for (const [rpcId, permissionGen] of this.pendingPermissions) {
-      if (permissionGen === this.activeGen) this.cancelPermission(rpcId);
+    for (const [rpcId, permission] of this.pendingPermissions) {
+      if (permission.generation === this.activeGen) this.cancelPermission(rpcId);
     }
     this.cancelComputerHelpWhere((pending) => pending.generation === cancelledGeneration, true);
     this.invalidateComputerHelpGeneration(cancelledGeneration);
@@ -740,15 +1368,33 @@ export class AcpClient {
         params: { sessionId: this.sessionId },
       });
     }
+    return true;
   }
 
   async respondPermission(rpcId: RpcId, optionId: string): Promise<void> {
-    await this.sendConfirmed({
-      jsonrpc: "2.0",
-      id: rpcId,
-      result: { outcome: { outcome: "selected", optionId } },
-    });
-    this.pendingPermissions.delete(rpcId);
+    const pending = this.pendingPermissions.get(rpcId);
+    if (
+      !pending
+      || pending.generation !== this.activeGen
+      || pending.responding
+    ) {
+      throw Object.assign(new Error("Permission request is no longer active"), { status: 409 });
+    }
+    pending.responding = true;
+    try {
+      await this.sendConfirmed({
+        jsonrpc: "2.0",
+        id: rpcId,
+        result: { outcome: { outcome: "selected", optionId } },
+      }, () => {
+        if (this.pendingPermissions.get(rpcId) === pending) this.pendingPermissions.delete(rpcId);
+        this.releaseServerRequest(rpcId, "permission", pending.generation);
+      });
+    } catch (error) {
+      const current = this.pendingPermissions.get(rpcId);
+      if (current === pending && !this.transportError) current.responding = false;
+      throw error;
+    }
   }
 
   async respondComputerHelp(
@@ -761,7 +1407,6 @@ export class AcpClient {
       !pending
       || pending.generation !== this.activeGen
       || pending.responding
-      || this.terminalElicitations.has(rpcId)
     ) {
       throw Object.assign(new Error("Computer-help request is no longer active"), { status: 409 });
     }
@@ -778,6 +1423,7 @@ export class AcpClient {
       await this.sendConfirmed({ jsonrpc: "2.0", id: rpcId, result: response }, () => {
         this.pendingComputerHelp.delete(rpcId);
         this.rememberTerminalElicitation(rpcId);
+        this.releaseServerRequest(rpcId, "elicitation", pending.generation);
         onFlushed?.();
       });
     } catch (err) {
@@ -788,16 +1434,7 @@ export class AcpClient {
   }
 
   close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.cancelComputerHelpWhere(() => true, false);
-    this.closeComputerHelpGenerationState();
-    this.failAll(new Error("ACP client closed"));
-    try {
-      this.child.kill("SIGTERM");
-    } catch {
-      /* ignore */
-    }
+    this.failTransport(new Error("ACP client closed"));
   }
 }
 
