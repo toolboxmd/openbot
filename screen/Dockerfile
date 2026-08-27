@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       xfdesktop4 \
       xfwm4 \
       gnupg \
+      jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Google Chrome (not Debian Chromium). Official Linux build is amd64-only.

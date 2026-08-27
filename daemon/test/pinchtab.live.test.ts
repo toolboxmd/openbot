@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import http from "node:http";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
@@ -17,13 +18,19 @@ import {
   pinchTabMcpServers,
   pinchTabWrapperCommand,
   resolvePinchTabBin,
+  waitForPinchTabBridge,
 } from "../src/pinchtab.ts";
 
 const PASSWORD = "correct-horse";
 const POLL_MS = 180_000;
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "../..");
-const PINCHTAB_RELEASE = "v0.15.2";
+const LIVE_SCOPE = process.env.OPENBOT_PINCHTAB_LIVE_SCOPE ?? "acceptance";
+const SUPERVISION_SCOPE = LIVE_SCOPE === "supervision";
+
+if (!SUPERVISION_SCOPE && LIVE_SCOPE !== "acceptance") {
+  throw new Error(`unknown OPENBOT_PINCHTAB_LIVE_SCOPE=${LIVE_SCOPE}`);
+}
 
 function cookieHeader(res: Response): string {
   return res.headers.getSetCookie().map((cookie) => cookie.split(";")[0]).join("; ");
@@ -39,7 +46,7 @@ function liveCodexAvailable(): boolean {
   }
 }
 
-if (!liveCodexAvailable()) {
+if (!SUPERVISION_SCOPE && !liveCodexAvailable()) {
   throw new Error("codex is required on PATH for PinchTab Talk MCP live Done; do not skip");
 }
 
@@ -52,27 +59,10 @@ if (!dockerOk()) {
   throw new Error("docker is required for PinchTab Talk MCP live Done; do not skip");
 }
 
-function pinchTabAssetName(): string {
-  const os = process.platform === "darwin" ? "darwin" : process.platform === "linux" ? "linux" : process.platform;
-  const arch = process.arch === "arm64" ? "arm64" : "amd64";
-  return `pinchtab-${os}-${arch}`;
-}
-
-function ensureHostPinchTab(): string {
+function requireHostPinchTab(): string {
   const existing = resolvePinchTabBin();
   if (existing) return existing;
-  const destDir = join(homedir(), ".local", "bin");
-  mkdirSync(destDir, { recursive: true });
-  const dest = join(destDir, "pinchtab");
-  const url = `https://github.com/pinchtab/pinchtab/releases/download/${PINCHTAB_RELEASE}/${pinchTabAssetName()}`;
-  const curl = spawnSync("curl", ["-fsSL", "-o", dest, url], { encoding: "utf8" });
-  if (curl.status !== 0) {
-    throw new Error(`failed to install host pinchtab from ${url}: ${curl.stderr}`);
-  }
-  chmodSync(dest, 0o755);
-  const again = resolvePinchTabBin();
-  if (!again) throw new Error("host pinchtab installed but not executable");
-  return again;
+  throw new Error("host pinchtab is required for live proof; this test never installs it");
 }
 
 async function emptyPwa(): Promise<string> {
@@ -285,6 +275,134 @@ async function listWrapperTools(server: string, token: string): Promise<string[]
   }
 }
 
+async function runLiveWrapperSequence(
+  bin: string,
+  server: string,
+  token: string,
+  targetUrl: string,
+  expectedText: string,
+): Promise<void> {
+  const wrapper = pinchTabWrapperCommand();
+  if (!wrapper) throw new Error("PinchTab MCP wrapper is unavailable");
+  const child = spawn(wrapper.command, [...wrapper.args, "--bin", bin, "--server", server, "--token", token], {
+    env: {
+      ...process.env,
+      OPENBOT_PINCHTAB: bin,
+      OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS: "30000",
+      OPENBOT_PINCHTAB_SERVER: server,
+      PINCHTAB_TOKEN: token,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  try {
+    writeRpc(child, 1, "initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "openbot-pt94-live" },
+    });
+    const initialized = await readRpc(child, 1, 30_000);
+    assert.equal(initialized.error, undefined, JSON.stringify(initialized));
+
+    writeRpc(child, 2, "tools/list");
+    const listed = await readRpc(child, 2, 30_000);
+    assert.equal(listed.error, undefined, JSON.stringify(listed));
+    const tools = ((listed.result as { tools?: Array<{ name?: string }> })?.tools ?? [])
+      .map((tool) => tool.name ?? "")
+      .filter(Boolean);
+    const navigate = tools.find((name) => /navigate/i.test(name));
+    const getText = tools.find((name) => /get[_-]?text|gettext/i.test(name));
+    assert.ok(navigate, `live wrapper has no navigate tool: ${tools.join(",")}`);
+    assert.ok(getText, `live wrapper has no get_text tool: ${tools.join(",")}`);
+
+    const navigatedPromise = readRpc(child, 3, 60_000);
+    const textPromise = readRpc(child, 4, 60_000);
+    writeRpc(child, 3, "tools/call", { name: navigate, arguments: { url: targetUrl } });
+    writeRpc(child, 4, "tools/call", { name: getText, arguments: {} });
+    const [navigated, text] = await Promise.all([navigatedPromise, textPromise]);
+    assert.equal(navigated.error, undefined, JSON.stringify(navigated));
+    assert.equal(text.error, undefined, JSON.stringify(text));
+    assert.match(JSON.stringify(text.result ?? {}), new RegExp(expectedText));
+  } finally {
+    child.kill("SIGTERM");
+  }
+}
+
+function dockerChecked(args: string[]): string {
+  const result = spawnSync("docker", args, { cwd: repoRoot, encoding: "utf8" });
+  assert.equal(result.status, 0, `docker ${args.join(" ")} failed\n${result.stdout}\n${result.stderr}`);
+  return result.stdout;
+}
+
+type LiveOwner = {
+  display: number;
+  port: number;
+  supervisorPid: number;
+  supervisorStart: string;
+  childPid: number;
+  childStart: string;
+  binary: string;
+  config: string;
+};
+
+function liveOwner(container: string, screenHome: string, display: number): LiveOwner {
+  return JSON.parse(
+    dockerChecked(["exec", container, "cat", `${screenHome}/.pinchtab-d${display}/bridge-owner.json`]),
+  ) as LiveOwner;
+}
+
+function assertSingleLiveOwner(container: string, display: number, owner: LiveOwner): void {
+  const processes = dockerChecked(["exec", container, "ps", "-eo", "pid=,args="])
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const child = processes.filter(
+    (line) => line.includes("pinchtab bridge") && line.includes(`--port ${9866 + display}`),
+  );
+  const supervisor = processes.filter(
+    (line) => line.includes("openbot-display") && line.includes(`pinchtab-supervise ${display}`),
+  );
+  assert.equal(child.length, 1, `display ${display} bridge processes: ${child.join(" | ")}`);
+  assert.equal(supervisor.length, 1, `display ${display} supervisors: ${supervisor.join(" | ")}`);
+  assert.match(child[0] ?? "", new RegExp(`^${owner.childPid}\\s`));
+  assert.match(supervisor[0] ?? "", new RegExp(`^${owner.supervisorPid}\\s`));
+}
+
+async function waitScreen(url: string, timeoutMs = 60_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
+      if (response.ok) return;
+    } catch {
+      /* wait for KasmVNC */
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`Screen did not become ready at ${url}`);
+}
+
+function startLiveProofPage(
+  marker: string,
+): Promise<{ port: number; close: () => Promise<void> }> {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(`<!doctype html><title>PinchTab 94</title><main>${marker}</main>`);
+    });
+    server.listen(0, "0.0.0.0", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        reject(new Error("live proof page failed to bind"));
+        return;
+      }
+      resolve({
+        port: address.port,
+        close: () => new Promise((done) => server.close(() => done())),
+      });
+    });
+  });
+}
+
 function startCookieServer(
   secret: string,
 ): Promise<{ port: number; setHost: (host: string) => string; close: () => Promise<void> }> {
@@ -393,6 +511,166 @@ async function waitForNetworkCookieHost(
   );
 }
 
+if (SUPERVISION_SCOPE) {
+  describe("Live Screen and PinchTab supervision", { timeout: 1_200_000 }, () => {
+    const nonce = randomUUID().replaceAll("-", "").slice(0, 12);
+    const container = `openbot-screen-pt94-${nonce}`;
+    const project = `openbot-pt94-${nonce}`;
+    const vncUser = `pt94${nonce.slice(0, 8)}`;
+    const screenHome = `/home/${vncUser}`;
+    const display = 2 + (Number.parseInt(nonce.slice(0, 2), 16) % 7);
+    const marker = `PINCHTAB-94-LIVE-${nonce}`;
+    let runtimeRoot = "";
+    let composeArgs: string[] = [];
+    let env: NodeJS.ProcessEnv = {};
+    let hostBin = "";
+    let screenPorts: number[] = [];
+    let pinchTabPorts: number[] = [];
+    let token = "";
+    let proofPage: { port: number; close: () => Promise<void> } | undefined;
+
+    before(async () => {
+      hostBin = requireHostPinchTab();
+      runtimeRoot = await mkdtemp(join(tmpdir(), "openbot-pt94-live-"));
+      const homeDir = join(runtimeRoot, "home");
+      const workspaceDir = defaultWorkspaceDir(homeDir);
+      const cookiesDir = join(homeDir, "cookies");
+      mkdirSync(workspaceDir, { recursive: true });
+      mkdirSync(cookiesDir, { recursive: true });
+      screenPorts = await pickScreenPorts(8);
+      pinchTabPorts = await pickScreenPorts(8, screenPorts);
+      token = `pt94-${nonce}-${randomUUID()}`;
+      const override = join(runtimeRoot, "compose.override.json");
+      await writeFile(
+        override,
+        JSON.stringify({
+          services: {
+            screen: {
+              container_name: container,
+              restart: "no",
+              environment: { VNC_USER: vncUser },
+            },
+          },
+        }),
+      );
+      composeArgs = [
+        "compose",
+        "--project-name",
+        project,
+        "--file",
+        join(repoRoot, "docker-compose.yml"),
+        "--file",
+        override,
+      ];
+      env = {
+        ...process.env,
+        OPENBOT_HOME: homeDir,
+        OPENBOT_PASSWORD: PASSWORD,
+        OPENBOT_WORKSPACE: workspaceDir,
+        OPENBOT_COOKIES: cookiesDir,
+        PINCHTAB_TOKEN: token,
+        SCREEN_PORTS: screenPorts.join(","),
+        PINCHTAB_PORTS: pinchTabPorts.join(","),
+      };
+      screenPorts.forEach((port, i) => {
+        env[`SCREEN_PORT_${i + 1}`] = String(port);
+      });
+      pinchTabPorts.forEach((port, i) => {
+        env[`PINCHTAB_PORT_${i + 1}`] = String(port);
+      });
+      proofPage = await startLiveProofPage(marker);
+
+      await run(
+        "docker",
+        [...composeArgs, "up", "--detach", "--build", "--force-recreate", "screen"],
+        env,
+      );
+      await run("docker", ["exec", container, DISPLAY_BIN, "start", String(display)], env);
+      await waitScreen(`http://127.0.0.1:${screenPorts[display - 1]}`);
+      assert.equal(
+        await waitForPinchTabBridge(
+          `http://127.0.0.1:${pinchTabPorts[display - 1]}`,
+          token,
+          90_000,
+        ),
+        true,
+        `health plus ensure-browser failed for ${container}:${display}`,
+      );
+    });
+
+    after(async () => {
+      await proofPage?.close();
+      if (composeArgs.length > 0) {
+        const stopped = spawnSync("docker", [...composeArgs, "down", "--volumes", "--remove-orphans"], {
+          cwd: repoRoot,
+          env,
+          encoding: "utf8",
+        });
+        if (stopped.status !== 0) {
+          spawnSync("docker", ["rm", "--force", container], { cwd: repoRoot, encoding: "utf8" });
+          assert.fail(`live container cleanup failed: ${stopped.stdout}\n${stopped.stderr}`);
+        }
+      }
+      if (runtimeRoot) rmSync(runtimeRoot, { recursive: true, force: true });
+    });
+
+    test("one durable owner survives concurrent starts, restarts cleanly, and serializes real tools", async () => {
+      const bridgeUrl = `http://127.0.0.1:${pinchTabPorts[display - 1]}`;
+      const first = liveOwner(container, screenHome, display);
+      assert.equal(first.display, display);
+      assert.equal(first.port, 9866 + display);
+      assert.equal(first.binary, "/usr/local/bin/pinchtab");
+      assert.equal(first.config, `${screenHome}/.pinchtab-d${display}/config.json`);
+      const config = JSON.parse(
+        dockerChecked(["exec", container, "cat", first.config]),
+      ) as { profiles?: { baseDir?: string; defaultProfile?: string } };
+      assert.equal(config.profiles?.baseDir, `${screenHome}/.config`);
+      assert.equal(config.profiles?.defaultProfile, `google-chrome-d${display}`);
+      assertSingleLiveOwner(container, display, first);
+
+      await Promise.all(
+        Array.from({ length: 3 }, () =>
+          run("docker", ["exec", container, DISPLAY_BIN, "pinchtab", String(display)], env),
+        ),
+      );
+      assert.deepEqual(liveOwner(container, screenHome, display), first);
+      assertSingleLiveOwner(container, display, first);
+
+      await run("docker", ["exec", container, DISPLAY_BIN, "stop", String(display)], env);
+      const ownerGone = spawnSync(
+        "docker",
+        ["exec", container, "test", "!", "-e", `${screenHome}/.pinchtab-d${display}/bridge-owner.json`],
+        { encoding: "utf8" },
+      );
+      assert.equal(ownerGone.status, 0, ownerGone.stderr);
+      for (const pid of [first.supervisorPid, first.childPid]) {
+        const dead = spawnSync(
+          "docker",
+          ["exec", container, "bash", "-c", 'kill -0 "$1" 2>/dev/null', "openbot-pt94", String(pid)],
+          { encoding: "utf8" },
+        );
+        assert.notEqual(dead.status, 0, `stale PinchTab pid ${pid} survived stop`);
+      }
+
+      await run("docker", ["exec", container, DISPLAY_BIN, "start", String(display)], env);
+      await waitScreen(`http://127.0.0.1:${screenPorts[display - 1]}`);
+      assert.equal(await waitForPinchTabBridge(bridgeUrl, token, 90_000), true);
+      const second = liveOwner(container, screenHome, display);
+      assert.notEqual(second.supervisorPid, first.supervisorPid);
+      assert.notEqual(second.childPid, first.childPid);
+      assertSingleLiveOwner(container, display, second);
+
+      assert.ok(proofPage);
+      await runLiveWrapperSequence(
+        hostBin,
+        bridgeUrl,
+        token,
+        `http://host.docker.internal:${proofPage.port}/proof`,
+        marker,
+      );
+    });
+  });
+} else {
 describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
   let box: RunningBox;
   let cookie = "";
@@ -408,13 +686,12 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
   const cookieSecret = `pt59-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
   before(async () => {
-    ensureHostPinchTab();
+    requireHostPinchTab();
     token = `live-${Date.now().toString(16)}`;
     const screenPorts = await pickScreenPorts(8);
     pinchTabPorts = await pickScreenPorts(8, screenPorts);
     kasmPort = screenPorts[0]!;
-    mkdirSync(join(homedir(), ".openbot-pt-live"), { recursive: true });
-    homeDir = await mkdtemp(join(homedir(), ".openbot-pt-live", "home-"));
+    homeDir = await mkdtemp(join(tmpdir(), "openbot-pt59-live-home-"));
     workspaceDir = defaultWorkspaceDir(homeDir);
     cookiesDir = join(homeDir, "cookies");
     mkdirSync(workspaceDir, { recursive: true });
@@ -647,3 +924,4 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
     assert.doesNotMatch(text, /Playwright/i);
   });
 });
+}

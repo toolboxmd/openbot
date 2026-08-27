@@ -8,7 +8,7 @@ const TEST_ROOTS = ["daemon/test", "pwa/test"];
 const TEST_FILE = /\.test\.(?:[cm]?[jt]sx?)$/u;
 const LIVE_FILE = /\.live\.test\.(?:[cm]?[jt]sx?)$/u;
 const SCREEN_LIVE_FILE = /\.screen\.live\.test\.(?:[cm]?[jt]sx?)$/u;
-const PINCHTAB_LIVE_FILE = /\.pinchtab\.live\.test\.(?:[cm]?[jt]sx?)$/u;
+const PINCHTAB_LIVE_FILE = /(?:^|[/.])pinchtab\.live\.test\.(?:[cm]?[jt]sx?)$/u;
 
 const LIVE_LANES = {
   "live:harness": { label: "Harness", suffix: "*.live.test.ts" },

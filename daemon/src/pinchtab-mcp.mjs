@@ -19,6 +19,9 @@ const BRING_FRONT = new Set([
   "wait_for_load",
 ]);
 
+const CHILD_EOF_GRACE_MS = 250;
+const CHILD_FORCE_KILL_GRACE_MS = 1_000;
+
 export function shouldBringTabFront(name) {
   return BRING_FRONT.has(normalizePinchTabToolName(name));
 }
@@ -71,18 +74,24 @@ export async function reuseExistingTabId(server, token) {
 
 export async function focusPinchTab(server, token, tabId) {
   if (!server || !tabId) return;
+  const response = await fetch(`${server.replace(/\/$/, "")}/tab`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ action: "focus", tabId }),
+    signal: AbortSignal.timeout(5000),
+  });
+  const ok = response.ok;
+  const status = response.status;
   try {
-    await fetch(`${server.replace(/\/$/, "")}/tab`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
-      },
-      body: JSON.stringify({ action: "focus", tabId }),
-      signal: AbortSignal.timeout(5000),
-    });
+    await response.body?.cancel();
   } catch {
-    /* Screen Chrome stays as-is */
+    /* response status is still authoritative */
+  }
+  if (!ok) {
+    throw new Error(`PinchTab focus failed with HTTP ${status}`);
   }
 }
 
@@ -196,6 +205,11 @@ export function runPinchTabAllowlistProxy(
     console.error("OPENBOT_PINCHTAB and OPENBOT_PINCHTAB_SERVER are required");
     return Promise.resolve(1);
   }
+  const configuredRequestTimeout = Number(env.OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS);
+  const requestTimeoutMs =
+    Number.isFinite(configuredRequestTimeout) && configuredRequestTimeout > 0
+      ? Math.ceil(configuredRequestTimeout)
+      : 60_000;
 
   const child = spawn(bin, ["--server", server, "mcp"], {
     env: { ...env, PINCHTAB_TOKEN: token ?? "" },
@@ -205,19 +219,159 @@ export function runPinchTabAllowlistProxy(
   const fromClient = new RpcReader();
   const fromChild = new RpcReader();
   const listIds = new Set();
-  const navigateIds = new Set();
+  const toolResponseWaiters = new Map();
+  const pending = new Map();
+  const requestTimers = new Map();
+  const terminalIds = new Set();
+  const receivedResponseIds = new Set();
+  const usedClientIds = new Set();
   let clientFraming = "ndjson";
   let sendChain = Promise.resolve();
-
-  const enqueueSend = (fn) => {
-    sendChain = sendChain.then(fn).catch(() => undefined);
-  };
+  let childExited = false;
+  let transportClosing = false;
+  let forceKillTimer;
+  let eofShutdownTimer;
 
   const writeOut = (obj, framing) => {
     stdout.write(encode(obj, framing));
   };
 
-  stdin.on("data", (chunk) => {
+  const rememberRequest = (obj, framing) => {
+    if (obj.id !== undefined && obj.id !== null) {
+      if (usedClientIds.has(obj.id)) {
+        const state = pending.has(obj.id) ? "is already pending" : "was already used";
+        writeOut(
+          {
+            jsonrpc: "2.0",
+            id: obj.id,
+            error: { code: -32600, message: `PinchTab MCP request ID ${String(obj.id)} ${state}` },
+          },
+          framing,
+        );
+        return false;
+      }
+      usedClientIds.add(obj.id);
+      pending.set(obj.id, { framing });
+    }
+    return true;
+  };
+
+  const clearRequestTimer = (id) => {
+    const timer = requestTimers.get(id);
+    if (timer) clearTimeout(timer);
+    requestTimers.delete(id);
+  };
+
+  const completeRequest = (id) => {
+    clearRequestTimer(id);
+    pending.delete(id);
+  };
+
+  const rejectPending = (id, fallbackFraming, error, terminal = false) => {
+    if (id === undefined || id === null) {
+      console.error(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    const tracked = pending.get(id);
+    if (!tracked) return;
+    completeRequest(id);
+    if (terminal) terminalIds.add(id);
+    listIds.delete(id);
+    const waiter = toolResponseWaiters.get(id);
+    toolResponseWaiters.delete(id);
+    waiter?.reject(error instanceof Error ? error : new Error(String(error)));
+    const detail = error instanceof Error ? error.message : String(error);
+    writeOut(
+      {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32000, message: `PinchTab MCP request failed: ${detail}` },
+      },
+      tracked.framing ?? fallbackFraming,
+    );
+  };
+
+  const rejectAllPending = (error, terminal = false) => {
+    for (const [id, tracked] of [...pending.entries()]) {
+      rejectPending(id, tracked.framing, error, terminal);
+    }
+  };
+
+  const terminateTransport = (error) => {
+    if (transportClosing || childExited) return;
+    transportClosing = true;
+    if (eofShutdownTimer) clearTimeout(eofShutdownTimer);
+    rejectAllPending(error, true);
+    child.kill("SIGTERM");
+    forceKillTimer = setTimeout(() => {
+      if (!childExited) child.kill("SIGKILL");
+    }, CHILD_FORCE_KILL_GRACE_MS);
+    forceKillTimer.unref?.();
+  };
+
+  const armRequestTimeout = (id) => {
+    if (id === undefined || id === null || requestTimers.has(id)) return;
+    const timer = setTimeout(() => {
+      terminateTransport(
+        new Error(
+          `PinchTab MCP request ${String(id)} timed out after ${requestTimeoutMs}ms; transport terminated`,
+        ),
+      );
+    }, requestTimeoutMs);
+    requestTimers.set(id, timer);
+  };
+
+  const writeChild = (obj, framing) =>
+    new Promise((resolve, reject) => {
+      if (!child.stdin || child.stdin.destroyed || childExited || transportClosing) {
+        const error = new Error("PinchTab MCP child stdin is closed");
+        terminateTransport(error);
+        reject(error);
+        return;
+      }
+      try {
+        child.stdin.write(encode(obj, framing), (error) => {
+          if (error) {
+            terminateTransport(error);
+            reject(error);
+          } else {
+            resolve();
+          }
+        });
+      } catch (error) {
+        terminateTransport(error);
+        reject(error);
+      }
+    });
+
+  const enqueueSend = (id, framing, fn) => {
+    const next = sendChain.then(fn);
+    sendChain = next.catch(() => undefined);
+    void next.catch((error) => rejectPending(id, framing, error));
+  };
+
+  const waitForToolResponse = (id) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        terminateTransport(
+          new Error(
+            `PinchTab MCP request ${String(id)} timed out after ${requestTimeoutMs}ms; transport terminated to preserve ordering`,
+          ),
+        );
+      }, requestTimeoutMs);
+      toolResponseWaiters.set(id, {
+        resolve(value) {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject(error) {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
+    });
+
+  const onClientData = (chunk) => {
     let messages;
     try {
       messages = fromClient.push(chunk);
@@ -241,64 +395,146 @@ export function runPinchTabAllowlistProxy(
           }
           continue;
         }
-        if (shouldBringTabFront(name)) {
-          if (obj.id !== undefined && obj.id !== null && normalizePinchTabToolName(name) === "navigate") {
-            navigateIds.add(obj.id);
+        if (!rememberRequest(obj, framing)) continue;
+        enqueueSend(obj.id, framing, async () => {
+          const args = shouldBringTabFront(name)
+            ? await prepareBrowseCall(name, toolArguments(obj.params), server, token)
+            : toolArguments(obj.params);
+          const next = { ...obj, params: { ...obj.params, arguments: args } };
+          if (obj.id === undefined || obj.id === null) {
+            await writeChild(next, framing);
+            return;
           }
-          enqueueSend(async () => {
-            const args = await prepareBrowseCall(name, toolArguments(obj.params), server, token);
-            const next = { ...obj, params: { ...obj.params, arguments: args } };
-            if (child.stdin) child.stdin.write(encode(next, framing));
-          });
-          continue;
-        }
+          const responsePromise = waitForToolResponse(obj.id);
+          try {
+            await writeChild(next, framing);
+            const { obj: response } = await responsePromise;
+            if (transportClosing || !pending.has(obj.id)) return;
+            if (normalizePinchTabToolName(name) === "navigate" && response.result !== undefined) {
+              const tabId = tabIdFromToolResult(response.result);
+              if (tabId) await focusPinchTab(server, token, tabId);
+            }
+            if (transportClosing || !pending.has(obj.id)) return;
+            const responseFraming = pending.get(obj.id)?.framing ?? framing;
+            completeRequest(obj.id);
+            writeOut(response, responseFraming);
+          } finally {
+            toolResponseWaiters.delete(obj.id);
+          }
+        });
+        continue;
       }
-      if (obj.method === "tools/list" && obj.id !== undefined && obj.id !== null) {
-        listIds.add(obj.id);
-      }
-      if (child.stdin) child.stdin.write(encode(obj, framing));
+      if (!rememberRequest(obj, framing)) continue;
+      if (obj.method === "tools/list" && obj.id !== undefined && obj.id !== null) listIds.add(obj.id);
+      armRequestTimeout(obj.id);
+      void writeChild(obj, framing).catch((error) => rejectPending(obj.id, framing, error));
     }
-  });
+  };
+  stdin.on("data", onClientData);
 
   child.stdout?.on("data", (chunk) => {
+    if (transportClosing) return;
     let messages;
     try {
       messages = fromChild.push(chunk);
     } catch {
-      stdout.write(chunk);
+      terminateTransport(new Error("PinchTab MCP child emitted malformed JSON-RPC framing"));
       return;
     }
     for (const { obj, framing } of messages) {
+      if (obj.id !== undefined && obj.id !== null && terminalIds.has(obj.id)) {
+        continue;
+      }
+      const isResponse =
+        obj.id !== undefined &&
+        obj.id !== null &&
+        (Object.prototype.hasOwnProperty.call(obj, "result") ||
+          Object.prototype.hasOwnProperty.call(obj, "error"));
+      if (isResponse) {
+        if (!pending.has(obj.id) || receivedResponseIds.has(obj.id)) {
+          terminateTransport(
+            new Error(`PinchTab MCP child emitted a duplicate or unsolicited response ID ${String(obj.id)}`),
+          );
+          return;
+        }
+        receivedResponseIds.add(obj.id);
+      }
+      const toolWaiter = toolResponseWaiters.get(obj.id);
+      if (toolWaiter) {
+        toolResponseWaiters.delete(obj.id);
+        toolWaiter.resolve({ obj, framing });
+        continue;
+      }
+      const responseFraming = pending.get(obj.id)?.framing ?? clientFraming ?? framing;
       if (obj.id !== undefined && obj.id !== null && listIds.has(obj.id) && obj.result !== undefined) {
         listIds.delete(obj.id);
-        writeOut({ ...obj, result: filterListResult(obj.result) }, framing);
+        completeRequest(obj.id);
+        writeOut({ ...obj, result: filterListResult(obj.result) }, responseFraming);
         continue;
       }
-      if (obj.id !== undefined && obj.id !== null && navigateIds.has(obj.id) && obj.result !== undefined) {
-        navigateIds.delete(obj.id);
-        enqueueSend(async () => {
-          const tabId = tabIdFromToolResult(obj.result);
-          if (tabId) await focusPinchTab(server, token, tabId);
-          writeOut(obj, framing);
-        });
-        continue;
-      }
-      writeOut(obj, framing);
+      if (obj.id !== undefined && obj.id !== null) completeRequest(obj.id);
+      writeOut(obj, responseFraming);
     }
   });
 
-  stdin.on("end", () => {
-    child.stdin?.end();
+  child.stdin?.on("error", (error) => {
+    terminateTransport(error);
   });
+  child.stdout?.on("error", (error) => terminateTransport(error));
+
+  const onClientEnd = () => {
+    try {
+      child.stdin?.end();
+    } catch (error) {
+      terminateTransport(error);
+      return;
+    }
+    if (childExited || transportClosing) return;
+    eofShutdownTimer = setTimeout(() => {
+      terminateTransport(
+        new Error("PinchTab MCP child did not exit after client EOF; transport terminated"),
+      );
+    }, CHILD_EOF_GRACE_MS);
+    eofShutdownTimer.unref?.();
+  };
+  stdin.on("end", onClientEnd);
+
+  const detachClient = () => {
+    stdin.off("data", onClientData);
+    stdin.off("end", onClientEnd);
+    stdin.pause?.();
+  };
 
   return new Promise((resolve) => {
-    child.on("exit", (code) => resolve(code ?? 1));
-    child.on("error", (err) => {
-      console.error(err.message);
-      writeOut(
-        { jsonrpc: "2.0", id: null, error: { code: -32000, message: "PinchTab MCP failed to start" } },
-        clientFraming,
+    child.on("exit", (code, signal) => {
+      childExited = true;
+      transportClosing = true;
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (eofShutdownTimer) clearTimeout(eofShutdownTimer);
+      detachClient();
+      rejectAllPending(
+        new Error(
+          code === null
+            ? `PinchTab MCP transport exited from signal ${signal ?? "unknown"}`
+            : `PinchTab MCP transport exited with code ${code}`,
+        ),
       );
+      resolve(code ?? 1);
+    });
+    child.on("error", (err) => {
+      childExited = true;
+      transportClosing = true;
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (eofShutdownTimer) clearTimeout(eofShutdownTimer);
+      detachClient();
+      console.error(err.message);
+      if (pending.size > 0) rejectAllPending(err, true);
+      else {
+        writeOut(
+          { jsonrpc: "2.0", id: null, error: { code: -32000, message: "PinchTab MCP failed to start" } },
+          clientFraming,
+        );
+      }
       resolve(1);
     });
   });
@@ -306,5 +542,5 @@ export function runPinchTabAllowlistProxy(
 
 const isMain = process.argv.some((arg) => /pinchtab-mcp\.(mjs|js|ts)$/.test(arg));
 if (isMain) {
-  process.exit(await runPinchTabAllowlistProxy());
+  process.exitCode = await runPinchTabAllowlistProxy();
 }

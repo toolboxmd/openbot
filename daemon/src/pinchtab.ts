@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,6 +45,7 @@ const MCP_INHERIT_ENV = [
   "TERM",
   "TMPDIR",
   "TZ",
+  "OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS",
 ] as const;
 
 function mcpInheritEnv(from: NodeJS.ProcessEnv): AcpMcpEnvVar[] {
@@ -93,8 +95,7 @@ export function pathHasPinchTab(pathEnv: string): boolean {
   return false;
 }
 
-function pathWithLocalBin(pathEnv: string): string {
-  const home = process.env.HOME;
+function pathWithLocalBin(pathEnv: string, home: string | undefined): string {
   if (!home) return pathEnv;
   const extra = path.join(home, ".local", "bin");
   const parts = pathEnv.split(path.delimiter);
@@ -126,10 +127,11 @@ function resolveExecutable(bin: string, pathEnv: string): string | null {
 }
 
 /** Absolute host pinchtab. Never the Harness PATH shim. */
-export function resolvePinchTabBin(pathEnv = process.env.PATH ?? ""): string | null {
-  const override = process.env.OPENBOT_PINCHTAB;
+export function resolvePinchTabBin(environment: NodeJS.ProcessEnv = process.env): string | null {
+  const pathEnv = environment.PATH ?? "";
+  const override = environment.OPENBOT_PINCHTAB;
   if (override) return resolveExecutable(override, pathEnv);
-  return resolveExecutable("pinchtab", pathWithLocalBin(pathEnv));
+  return resolveExecutable("pinchtab", pathWithLocalBin(pathEnv, environment.HOME));
 }
 
 export function pinchTabMcpScript(): string {
@@ -188,6 +190,10 @@ function probe(
   method = "GET",
 ): Promise<number | null> {
   return new Promise((resolve) => {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      resolve(null);
+      return;
+    }
     let dest: URL;
     try {
       dest = new URL(pathname, url.endsWith("/") ? url : `${url}/`);
@@ -195,36 +201,106 @@ function probe(
       resolve(null);
       return;
     }
-    const req = http.request(
-      dest,
-      {
-        method,
-        headers: {
-          authorization: `Bearer ${token}`,
-          connection: "close",
-        },
-        timeout: timeoutMs,
-      },
-      (res) => {
-        res.resume();
-        resolve(res.statusCode ?? null);
-      },
-    );
-    req.on("error", () => resolve(null));
-    req.on("timeout", () => {
-      req.destroy();
+    const request = dest.protocol === "https:" ? https.request : dest.protocol === "http:" ? http.request : null;
+    if (!request) {
       resolve(null);
+      return;
+    }
+
+    const phaseMs = Math.max(1, Math.min(5_000, timeoutMs));
+    let req: http.ClientRequest | undefined;
+    let response: http.IncomingMessage | undefined;
+    let settled = false;
+    let connectTimer: NodeJS.Timeout | undefined;
+    let headerTimer: NodeJS.Timeout | undefined;
+    let bodyTimer: NodeJS.Timeout | undefined;
+    const totalTimer = setTimeout(() => finish(null), timeoutMs);
+
+    function clearTimers(): void {
+      clearTimeout(totalTimer);
+      if (connectTimer) clearTimeout(connectTimer);
+      if (headerTimer) clearTimeout(headerTimer);
+      if (bodyTimer) clearTimeout(bodyTimer);
+    }
+
+    function finish(status: number | null): void {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      if (status === null) {
+        response?.destroy();
+        req?.destroy();
+      }
+      resolve(status);
+    }
+
+    function armHeaderTimer(): void {
+      if (headerTimer) clearTimeout(headerTimer);
+      headerTimer = setTimeout(() => finish(null), phaseMs);
+    }
+
+    function armBodyTimer(): void {
+      if (bodyTimer) clearTimeout(bodyTimer);
+      bodyTimer = setTimeout(() => finish(null), phaseMs);
+    }
+
+    try {
+      req = request(
+        dest,
+        {
+          method,
+          headers: {
+            authorization: `Bearer ${token}`,
+            connection: "close",
+          },
+        },
+        (res) => {
+          if (settled) {
+            res.destroy();
+            return;
+          }
+          response = res;
+          if (connectTimer) clearTimeout(connectTimer);
+          if (headerTimer) clearTimeout(headerTimer);
+          armBodyTimer();
+          res.on("data", armBodyTimer);
+          res.on("end", () => finish(res.statusCode ?? null));
+          res.on("aborted", () => finish(null));
+          res.on("error", () => finish(null));
+          res.resume();
+        },
+      );
+    } catch {
+      finish(null);
+      return;
+    }
+    req.on("error", () => finish(null));
+    req.on("socket", (socket) => {
+      if (settled) return;
+      const connected = () => {
+        if (settled) return;
+        if (connectTimer) clearTimeout(connectTimer);
+        armHeaderTimer();
+      };
+      connectTimer = setTimeout(() => finish(null), phaseMs);
+      if (socket.connecting) {
+        socket.once(dest.protocol === "https:" ? "secureConnect" : "connect", connected);
+      } else {
+        connected();
+      }
     });
-    req.end();
+    try {
+      req.end();
+    } catch {
+      finish(null);
+    }
   });
 }
 
 export async function pinchTabHealthy(url: string, token: string, timeoutMs = 1500): Promise<boolean> {
   if (!url || !token) return false;
   const health = await probe(url, "/health", token, timeoutMs);
-  if (health !== null && health >= 200 && health < 300) return true;
-  const tabs = await probe(url, "/tabs", token, timeoutMs);
-  return tabs !== null && tabs >= 200 && tabs < 300;
+  return health !== null && health >= 200 && health < 300;
 }
 
 /** PinchTab only opens headed Chrome on /ensure-browser or the first navigate. */
@@ -239,17 +315,19 @@ export async function waitForPinchTabBridge(
   token: string,
   timeoutMs = 60_000,
 ): Promise<boolean> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (await pinchTabHealthy(url, token, 800)) {
-      await ensurePinchTabBrowser(url, token);
-      return true;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const probeBudget = Math.min(800, Math.max(0, deadline - Date.now()));
+    if (await pinchTabHealthy(url, token, probeBudget)) {
+      const ensureBudget = Math.min(5_000, Math.max(0, deadline - Date.now()));
+      if (ensureBudget > 0 && (await ensurePinchTabBrowser(url, token, ensureBudget))) {
+        return true;
+      }
     }
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    const sleepMs = Math.min(400, Math.max(0, deadline - Date.now()));
+    if (sleepMs > 0) await new Promise((resolve) => setTimeout(resolve, sleepMs));
   }
-  if (!(await pinchTabHealthy(url, token, 800))) return false;
-  await ensurePinchTabBrowser(url, token);
-  return true;
+  return false;
 }
 
 export async function pinchTabMcpServers(
@@ -259,7 +337,7 @@ export async function pinchTabMcpServers(
 ): Promise<AcpMcpServer[]> {
   const bridge = computer.pinchTab(botId);
   if (!bridge) return [];
-  const bin = resolvePinchTabBin();
+  const bin = resolvePinchTabBin(inheritEnv);
   if (!bin) return [];
   const wrapper = pinchTabWrapperCommand();
   if (!wrapper) return [];

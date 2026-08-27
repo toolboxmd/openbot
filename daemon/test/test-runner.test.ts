@@ -137,6 +137,16 @@ describe("test command contract", () => {
     ]);
   });
 
+  test("the existing PinchTab suite belongs only to the live PinchTab lane", () => {
+    const harness = runRunner("live:harness", "--list");
+    const pinchtab = runRunner("live:pinchtab", "--list");
+
+    assert.equal(harness.status, 0, harness.stderr);
+    assert.equal(outputLines(harness.stdout).includes("daemon/test/pinchtab.live.test.ts"), false);
+    assert.equal(pinchtab.status, 0, pinchtab.stderr);
+    assert.deepEqual(outputLines(pinchtab.stdout), ["daemon/test/pinchtab.live.test.ts"]);
+  });
+
   test("a deterministic lane rejects a live module", () => {
     const result = runRunner("focused", "--list", "daemon/test/home-channel.live.test.ts");
 
@@ -144,13 +154,10 @@ describe("test command contract", () => {
     assert.match(result.stderr, /belongs to live:harness, not focused/u);
   });
 
-  test("empty live Screen and PinchTab lanes fail instead of reporting proof", () => {
+  test("an empty live Screen lane fails instead of reporting proof", () => {
     const screen = runRunner("live:screen", "--list");
-    const pinchtab = runRunner("live:pinchtab", "--list");
 
     assert.equal(screen.status, 2);
     assert.match(screen.stderr, /No live Screen test files found/u);
-    assert.equal(pinchtab.status, 2);
-    assert.match(pinchtab.stderr, /No live PinchTab test files found/u);
   });
 });
