@@ -1,3 +1,9 @@
+import {
+  permissionOptionKind,
+  validatedPermissionOptions,
+  type PermissionOption,
+} from "./acp.ts";
+
 export type TranscriptCardStatus = {
   tone: "neutral" | "waiting" | "success" | "danger";
   label: string;
@@ -22,10 +28,6 @@ export type TranscriptCard = {
   actions: TranscriptCardAction[];
 };
 
-type PermissionOption = { optionId: string; name: string; kind?: string };
-
-type PermissionActionKind = "allow_once" | "allow_always" | "reject_once" | "reject_always";
-
 const PERMISSION_COPY: Record<string, string> = {
   execute: "This Bot wants to run a command that needs your approval.",
   read: "This Bot wants to read something that needs your approval.",
@@ -33,54 +35,12 @@ const PERMISSION_COPY: Record<string, string> = {
   delete: "This Bot wants to remove something that needs your approval.",
 };
 
-function permissionActionKind(option: PermissionOption): PermissionActionKind | null {
-  if (
-    option.kind === "allow_once"
-    || option.optionId === "allow-once"
-    || option.optionId === "once"
-  ) {
-    return "allow_once";
-  }
-  if (
-    option.kind === "allow_always"
-    || option.optionId === "allow-always"
-    || option.optionId === "always"
-  ) {
-    return "allow_always";
-  }
-  if (
-    option.kind === "reject_once"
-    || option.kind === "reject"
-    || option.optionId === "reject-once"
-    || option.optionId === "reject"
-    || option.optionId === "deny"
-  ) {
-    return "reject_once";
-  }
-  if (
-    option.kind === "reject_always"
-    || option.optionId === "reject-always"
-    || option.optionId === "deny-always"
-  ) {
-    return "reject_always";
-  }
-  return null;
-}
-
 function permissionAction(option: PermissionOption): TranscriptCardAction | null {
-  const kind = permissionActionKind(option);
+  const kind = permissionOptionKind(option);
   if (kind === "allow_once") {
     return {
       id: option.optionId,
       label: "Allow once",
-      intent: "primary",
-      command: { kind: "permission", optionId: option.optionId },
-    };
-  }
-  if (kind === "allow_always") {
-    return {
-      id: option.optionId,
-      label: "Always allow",
       intent: "primary",
       command: { kind: "permission", optionId: option.optionId },
     };
@@ -93,24 +53,19 @@ function permissionAction(option: PermissionOption): TranscriptCardAction | null
       command: { kind: "permission", optionId: option.optionId },
     };
   }
-  if (kind === "reject_always") {
-    return {
-      id: option.optionId,
-      label: "Always deny",
-      intent: "secondary",
-      command: { kind: "permission", optionId: option.optionId },
-    };
-  }
+  // Durable ACP choices are intentionally omitted. Their provider-owned label
+  // carries scope OpenBot cannot restate safely without exposing raw content.
   return null;
 }
 
 export function permissionTranscriptCard(toolKind: string | undefined, options: PermissionOption[]): TranscriptCard {
+  const validated = validatedPermissionOptions(options);
   return {
     kind: "permission",
     title: "Permission requested",
     body: PERMISSION_COPY[toolKind ?? ""] ?? "This Bot needs your approval before it can continue.",
     status: { tone: "waiting", label: "Waiting for you" },
-    actions: options.flatMap((option) => permissionAction(option) ?? []),
+    actions: validated.flatMap((option) => permissionAction(option) ?? []),
   };
 }
 
@@ -129,8 +84,15 @@ export function hostGrantTranscriptCard(
   requested: "read" | "read-write",
   options: PermissionOption[],
 ): TranscriptCard {
-  const canAllow = options.some((option) => permissionActionKind(option)?.startsWith("allow"));
-  const canReject = options.some((option) => permissionActionKind(option)?.startsWith("reject"));
+  const validated = validatedPermissionOptions(options);
+  const canAllow = validated.some((option) => {
+    const kind = permissionOptionKind(option);
+    return kind === "allow_once" || kind === "allow_always";
+  });
+  const canReject = validated.some((option) => {
+    const kind = permissionOptionKind(option);
+    return kind === "reject_once" || kind === "reject_always";
+  });
   const actions: TranscriptCardAction[] = [];
   if (canAllow && requested === "read") {
     actions.push({

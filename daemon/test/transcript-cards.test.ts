@@ -345,8 +345,9 @@ describe("Talk HTTP Transcript Cards", () => {
         rawInput: { command: "curl -H 'Authorization: TOKEN-71'" },
         toolKind: "execute",
         options: [
-          { optionId: "allow-once", name: "TOKEN-71", kind: "provider-private-TOKEN-71" },
+          { optionId: "allow-once", name: "TOKEN-71", kind: "allow_once" },
           { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+          { optionId: "allow-always", name: "TOKEN-71", kind: "provider-private-TOKEN-71" },
         ],
       });
 
@@ -377,6 +378,13 @@ describe("Talk HTTP Transcript Cards", () => {
       const publicBotResponse = await fetch(`${first.box.url}/api/bots/${botId}`, { headers: { cookie } });
       const publicBotJson = await publicBotResponse.text();
       assert.doesNotMatch(publicBotJson, /TOKEN-71|raw command|Authorization|stack|private/);
+      const publicBot = JSON.parse(publicBotJson) as {
+        permission: { options: Array<{ optionId: string; name: string; kind?: string }> } | null;
+      };
+      assert.deepEqual(publicBot.permission?.options, [
+        { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+        { optionId: "reject-once", name: "Deny", kind: "reject_once" },
+      ]);
       const inboxResponse = await fetch(`${first.box.url}/api/inbox`, { headers: { cookie } });
       const inboxJson = await inboxResponse.text();
       assert.doesNotMatch(inboxJson, /TOKEN-71|raw command|Authorization|stack|private/);
@@ -468,7 +476,10 @@ describe("Talk HTTP Transcript Cards", () => {
         title: "Raw provider prompt SECRET-79",
         description: "stack SECRET-79",
         toolKind: "provider-specific",
-        options: [{ optionId: "provider-choice", name: "Raw provider choice" }],
+        options: [
+          { optionId: "provider-allow-project", name: "Allow for project", kind: "allow_always" },
+          { optionId: "provider-reject-project", name: "Reject for project", kind: "reject_always" },
+        ],
       });
 
       const card = await waitForCard(running.box, cookie, botId);
@@ -476,6 +487,7 @@ describe("Talk HTTP Transcript Cards", () => {
       const bot = (await botResponse.json()) as { permission: unknown; messages: CardMessage[] };
       assert.equal(bot.permission, null);
       assert.equal(running.fake.cancelled, 1);
+      assert.deepEqual(running.fake.answered, []);
       assert.deepEqual(card.card, {
         kind: "permission",
         title: "Permission not available",
@@ -483,7 +495,7 @@ describe("Talk HTTP Transcript Cards", () => {
         status: { tone: "neutral", label: "Not approved" },
         actions: [],
       });
-      assert.doesNotMatch(JSON.stringify(bot), /SECRET-79|Raw provider|stack|provider-choice/);
+      assert.doesNotMatch(JSON.stringify(bot), /SECRET-79|Raw provider|stack|provider-(allow|reject)-project/);
     } finally {
       await running.box.close();
     }
@@ -551,8 +563,8 @@ describe("Talk HTTP Transcript Cards", () => {
     const cardId = crypto.randomUUID();
     const requestedPath = "/tmp/openbot-card-host.txt";
     const options = [
-      { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
-      { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+      { optionId: "provider-allow-project", name: "Allow for this project", kind: "allow_always" },
+      { optionId: "provider-reject-project", name: "Reject for this project", kind: "reject_always" },
     ];
     const pending = hostGrantTranscriptCard(requestedPath, "read-write", options);
     const resolved = resolvedHostGrantCard(pending, "read-write", "until-revoked");
@@ -620,8 +632,8 @@ describe("Talk HTTP Transcript Cards", () => {
     await store.pickHarness(created.id, "codex");
     const requestedPath = "/tmp/openbot-dormant-http.txt";
     const options = [
-      { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
-      { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+      { optionId: "provider-allow-project", name: "Allow for this project", kind: "allow_always" },
+      { optionId: "provider-reject-project", name: "Reject for this project", kind: "reject_always" },
     ];
     const cardId = crypto.randomUUID();
     const card = hostGrantTranscriptCard(requestedPath, "read-write", options);
@@ -677,13 +689,24 @@ describe("Talk HTTP Transcript Cards", () => {
     let boxClosed = false;
     try {
       const cookie = await login(box);
+      const polledBotResponse = await fetch(`${box.url}/api/bots/${created.id}`, {
+        headers: { cookie },
+      });
+      const polledBot = (await polledBotResponse.json()) as {
+        permission: { options: Array<{ optionId: string; name: string; kind?: string }> } | null;
+      };
+      assert.deepEqual(polledBot.permission?.options, [
+        { optionId: "provider-allow-project", name: "Allow", kind: "allow_always" },
+        { optionId: "provider-reject-project", name: "Deny", kind: "reject_always" },
+      ]);
+      assert.doesNotMatch(JSON.stringify(polledBot.permission), /this project/);
       const response = await fetch(`${box.url}/api/bots/${created.id}/permissions`, {
         method: "POST",
         headers: { cookie, "content-type": "application/json" },
         body: JSON.stringify({ cardId, access: "read-write", duration: "until-revoked" }),
       });
       assert.equal(response.status, 200, await response.text());
-      assert.deepEqual(answered, ["allow-once"]);
+      assert.deepEqual(answered, ["provider-allow-project"]);
       await box.close();
       boxClosed = true;
 
@@ -1546,6 +1569,58 @@ describe("Talk HTTP Transcript Cards", () => {
 });
 
 describe("Transcript Card permission choices", () => {
+  test("treats a recognized ACP kind as authoritative over a conflicting optionId", () => {
+    const card = permissionTranscriptCard("execute", [
+      { optionId: "allow-once", name: "Reject this request", kind: "reject_once" },
+      { optionId: "reject-once", name: "Allow this request", kind: "allow_once" },
+    ]);
+
+    assert.deepEqual(card.actions, [
+      {
+        id: "allow-once",
+        label: "Deny",
+        intent: "secondary",
+        command: { kind: "permission", optionId: "allow-once" },
+      },
+      {
+        id: "reject-once",
+        label: "Allow once",
+        intent: "primary",
+        command: { kind: "permission", optionId: "reject-once" },
+      },
+    ]);
+    assert.deepEqual(resolvedPermissionCard(card, "allow-once").status, {
+      tone: "neutral",
+      label: "Denied",
+    });
+    assert.deepEqual(resolvedPermissionCard(card, "reject-once").status, {
+      tone: "success",
+      label: "Allowed once",
+    });
+  });
+
+  test("fails closed when a present ACP kind is unknown instead of falling back to optionId", () => {
+    const card = permissionTranscriptCard("execute", [
+      { optionId: "allow-once", name: "Provider-specific choice", kind: "provider_allow" },
+    ]);
+
+    assert.deepEqual(card.actions, []);
+  });
+
+  test("fails closed for malformed choices and duplicate optionIds", () => {
+    const malformed = permissionTranscriptCard("execute", [
+      null,
+      { optionId: "allow-once", name: "Allow", kind: "allow_once" },
+    ] as unknown as Array<{ optionId: string; name: string; kind?: string }>);
+    assert.deepEqual(malformed.actions, []);
+
+    const duplicate = permissionTranscriptCard("execute", [
+      { optionId: "same-choice", name: "Allow", kind: "allow_once" },
+      { optionId: "same-choice", name: "Reject", kind: "reject_once" },
+    ]);
+    assert.deepEqual(duplicate.actions, []);
+  });
+
   test("uses canonical safe choices when ACP omits option kinds", () => {
     const card = permissionTranscriptCard("execute", [
       { optionId: "allow-once", name: "raw allow label" },
@@ -1555,21 +1630,10 @@ describe("Transcript Card permission choices", () => {
       { optionId: "provider-specific", name: "raw provider label" },
     ]);
 
-    assert.deepEqual(card.actions.map((action) => action.label), [
-      "Allow once",
-      "Always allow",
-      "Deny",
-      "Always deny",
-    ]);
+    assert.deepEqual(card.actions.map((action) => action.label), ["Allow once", "Deny"]);
     assert.doesNotMatch(JSON.stringify(card), /raw |provider-specific/);
-    assert.deepEqual(resolvedPermissionCard(card, "always").status, {
-      tone: "success",
-      label: "Always allowed",
-    });
-    assert.deepEqual(resolvedPermissionCard(card, "reject-always").status, {
-      tone: "neutral",
-      label: "Always denied",
-    });
+    assert.throws(() => resolvedPermissionCard(card, "always"), /permission choice is not available/);
+    assert.throws(() => resolvedPermissionCard(card, "reject-always"), /permission choice is not available/);
   });
 
   test("never labels a write approval as read-only and respects ACP allow or reject support", () => {
@@ -1588,6 +1652,18 @@ describe("Transcript Card permission choices", () => {
     assert.deepEqual(
       hostGrantTranscriptCard("/tmp/write.txt", "read-write", [options[1]]).actions.map((action) => action.label),
       ["Deny"],
+    );
+    const durable = [
+      { optionId: "provider-allow", name: "Allow for this project", kind: "allow_always" },
+      { optionId: "provider-reject", name: "Reject for this project", kind: "reject_always" },
+    ];
+    assert.deepEqual(
+      hostGrantTranscriptCard("/tmp/read.txt", "read", durable).actions.map((action) => action.label),
+      ["Read", "Read and write", "Deny"],
+    );
+    assert.deepEqual(
+      hostGrantTranscriptCard("/tmp/write.txt", "read-write", durable).actions.map((action) => action.label),
+      ["Read and write", "Deny"],
     );
   });
 });

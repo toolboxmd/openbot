@@ -55,7 +55,7 @@ export type Bot = {
     cardId?: string;
     title: string;
     description?: string;
-    options: Array<{ optionId: string; name: string }>;
+    options: Array<{ optionId: string; name: string; kind?: string }>;
     hostGrant?: { path: string; requested?: "read" | "read-write" };
   } | null;
   needsYou: { reason: "login"; hint: string } | null;

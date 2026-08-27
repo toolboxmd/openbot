@@ -4,6 +4,54 @@ import type { SpawnSpec } from "./harness.ts";
 
 type RpcId = number | string;
 
+export type PermissionOption = { optionId: string; name: string; kind?: string };
+
+export type PermissionOptionIdentity = Pick<PermissionOption, "optionId" | "kind">;
+
+export type PermissionOptionKind = "allow_once" | "allow_always" | "reject_once" | "reject_always";
+
+export function validatedPermissionOptions(value: unknown): PermissionOption[] {
+  if (!Array.isArray(value)) return [];
+  const optionIds = new Set<string>();
+  const options: PermissionOption[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return [];
+    const option = entry as Record<string, unknown>;
+    if (
+      typeof option.optionId !== "string"
+      || option.optionId.trim().length === 0
+      || typeof option.name !== "string"
+      || (option.kind !== undefined && typeof option.kind !== "string")
+      || optionIds.has(option.optionId)
+    ) {
+      return [];
+    }
+    optionIds.add(option.optionId);
+    options.push({
+      optionId: option.optionId,
+      name: option.name,
+      ...(typeof option.kind === "string" ? { kind: option.kind } : {}),
+    });
+  }
+  return options;
+}
+
+export function permissionOptionKind(option: PermissionOptionIdentity): PermissionOptionKind | null {
+  if (option.kind !== undefined) {
+    return option.kind === "allow_once"
+      || option.kind === "allow_always"
+      || option.kind === "reject_once"
+      || option.kind === "reject_always"
+      ? option.kind
+      : null;
+  }
+  if (option.optionId === "allow-once" || option.optionId === "once") return "allow_once";
+  if (option.optionId === "allow-always" || option.optionId === "always") return "allow_always";
+  if (["reject-once", "reject", "deny"].includes(option.optionId)) return "reject_once";
+  if (["reject-always", "deny-always"].includes(option.optionId)) return "reject_always";
+  return null;
+}
+
 type Pending = {
   resolve: (value: unknown) => void;
   reject: (err: Error) => void;
@@ -13,7 +61,7 @@ export type PermissionPrompt = {
   rpcId: RpcId;
   title: string;
   description?: string;
-  options: Array<{ optionId: string; name: string; kind?: string }>;
+  options: PermissionOption[];
   locations?: Array<{ path?: string }>;
   rawInput?: Record<string, unknown> | null;
   toolKind?: string;
@@ -233,7 +281,7 @@ export class AcpClient {
           rawInput?: Record<string, unknown>;
         };
         description?: string;
-        options?: Array<{ optionId: string; name: string; kind?: string }>;
+        options?: unknown;
         _meta?: unknown;
       };
       const handler = (this.activeHandlers ?? this.handlers).onPermission;
@@ -246,7 +294,7 @@ export class AcpClient {
         rpcId,
         title: params.title ?? params.toolCall?.title ?? "Allow this tool?",
         description: params.description ?? params.toolCall?.title,
-        options: Array.isArray(params.options) ? params.options : [],
+        options: validatedPermissionOptions(params.options),
         locations: params.toolCall?.locations,
         rawInput: params.toolCall?.rawInput ?? null,
         toolKind: params.toolCall?.kind,

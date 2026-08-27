@@ -15,6 +15,8 @@ import {
   extractPermissionPath,
   isInsideScreenWorkspace,
   isInsideWorkspace,
+  pickAllowOption,
+  pickRejectOption,
   vendorDir,
 } from "../src/harness-home.ts";
 import type { SpawnSpec } from "../src/harness.ts";
@@ -86,6 +88,41 @@ const allowDenyOptions = [
   { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
   { optionId: "reject-once", name: "Reject", kind: "reject_once" },
 ];
+
+test("Host permission selectors honor kinds, prefer one-time choices, and fail closed for unknown kinds", () => {
+  const conflicting = [
+    { optionId: "allow-once", name: "Reject", kind: "reject_once" },
+    { optionId: "provider-allow", name: "Allow", kind: "allow_once" },
+  ];
+  assert.equal(pickAllowOption(conflicting), "provider-allow");
+  assert.equal(pickRejectOption(conflicting), "allow-once");
+  assert.equal(
+    pickAllowOption([{ optionId: "allow-once", kind: "provider_allow" }]),
+    null,
+  );
+  assert.equal(
+    pickRejectOption([{ optionId: "reject-once", kind: "provider_reject" }]),
+    null,
+  );
+  assert.equal(
+    pickAllowOption([{ optionId: "provider-always", kind: "allow_always" }]),
+    "provider-always",
+  );
+  assert.equal(
+    pickRejectOption([{ optionId: "provider-never", kind: "reject_always" }]),
+    "provider-never",
+  );
+  assert.equal(pickAllowOption([
+    { optionId: "provider-always", kind: "allow_always" },
+    { optionId: "provider-once", kind: "allow_once" },
+  ]), "provider-once");
+  assert.equal(pickRejectOption([
+    { optionId: "provider-never", kind: "reject_always" },
+    { optionId: "provider-reject-once", kind: "reject_once" },
+  ]), "provider-reject-once");
+  assert.equal(pickAllowOption([{ optionId: "allow-once" }]), "allow-once");
+  assert.equal(pickRejectOption([{ optionId: "reject-once" }]), "reject-once");
+});
 
 describe("Isolated Harness Home layout", () => {
   test("shared OPENBOT.md, vendor dirs, auth symlink, Grok has AGENTS.md only", async () => {

@@ -57,7 +57,9 @@ import {
 import {
   isAuthError,
   isCancelled,
+  permissionOptionKind,
   spawnAcp,
+  validatedPermissionOptions,
   type AcpHandlers,
   type AssistantDelta,
   type PermissionPrompt,
@@ -78,7 +80,7 @@ export type PublicPermission = {
   cardId?: string;
   title: string;
   description?: string;
-  options: Array<{ optionId: string; name: string }>;
+  options: Array<{ optionId: string; name: string; kind?: string }>;
   hostGrant?: PublicHostGrant;
 };
 
@@ -160,15 +162,25 @@ export type BotStoreDeps = {
 
 function publicPermission(p: BotPermission | null): PublicPermission | null {
   if (!p) return null;
-  const permissionCard = permissionTranscriptCard(p.toolKind, p.options);
+  const options = validatedPermissionOptions(p.options);
+  const permissionCard = permissionTranscriptCard(p.toolKind, options);
   const card = p.hostGrant
-    ? hostGrantTranscriptCard(p.hostGrant.path, p.hostGrant.requested, p.options)
+    ? hostGrantTranscriptCard(p.hostGrant.path, p.hostGrant.requested, options)
     : permissionCard;
-  const safeOptions = permissionCard.actions.flatMap((action) => {
-    if (action.command.kind !== "permission") return [];
-    const optionId = action.command.optionId;
-    return [{ optionId, name: action.label }];
-  });
+  const safeOptions = p.hostGrant
+    ? options.flatMap((option) => {
+      const kind = permissionOptionKind(option);
+      if (!kind) return [];
+      const name = kind.startsWith("allow_") ? "Allow" : "Deny";
+      return [{ optionId: option.optionId, name, kind }];
+    })
+    : permissionCard.actions.flatMap((action) => {
+      if (action.command.kind !== "permission") return [];
+      const optionId = action.command.optionId;
+      const source = options.find((option) => option.optionId === optionId);
+      const kind = source ? permissionOptionKind(source) : null;
+      return [{ optionId, name: action.label, ...(kind ? { kind } : {}) }];
+    });
   const out: PublicPermission = {
     title: card.title,
     description: card.body,
@@ -177,6 +189,10 @@ function publicPermission(p: BotPermission | null): PublicPermission | null {
   if (p.cardId) out.cardId = p.cardId;
   if (p.hostGrant) out.hostGrant = p.hostGrant;
   return out;
+}
+
+function pickGenericRejectOption(options: PermissionPrompt["options"]): string | null {
+  return options.find((option) => permissionOptionKind(option) === "reject_once")?.optionId ?? null;
 }
 
 export class BotStore {
@@ -965,7 +981,9 @@ export class BotStore {
     if (turnSeq !== bot.turnSeq || bot.client !== client) return false;
     const active = bot.permission;
     if (!active) return true;
-    const reject = pickRejectOption(active.options);
+    const reject = active.hostGrant
+      ? pickRejectOption(active.options)
+      : pickGenericRejectOption(active.options);
     if (!reject) {
       try {
         client.cancel();
@@ -1018,7 +1036,7 @@ export class BotStore {
     if (turnSeq !== bot.turnSeq || bot.client !== client) return;
     const card = permissionTranscriptCard(prompt.toolKind, prompt.options);
     if (card.actions.length === 0) {
-      const reject = pickRejectOption(prompt.options);
+      const reject = pickGenericRejectOption(prompt.options);
       try {
         if (reject) await client.respondPermission(prompt.rpcId, reject);
         else client.cancel();
