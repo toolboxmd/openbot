@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
@@ -433,14 +442,18 @@ if (process.env.OPENBOT_STDIN_FAIL_PID_FILE) fs.writeFileSync(process.env.OPENBO
 process.on("SIGTERM", () => {});
 setInterval(() => {}, 1000);
 const rl = readline.createInterface({ input: process.stdin });
+let pendingCalls = 0;
 rl.on("line", (line) => {
   const msg = JSON.parse(line);
-  if (msg.method !== "initialize") return;
-  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "closed-stdin" } } }) + "\\n");
-  setTimeout(() => {
-    rl.close();
-    try { fs.closeSync(0); } catch {}
-  }, 10);
+  if (msg.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "closed-stdin" } } }) + "\\n");
+    return;
+  }
+  pendingCalls += 1;
+  if (pendingCalls !== 2) return;
+  rl.close();
+  try { fs.closeSync(0); } catch {}
+  if (process.env.OPENBOT_STDIN_CLOSED_FILE) fs.writeFileSync(process.env.OPENBOT_STDIN_CLOSED_FILE, "closed");
 });
 `;
   await writeFile(file, body, { encoding: "utf8", mode: 0o755 });
@@ -498,6 +511,33 @@ rl.on("line", (line) => {
   return file;
 }
 
+async function writeBackpressuredInputPinchTab(dir: string): Promise<string> {
+  const file = join(dir, "pinchtab");
+  const body = `#!/usr/bin/env node
+import fs from "node:fs";
+import readline from "node:readline";
+if (process.env.OPENBOT_INPUT_CHILD_PID_FILE) fs.writeFileSync(process.env.OPENBOT_INPUT_CHILD_PID_FILE, String(process.pid));
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+process.stdin.pause();
+const delay = Number(process.env.OPENBOT_INPUT_DRAIN_DELAY_MS);
+if (Number.isFinite(delay) && delay >= 0) {
+  setTimeout(() => {
+    const rl = readline.createInterface({ input: process.stdin });
+    rl.on("line", (line) => {
+      const msg = JSON.parse(line);
+      if (process.env.OPENBOT_INPUT_CHILD_CALL_LOG) fs.appendFileSync(process.env.OPENBOT_INPUT_CHILD_CALL_LOG, String(msg.id) + "\\n");
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { accepted: true } }) + "\\n");
+    });
+    process.stdin.resume();
+  }, delay);
+}
+`;
+  await writeFile(file, body, { encoding: "utf8", mode: 0o755 });
+  chmodSync(file, 0o755);
+  return file;
+}
+
 async function writeDelayedNavigationPinchTab(dir: string): Promise<string> {
   const file = join(dir, "pinchtab");
   const body = `#!/usr/bin/env node
@@ -516,6 +556,30 @@ rl.on("line", (line) => {
     return;
   }
   reply(msg, { content: [{ type: "text", text: "called:" + msg.params.name }] });
+});
+`;
+  await writeFile(file, body, { encoding: "utf8", mode: 0o755 });
+  chmodSync(file, 0o755);
+  return file;
+}
+
+async function writeDelayedToolQueuePinchTab(dir: string): Promise<string> {
+  const file = join(dir, "pinchtab");
+  const body = `#!/usr/bin/env node
+import fs from "node:fs";
+import readline from "node:readline";
+const log = process.env.OPENBOT_TOOL_QUEUE_LOG;
+const rl = readline.createInterface({ input: process.stdin });
+const reply = (msg, result) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }) + "\\n");
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    reply(msg, { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "delayed-tool-queue" } });
+    return;
+  }
+  if (msg.method !== "tools/call") return;
+  if (log) fs.appendFileSync(log, String(msg.id) + "\\n");
+  setTimeout(() => reply(msg, { content: [{ type: "text", text: "completed:" + msg.id }] }), 350);
 });
 `;
   await writeFile(file, body, { encoding: "utf8", mode: 0o755 });
@@ -716,6 +780,18 @@ function processAlive(pid: number | undefined): boolean {
   } catch {
     return false;
   }
+}
+
+function processStartId(pid: number): string {
+  const statPath = `/proc/${pid}/stat`;
+  if (existsSync(statPath)) {
+    const stat = readFileSync(statPath, "utf8");
+    const fieldsAfterCommand = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/u);
+    return fieldsAfterCommand[19] ?? "";
+  }
+  return spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" })
+    .stdout.replace(/^[\t ]*/u, "")
+    .replace(/\r?\n$/u, "");
 }
 
 function rpc(child: { stdin: { write: (s: string) => void } | null }, id: number, method: string, params: unknown = {}): void {
@@ -1884,6 +1960,132 @@ describe("PinchTab MCP allowlist proxy", () => {
     }
   });
 
+  test("child input backpressure bounds ordinary requests and reaps a child that never drains", async () => {
+    const dir = await tempDir("openbot-pt-child-input-backpressure-");
+    const bin = await writeBackpressuredInputPinchTab(dir);
+    const pidFile = join(dir, "child.pid");
+    const input = new PassThrough({ highWaterMark: 16 * 1024 * 1024 });
+    const output = new PassThrough();
+    const messages: Array<{ id?: number; error?: unknown }> = [];
+    let outputBuffer = "";
+    output.on("data", (chunk: Buffer) => {
+      outputBuffer += chunk.toString("utf8");
+      const lines = outputBuffer.split("\n");
+      outputBuffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (line.trim()) messages.push(JSON.parse(line) as (typeof messages)[number]);
+      }
+    });
+    const running = runPinchTabAllowlistProxy(input, output, {
+      ...process.env,
+      OPENBOT_INPUT_CHILD_PID_FILE: pidFile,
+      OPENBOT_PINCHTAB: bin,
+      OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS: "400",
+      OPENBOT_PINCHTAB_SERVER: "http://127.0.0.1:9867",
+      PINCHTAB_TOKEN: "t",
+    });
+    const padding = "x".repeat(1024 * 1024);
+    const batch = Array.from({ length: 8 }, (_, index) =>
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: index + 1,
+        method: "initialize",
+        params: { padding },
+      }),
+    ).join("\n");
+    try {
+      await waitUntil(() => existsSync(pidFile), 750);
+      input.write(`${batch}\n`);
+      assert.equal(input.isPaused(), true, "client ingress stayed flowing after child stdin returned false");
+
+      const boundedExit = await Promise.race([
+        running.then((code) => ({ exited: true, code })),
+        new Promise<{ exited: false; code: null }>((resolve) =>
+          setTimeout(() => resolve({ exited: false, code: null }), 2_500),
+        ),
+      ]);
+      assert.equal(boundedExit.exited, true, "wrapper stayed alive while child stdin never drained");
+      const replies = messages.filter((message) => message.id !== undefined);
+      assert.deepEqual(replies.map((message) => message.id), [1], JSON.stringify(messages));
+      assert.equal(replies.filter((message) => message.error !== undefined).length, 1, JSON.stringify(messages));
+      assert.equal(
+        processAlive(Number(readFileSync(pidFile, "utf8"))),
+        false,
+        "PinchTab child survived child-input backpressure timeout",
+      );
+    } finally {
+      input.destroy();
+      output.destroy();
+      if (existsSync(pidFile)) {
+        const pid = Number(readFileSync(pidFile, "utf8"));
+        if (processAlive(pid)) process.kill(pid, "SIGKILL");
+      }
+    }
+  });
+
+  test("a large ordinary request resumes only after child stdin really drains", async () => {
+    const dir = await tempDir("openbot-pt-child-input-drain-");
+    const bin = await writeBackpressuredInputPinchTab(dir);
+    const pidFile = join(dir, "child.pid");
+    const callLog = join(dir, "calls.log");
+    const input = new PassThrough({ highWaterMark: 4 * 1024 * 1024 });
+    const output = new PassThrough();
+    const messages: Array<{ id?: number; result?: unknown; error?: unknown }> = [];
+    let outputBuffer = "";
+    output.on("data", (chunk: Buffer) => {
+      outputBuffer += chunk.toString("utf8");
+      const lines = outputBuffer.split("\n");
+      outputBuffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (line.trim()) messages.push(JSON.parse(line) as (typeof messages)[number]);
+      }
+    });
+    const running = runPinchTabAllowlistProxy(input, output, {
+      ...process.env,
+      OPENBOT_INPUT_CHILD_CALL_LOG: callLog,
+      OPENBOT_INPUT_CHILD_PID_FILE: pidFile,
+      OPENBOT_INPUT_DRAIN_DELAY_MS: "300",
+      OPENBOT_PINCHTAB: bin,
+      OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS: "1500",
+      OPENBOT_PINCHTAB_SERVER: "http://127.0.0.1:9867",
+      PINCHTAB_TOKEN: "t",
+    });
+    try {
+      await waitUntil(() => existsSync(pidFile), 750);
+      input.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { padding: "x".repeat(1024 * 1024) },
+        })}\n`,
+      );
+      assert.equal(input.isPaused(), true, "large valid request did not pause client ingress");
+      await waitUntil(() => messages.some((message) => message.id === 1), 1_250);
+      assert.equal(input.isPaused(), false, "client ingress resumed before a real child stdin drain");
+      assert.equal(messages.find((message) => message.id === 1)?.error, undefined, JSON.stringify(messages));
+
+      input.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "initialize", params: {} })}\n`);
+      await waitUntil(() => messages.some((message) => message.id === 2), 750);
+      assert.deepEqual(readFileSync(callLog, "utf8").trim().split("\n"), ["1", "2"]);
+      assert.equal(messages.find((message) => message.id === 2)?.error, undefined, JSON.stringify(messages));
+
+      input.end();
+      const boundedExit = await Promise.race([
+        running.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 2_500)),
+      ]);
+      assert.equal(boundedExit, true, "drained child-input transport did not shut down boundedly");
+    } finally {
+      input.destroy();
+      output.destroy();
+      if (existsSync(pidFile)) {
+        const pid = Number(readFileSync(pidFile, "utf8"));
+        if (processAlive(pid)) process.kill(pid, "SIGKILL");
+      }
+    }
+  });
+
   test("a child request sharing a pending client ID stays in the server-to-client direction", async () => {
     const dir = await tempDir("openbot-pt-child-direction-id-");
     const bin = await writeDirectionCollisionPinchTab(dir);
@@ -1970,12 +2172,14 @@ describe("PinchTab MCP allowlist proxy", () => {
     const dir = await tempDir("openbot-pt-child-stdin-fail-");
     const bin = await writeClosedStdinPinchTab(dir);
     const pidFile = join(dir, "child.pid");
+    const closedFile = join(dir, "stdin-closed");
     const child = spawn(process.execPath, [wrapper], {
       env: {
         ...process.env,
         OPENBOT_PINCHTAB: bin,
         OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS: "5000",
         OPENBOT_PINCHTAB_SERVER: "http://127.0.0.1:9867",
+        OPENBOT_STDIN_CLOSED_FILE: closedFile,
         OPENBOT_STDIN_FAIL_PID_FILE: pidFile,
         PINCHTAB_TOKEN: "t",
       },
@@ -2000,12 +2204,16 @@ describe("PinchTab MCP allowlist proxy", () => {
       rpc(child, 1, "initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test" } });
       await readRpc(child, 1);
       await waitUntil(() => existsSync(pidFile), 500);
-      await new Promise((resolve) => setTimeout(resolve, 60));
       child.stdout.on("data", collect);
       const exited = new Promise<number | null>((resolve) => child.once("exit", resolve));
       rpc(child, 2, "tools/list");
       rpc(child, 3, "tools/list");
-      await waitUntil(() => messages.filter((message) => message.id === 2 || message.id === 3).length >= 2, 750);
+      await waitUntil(() => existsSync(closedFile), 1_000);
+      rpc(child, 4, "tools/list");
+      await waitUntil(
+        () => messages.filter((message) => message.id === 2 || message.id === 3 || message.id === 4).length >= 3,
+        1_000,
+      );
       const boundedExit = await Promise.race([
         exited.then((code) => ({ exited: true, code })),
         new Promise<{ exited: false; code: null }>((resolve) =>
@@ -2014,7 +2222,7 @@ describe("PinchTab MCP allowlist proxy", () => {
       ]);
 
       assert.equal(boundedExit.exited, true, "wrapper stayed alive after child stdin failed");
-      for (const id of [2, 3]) {
+      for (const id of [2, 3, 4]) {
         const replies = messages.filter((message) => message.id === id);
         assert.equal(replies.length, 1, `request ${id} replies: ${JSON.stringify(replies)}`);
         assert.match(JSON.stringify(replies[0]?.error ?? {}), /stdin|closed|write|pipe|transport/i);
@@ -2176,6 +2384,74 @@ describe("PinchTab MCP allowlist proxy", () => {
     }
   });
 
+  test("queued tools keep one receipt-to-terminal deadline and never forward after expiry", async () => {
+    const dir = await tempDir("openbot-pt-tool-queue-deadline-");
+    const bin = await writeDelayedToolQueuePinchTab(dir);
+    const callLog = join(dir, "calls.log");
+    const child = spawn(process.execPath, [wrapper], {
+      env: {
+        ...process.env,
+        OPENBOT_PINCHTAB: bin,
+        OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS: "600",
+        OPENBOT_PINCHTAB_SERVER: "http://127.0.0.1:9867",
+        OPENBOT_TOOL_QUEUE_LOG: callLog,
+        PINCHTAB_TOKEN: "t",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const messages: Array<{ id?: number; result?: unknown; error?: unknown }> = [];
+    let buffer = "";
+    const collect = (chunk: Buffer) => {
+      buffer += chunk.toString("utf8");
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (line.trim()) messages.push(JSON.parse(line) as (typeof messages)[number]);
+      }
+    };
+    try {
+      rpc(child, 0, "initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "test" },
+      });
+      await readRpc(child, 0);
+      child.stdout.on("data", collect);
+      const started = Date.now();
+      child.stdin.write(
+        [1, 2, 3]
+          .map((id) =>
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              method: "tools/call",
+              params: { name: "pinchtab_snapshot", arguments: {} },
+            }),
+          )
+          .join("\n") + "\n",
+      );
+      await waitUntil(
+        () => [1, 2, 3].every((id) => messages.some((message) => message.id === id)),
+        1_500,
+      );
+
+      const first = messages.filter((message) => message.id === 1);
+      const second = messages.filter((message) => message.id === 2);
+      const third = messages.filter((message) => message.id === 3);
+      assert.equal(first.length, 1, JSON.stringify(messages));
+      assert.equal(second.length, 1, JSON.stringify(messages));
+      assert.equal(third.length, 1, JSON.stringify(messages));
+      assert.equal(first[0]?.error, undefined, JSON.stringify(messages));
+      assert.match(JSON.stringify(second[0]?.error ?? {}), /timed out|deadline|terminated/i);
+      assert.match(JSON.stringify(third[0]?.error ?? {}), /timed out|deadline|terminated/i);
+      assert.ok(Date.now() - started < 1_000, `queued deadline overran: ${Date.now() - started}ms`);
+      assert.deepEqual(readFileSync(callLog, "utf8").trim().split("\n"), ["1", "2"]);
+    } finally {
+      child.stdout.off("data", collect);
+      child.kill("SIGKILL");
+    }
+  });
+
   test("navigation completion and focus precede the next prepared tool call", async () => {
     const bin = await writeDelayedNavigationPinchTab(await tempDir("openbot-pt-order-"));
     let currentTab = "tab-old";
@@ -2237,6 +2513,218 @@ describe("PinchTab MCP allowlist proxy", () => {
 });
 
 describe("PinchTab display lifecycle", () => {
+  test("display CLI validates every command before path or arithmetic expansion", async () => {
+    const root = await tempDir("openbot-display-validation-");
+    const binDir = join(root, "bin");
+    const pinchtab = join(binDir, "pinchtab");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(pinchtab, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    chmodSync(pinchtab, 0o755);
+
+    const run = (command: string, display: string, home: string, token = "") =>
+      spawnSync("bash", [displaySh, command, display], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          COOKIE_JAR: join(home, "cookies"),
+          OPENBOT_PINCHTAB_BIN: pinchtab,
+          OPENBOT_SCREEN_HOME: home,
+          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+          PINCHTAB_TOKEN: token,
+          VNC_USER: process.env.USER ?? "openbot",
+        },
+        timeout: 2_000,
+      });
+
+    try {
+      const invalidCommands = [
+        ["start", "1", /display must be 2-8/u],
+        ["stop", "9", /display must be 1-8/u],
+        ["seed", "9", /display must be 1-8/u],
+        ["cookies-in", "9", /display must be 1-8/u],
+        ["cookies-out", "9", /display must be 1-8/u],
+        ["pinchtab", "9", /display must be 1-8/u],
+        ["pinchtab-supervise", "9", /display must be 1-8/u],
+      ] as const;
+      for (const [index, [command, display, error]] of invalidCommands.entries()) {
+        const home = join(root, `invalid-${index}`);
+        mkdirSync(home);
+        const result = run(command, display, home);
+        assert.equal(result.signal, null, `${command}: ${result.stdout}${result.stderr}`);
+        assert.equal(result.status, 1, `${command}: ${result.stdout}${result.stderr}`);
+        assert.match(result.stderr, error, command);
+        assert.deepEqual(readdirSync(home), [], `${command} mutated ${home}`);
+      }
+
+      const arithmeticHome = join(root, "arithmetic-home");
+      mkdirSync(arithmeticHome);
+      const arithmetic = run(
+        "pinchtab",
+        "BASH_REMATCH[$(printf DISPLAY_INJECTION >&2)]",
+        arithmeticHome,
+        "validation-token",
+      );
+      assert.equal(arithmetic.signal, null, arithmetic.stdout + arithmetic.stderr);
+      assert.equal(arithmetic.status, 1, arithmetic.stdout + arithmetic.stderr);
+      assert.match(arithmetic.stderr, /display must be 1-8/u);
+      assert.doesNotMatch(arithmetic.stderr, /DISPLAY_INJECTION/u);
+      assert.deepEqual(readdirSync(arithmeticHome), [], "arithmetic payload mutated Screen Home");
+
+      const traversalHome = join(root, "traversal-home");
+      const traversalTarget = join(root, "traversal-target");
+      mkdirSync(traversalHome);
+      const traversal = run("seed", "/../../traversal-target", traversalHome);
+      assert.equal(traversal.signal, null, traversal.stdout + traversal.stderr);
+      assert.equal(traversal.status, 1, traversal.stdout + traversal.stderr);
+      assert.match(traversal.stderr, /display must be 1-8/u);
+      assert.equal(existsSync(traversalTarget), false, "display suffix escaped Screen Home");
+      assert.deepEqual(readdirSync(traversalHome), [], "traversal payload mutated Screen Home");
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("display stop retains owner state when final exact identities remain live", async () => {
+    const root = await tempDir("openbot-pt-stop-owned-failure-");
+    const home = join(root, "home");
+    const binDir = join(root, "bin");
+    const ownerDir = join(home, ".pinchtab-d1");
+    const ownerPath = join(ownerDir, "bridge-owner.json");
+    const bashEnv = join(root, "bash-env");
+    const killLog = join(root, "kill.log");
+    mkdirSync(ownerDir, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(binDir, "sleep"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(join(binDir, "pgrep"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    writeFileSync(join(binDir, "pkill"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(join(binDir, "curl"), "#!/bin/sh\nexit 7\n", { mode: 0o755 });
+    writeFileSync(
+      bashEnv,
+      `kill() {
+  if [ "\${1:-}" = "-0" ]; then
+    builtin kill "$@"
+    return
+  fi
+  printf '%s\\n' "$*" >> "$OPENBOT_KILL_LOG"
+  return 0
+}
+`,
+    );
+
+    const stubbornCode = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)";
+    const supervisor = spawn(process.execPath, ["-e", stubbornCode], { stdio: "ignore" });
+    const child = spawn(process.execPath, ["-e", stubbornCode], { stdio: "ignore" });
+    const supervisorPid = supervisor.pid ?? 0;
+    const childPid = child.pid ?? 0;
+    await waitUntil(
+      () =>
+        processAlive(supervisorPid) &&
+        processAlive(childPid) &&
+        processStartId(supervisorPid) !== "" &&
+        processStartId(childPid) !== "",
+    );
+    const owner = {
+      schema: 1,
+      display: 1,
+      port: 19_867,
+      supervisorPid,
+      supervisorStart: processStartId(supervisorPid),
+      childPid,
+      childStart: processStartId(childPid),
+      binary: "/fixture/pinchtab",
+      config: join(ownerDir, "config.json"),
+    };
+    writeFileSync(ownerPath, JSON.stringify(owner));
+
+    try {
+      const result = spawnSync("bash", [displaySh, "stop", "1"], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          BASH_ENV: bashEnv,
+          COOKIE_JAR: join(root, "cookies"),
+          OPENBOT_KILL_LOG: killLog,
+          OPENBOT_PINCHTAB_PORT_BASE: "19866",
+          OPENBOT_SCREEN_HOME: home,
+          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+          VNC_USER: process.env.USER ?? "openbot",
+        },
+        timeout: 4_000,
+      });
+
+      assert.equal(result.signal, null, result.stdout + result.stderr);
+      assert.equal(
+        result.status,
+        1,
+        `${result.stdout}${result.stderr}\nowner=${existsSync(ownerPath)} killLog=${
+          existsSync(killLog) ? readFileSync(killLog, "utf8") : "<missing>"
+        }`,
+      );
+      assert.match(result.stderr, /cleanup.*incomplete|owner.*retain|surviv/iu);
+      assert.equal(existsSync(ownerPath), true, "failed cleanup discarded PinchTab ownership");
+      assert.deepEqual(JSON.parse(readFileSync(ownerPath, "utf8")), owner);
+      assert.equal(processAlive(supervisorPid), true, "fixture supervisor unexpectedly exited");
+      assert.equal(processAlive(childPid), true, "fixture child unexpectedly exited");
+      assert.match(readFileSync(killLog, "utf8"), /-9/u);
+    } finally {
+      if (processAlive(supervisorPid)) process.kill(supervisorPid, "SIGKILL");
+      if (processAlive(childPid)) process.kill(childPid, "SIGKILL");
+      await Promise.all([
+        new Promise<void>((resolve) => supervisor.once("close", () => resolve())),
+        new Promise<void>((resolve) => child.once("close", () => resolve())),
+      ]);
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("display stop fails when Chrome still owns the exact profile after final KILL", async () => {
+    const root = await tempDir("openbot-display-stop-chrome-live-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    const binDir = join(root, "bin");
+    const killLog = join(root, "pkill.log");
+    const profileCookies = join(home, ".config", "google-chrome", "Default");
+    mkdirSync(profileCookies, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(profileCookies, "Cookies"), "chrome-cleanup-cookie");
+    writeFileSync(
+      join(binDir, "pkill"),
+      '#!/bin/sh\nprintf "%s\\n" "$*" >> "$OPENBOT_CHROME_KILL_LOG"\nexit 0\n',
+      { mode: 0o755 },
+    );
+    writeFileSync(join(binDir, "pgrep"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(join(binDir, "sleep"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(join(binDir, "curl"), "#!/bin/sh\nexit 7\n", { mode: 0o755 });
+
+    try {
+      const result = spawnSync("bash", [displaySh, "stop", "1"], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          COOKIE_JAR: jar,
+          OPENBOT_CHROME_KILL_LOG: killLog,
+          OPENBOT_PINCHTAB_PORT_BASE: "29866",
+          OPENBOT_SCREEN_HOME: home,
+          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+          VNC_USER: process.env.USER ?? "openbot",
+        },
+        timeout: 3_000,
+      });
+
+      assert.equal(result.signal, null, result.stdout + result.stderr);
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.match(result.stderr, /Chrome.*(?:profile|remain|failed to stop)/iu);
+      assert.match(readFileSync(killLog, "utf8"), /-9/u);
+      assert.equal(
+        readFileSync(join(jar, "Network", "Cookies"), "utf8"),
+        "chrome-cleanup-cookie",
+        "cookie cleanup was skipped after Chrome stop failure",
+      );
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
   test("display CLI keeps one durable PinchTab owner and stop removes it", async () => {
     const root = await tempDir("openbot-pt-supervisor-");
     const home = join(root, 'home-"quoted\\segment\nline');
@@ -2793,6 +3281,65 @@ describe("PinchTab display lifecycle", () => {
       assert.equal(result.status, 0, result.stderr);
       assert.equal(existsSync(marker), true, `stale lock returned early: ${result.stdout}${result.stderr}`);
       assert.equal(existsSync(lock), false);
+    } finally {
+      rmSync(lock, { force: true });
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("display CLI does not trust a foreign live PID in an incoherent X lock", async () => {
+    const root = await tempDir("openbot-foreign-x-lock-");
+    const home = join(root, "home");
+    const binDir = join(root, "bin");
+    const marker = join(root, "su-called");
+    mkdirSync(home, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(
+      join(binDir, "cp"),
+      '#!/bin/bash\nfor arg in "$@"; do dest="$arg"; done\nif [ -d "$dest" ]; then dest="$dest/fixture"; fi\nmkdir -p "$(dirname "$dest")"\n: > "$dest"\n',
+      { mode: 0o755 },
+    );
+    writeFileSync(
+      join(binDir, "su"),
+      '#!/bin/sh\nprintf "%s\\n" "$*" > "$OPENBOT_SU_MARKER"\n',
+      { mode: 0o755 },
+    );
+
+    let display = 0;
+    let lock = "";
+    for (const candidate of [8, 7, 6, 5, 4, 3, 2]) {
+      const candidateLock = `/tmp/.X${candidate}-lock`;
+      const candidateSocket = `/tmp/.X11-unix/X${candidate}`;
+      if (existsSync(candidateLock) || existsSync(candidateSocket)) continue;
+      try {
+        writeFileSync(candidateLock, `${process.pid}\n`, { flag: "wx" });
+        display = candidate;
+        lock = candidateLock;
+        break;
+      } catch {
+        continue;
+      }
+    }
+    assert.notEqual(display, 0, "no unused test display id was available");
+    try {
+      const result = spawnSync("bash", [displaySh, "start", String(display)], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          COOKIE_JAR: join(root, "cookies"),
+          OPENBOT_SCREEN_HOME: home,
+          OPENBOT_SU_MARKER: marker,
+          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+          PINCHTAB_TOKEN: "",
+          VNC_USER: process.env.USER ?? "openbot",
+        },
+        timeout: 10_000,
+      });
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.match(result.stderr, /stale|mismatch|foreign|incoherent/iu);
+      assert.equal(existsSync(marker), true, `foreign lock returned early: ${result.stdout}${result.stderr}`);
+      assert.equal(processAlive(process.pid), true, "foreign lock owner was killed");
+      assert.equal(existsSync(lock), false, "foreign lock state was retained after safe relaunch");
     } finally {
       rmSync(lock, { force: true });
       rmSync(root, { force: true, recursive: true });

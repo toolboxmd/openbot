@@ -17,6 +17,25 @@ PINCHTAB_BODY_TIMEOUT_SEC="${OPENBOT_PINCHTAB_BODY_TIMEOUT_SEC:-2}"
 PINCHTAB_REQUEST_TIMEOUT_SEC="${OPENBOT_PINCHTAB_REQUEST_TIMEOUT_SEC:-3}"
 PINCHTAB_START_TIMEOUT_SEC="${OPENBOT_PINCHTAB_START_TIMEOUT_SEC:-60}"
 
+case "$CMD" in
+  start)
+    if ! [[ "$N" =~ ^[2-8]$ ]]; then
+      echo "openbot-display: display must be 2-8" >&2
+      exit 1
+    fi
+    ;;
+  stop|seed|cookies-in|cookies-out|pinchtab|pinchtab-supervise)
+    if ! [[ "$N" =~ ^[1-8]$ ]]; then
+      echo "openbot-display: display must be 1-8" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "usage: openbot-display start <n> | stop <n> | seed <n> | cookies-in <n> | cookies-out <n> | pinchtab <n>" >&2
+    exit 1
+    ;;
+esac
+
 cdp_port() {
   echo $((${OPENBOT_CDP_PORT_BASE:-9221} + $1))
 }
@@ -61,6 +80,27 @@ process_group_id() {
 process_group_alive() {
   local pgid="$1"
   [ -n "$pgid" ] && kill -0 -- "-${pgid}" 2>/dev/null
+}
+
+display_process_command() {
+  local pid="$1"
+  if [ -r "/proc/${pid}/cmdline" ]; then
+    tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true
+    return
+  fi
+  ps -o command= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//' || true
+}
+
+display_owner_matches() {
+  local n="$1"
+  local pid="$2"
+  local socket="/tmp/.X11-unix/X${n}"
+  local command
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ -S "$socket" ] || return 1
+  command="$(display_process_command "$pid")"
+  [[ "$command" =~ (^|[[:space:]/])(X|Xorg|Xvnc|Xtigervnc)([[:space:]].*)?[[:space:]]:${n}([[:space:]]|$) ]]
 }
 
 terminate_exact_process_or_group() {
@@ -497,7 +537,16 @@ pinchtab_stop_locked() {
   if process_matches "$child_pid" "$child_start"; then
     kill -9 "$child_pid" 2>/dev/null || true
   fi
-  rm -f "$file"
+  for i in $(seq 1 20); do
+    if ! process_matches "$child_pid" "$child_start" \
+      && ! process_matches "$supervisor_pid" "$supervisor_start"; then
+      rm -f "$file"
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "openbot-display: PinchTab cleanup incomplete on :${n}; exact owner ${file} retained for retry" >&2
+  return 1
 }
 
 pinchtab_stop() {
@@ -510,7 +559,7 @@ pinchtab_stop() {
   if pinchtab_stop_locked "$n"; then result=0; else result=$?; fi
   port="$(pinchtab_port "$n")"
   if pinchtab_port_in_use "$port"; then
-    echo "openbot-display: PinchTab port ${port} remains occupied without a valid owner; refusing to kill an unowned process" >&2
+    echo "openbot-display: PinchTab port ${port} remains occupied after bounded cleanup; no unverified process was killed" >&2
     result=1
   fi
   release_pinchtab_lock "$n"
@@ -585,7 +634,10 @@ pinchtab_start_locked() {
     echo "openbot-display: PinchTab bridge :${pt} already supervised"
     return 0
   fi
-  pinchtab_stop_locked "$n"
+  if ! pinchtab_stop_locked "$n"; then
+    echo "openbot-display: refusing to start a duplicate PinchTab owner on :${n}" >&2
+    return 1
+  fi
   if pinchtab_port_in_use "$pt"; then
     echo "openbot-display: PinchTab port ${pt} is already in use without a valid owner" >&2
     return 1
@@ -699,16 +751,19 @@ stop_chrome() {
     sleep 1
   done
   pkill -9 -f -- "$pat" 2>/dev/null || true
-  sleep 1
+  for i in $(seq 1 10); do
+    if ! pgrep -af -- "$pat" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "openbot-display: Chrome still owns profile ${profile} after bounded TERM/KILL cleanup" >&2
+  return 1
 }
 
 stop_display() {
   local n="$1"
   local result=0
-  if ! [[ "$n" =~ ^[1-8]$ ]]; then
-    echo "openbot-display: display must be 1-8" >&2
-    exit 1
-  fi
   if ! pinchtab_stop "$n"; then result=1; fi
   if ! stop_chrome "$n"; then
     echo "openbot-display: failed to stop Chrome for display :${n}" >&2
@@ -730,24 +785,29 @@ stop_display() {
 
 start_display() {
   local n="$1"
-  if ! [[ "$n" =~ ^[2-8]$ ]]; then
-    echo "openbot-display: display must be 2-8" >&2
-    exit 1
-  fi
   local ws_port=$((6900 + n))
-  if [ -e "/tmp/.X${n}-lock" ]; then
+  local x_lock="/tmp/.X${n}-lock"
+  local x_socket="/tmp/.X11-unix/X${n}"
+  if [ -e "$x_lock" ]; then
     local x_pid
-    x_pid="$(awk 'NR == 1 { print $1 }' "/tmp/.X${n}-lock" 2>/dev/null || true)"
-    if [[ "$x_pid" =~ ^[0-9]+$ ]] && kill -0 "$x_pid" 2>/dev/null; then
+    x_pid="$(awk 'NR == 1 { print $1 }' "$x_lock" 2>/dev/null || true)"
+    if display_owner_matches "$n" "$x_pid"; then
       echo "display :${n} already up"
       if [ -n "${PINCHTAB_TOKEN:-}" ]; then
         pinchtab_start "$n"
       fi
       return 0
     fi
-    echo "openbot-display: removing stale X lock for display :${n}" >&2
+    if [[ "$x_pid" =~ ^[0-9]+$ ]] && kill -0 "$x_pid" 2>/dev/null && [ -S "$x_socket" ]; then
+      echo "openbot-display: display :${n} X lock and socket have mismatched live ownership; refusing to remove or kill PID ${x_pid}" >&2
+      return 1
+    fi
+    echo "openbot-display: removing stale or incoherent X state for display :${n}; PID ${x_pid:-unknown} is not a coherent owner" >&2
+  elif [ -S "$x_socket" ]; then
+    echo "openbot-display: display :${n} has an X socket without an ownership lock; refusing unsafe replacement" >&2
+    return 1
   fi
-  rm -f "/tmp/.X${n}-lock" "/tmp/.X11-unix/X${n}"
+  rm -f "$x_lock" "$x_socket"
   seed_display "$n"
   cookies_in "$n"
   export PINCHTAB_TOKEN

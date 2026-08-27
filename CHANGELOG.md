@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.3] - 2026-08-27
+
+### Changed
+
+- Harden PinchTab and Screen lifecycle bounds for issue #94
+
 ## [0.9.2] - 2026-08-27
 
 ### Changed
