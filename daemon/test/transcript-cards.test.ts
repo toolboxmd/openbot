@@ -27,6 +27,7 @@ type CardMessage = {
     title: string;
     body: string;
     preview?: string;
+    needsYou?: { id: string; reason: string };
     status: { tone: string; label: string };
     actions: Array<{
       id: string;
@@ -1551,7 +1552,15 @@ describe("Talk HTTP Transcript Cards", () => {
         const bot = JSON.parse(raw) as { messages: CardMessage[] };
         const source = bot.messages.find((message) => message.role === "user");
         const failure = bot.messages.find((message) => message.kind === "card");
+        assert.equal(failure?.card?.kind, "bot-failure");
         assert.equal(failure?.card?.title, phase === "initialize" ? "Codex needs sign-in" : "Bot stopped");
+        if (phase === "initialize") {
+          assert.equal(
+            failure?.card?.body,
+            "Sign in to Codex on the host with `codex login` (device code), then try this message again.",
+          );
+        }
+        assert.equal(failure?.card?.needsYou, undefined);
         assert.deepEqual(failure?.card?.actions, [{
           id: "retry",
           label: "Try again",

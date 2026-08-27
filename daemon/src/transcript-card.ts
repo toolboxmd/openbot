@@ -16,7 +16,14 @@ export type TranscriptCardAction = {
   command:
     | { kind: "permission"; optionId: string }
     | { kind: "host-grant"; access: "read" | "read-write" | "deny" }
-    | { kind: "retry-message"; messageId: string };
+    | { kind: "retry-message"; messageId: string }
+    | { kind: "open-computer"; eventId: string }
+    | { kind: "resolve-needs-you"; eventId: string; resolution: "done" | "skip" };
+};
+
+export type NeedsYouEvent = {
+  id: string;
+  reason: "computer-help";
 };
 
 export type TranscriptCard = {
@@ -24,6 +31,7 @@ export type TranscriptCard = {
   title: string;
   body: string;
   preview?: string;
+  needsYou?: NeedsYouEvent;
   status: TranscriptCardStatus;
   actions: TranscriptCardAction[];
 };
@@ -186,7 +194,7 @@ export function botFailureTranscriptCard(messageId: string, needsSignIn = false)
     kind: "bot-failure",
     title: needsSignIn ? "Codex needs sign-in" : "Bot stopped",
     body: needsSignIn
-      ? "Sign in to Codex on this Computer, then try this message again."
+      ? "Sign in to Codex on the host with `codex login` (device code), then try this message again."
       : "The Bot could not finish this message. Try again.",
     status: { tone: "danger", label: needsSignIn ? "Action needed" : "Failed" },
     actions: [
@@ -197,6 +205,111 @@ export function botFailureTranscriptCard(messageId: string, needsSignIn = false)
         command: { kind: "retry-message", messageId },
       },
     ],
+  };
+}
+
+export function needsYouComputerCard(event: NeedsYouEvent, instruction: string): TranscriptCard {
+  return {
+    kind: "computer",
+    title: "Computer",
+    body: instruction,
+    status: { tone: "waiting", label: "Action needed" },
+    needsYou: event,
+    actions: [
+      {
+        id: "open-computer",
+        label: "Open computer",
+        intent: "primary",
+        command: { kind: "open-computer", eventId: event.id },
+      },
+      {
+        id: "done",
+        label: "I'm done",
+        intent: "secondary",
+        command: { kind: "resolve-needs-you", eventId: event.id, resolution: "done" },
+      },
+      {
+        id: "skip",
+        label: "Skip",
+        intent: "secondary",
+        command: { kind: "resolve-needs-you", eventId: event.id, resolution: "skip" },
+      },
+    ],
+  };
+}
+
+export function isPendingNeedsYouComputerCard(card: TranscriptCard): boolean {
+  if (card.kind !== "computer" || !card.needsYou || card.status.tone !== "waiting") return false;
+  return card.actions.some((action) => (
+    action.command.kind === "resolve-needs-you"
+    && action.command.eventId === card.needsYou?.id
+  ));
+}
+
+export function resolvedNeedsYouComputerCard(
+  card: TranscriptCard,
+  eventId: string,
+  resolution: "done" | "skip",
+): TranscriptCard {
+  if (card.kind !== "computer" || !card.needsYou) {
+    throw Object.assign(new Error("needs-you Computer Card not found"), { status: 404 });
+  }
+  if (card.needsYou.id !== eventId) {
+    throw Object.assign(new Error("needs-you event is no longer active"), { status: 409 });
+  }
+  const action = card.actions.find((candidate) => (
+    candidate.command.kind === "resolve-needs-you"
+    && candidate.command.eventId === eventId
+    && candidate.command.resolution === resolution
+  ));
+  if (card.status.tone !== "waiting" || !action) {
+    throw Object.assign(new Error("needs-you event is no longer active"), { status: 409 });
+  }
+  return {
+    ...card,
+    status: resolution === "done"
+      ? { tone: "success", label: "Done" }
+      : { tone: "neutral", label: "Skipped" },
+    actions: card.actions.filter((candidate) => candidate.command.kind === "open-computer"),
+  };
+}
+
+export function failedNeedsYouResumeCard(card: TranscriptCard, eventId: string): TranscriptCard {
+  if (
+    card.kind !== "computer"
+    || !card.needsYou
+    || card.needsYou.id !== eventId
+    || !isPendingNeedsYouComputerCard(card)
+  ) {
+    throw Object.assign(new Error("needs-you event is no longer active"), { status: 409 });
+  }
+  return card;
+}
+
+export function unconfirmedNeedsYouComputerCard(card: TranscriptCard, eventId: string): TranscriptCard {
+  if (
+    card.kind !== "computer"
+    || !card.needsYou
+    || card.needsYou.id !== eventId
+    || !isPendingNeedsYouComputerCard(card)
+  ) {
+    throw Object.assign(new Error("needs-you event is no longer active"), { status: 409 });
+  }
+  return {
+    ...card,
+    body: "OpenBot sent your response but could not confirm this request's final state.",
+    status: { tone: "neutral", label: "No longer available" },
+    actions: card.actions.filter((action) => action.command.kind === "open-computer"),
+  };
+}
+
+export function unavailableNeedsYouComputerCard(card: TranscriptCard): TranscriptCard {
+  if (card.kind !== "computer" || !card.needsYou) return expiredTranscriptCard(card);
+  return {
+    ...card,
+    body: "This request ended before the Bot received your response.",
+    status: { tone: "neutral", label: "No longer available" },
+    actions: card.actions.filter((action) => action.command.kind === "open-computer"),
   };
 }
 
@@ -295,13 +408,33 @@ export function parseTranscriptCard(value: unknown): TranscriptCard | null {
     ) {
       return [action as TranscriptCardAction];
     }
+    if (
+      action.command.kind === "open-computer"
+      && typeof action.command.eventId === "string"
+    ) {
+      return [action as TranscriptCardAction];
+    }
+    if (
+      action.command.kind === "resolve-needs-you"
+      && typeof action.command.eventId === "string"
+      && (action.command.resolution === "done" || action.command.resolution === "skip")
+    ) {
+      return [action as TranscriptCardAction];
+    }
     return [];
   });
+  const needsYou = typeof card.needsYou === "object"
+    && card.needsYou !== null
+    && typeof card.needsYou.id === "string"
+    && card.needsYou.reason === "computer-help"
+    ? card.needsYou as NeedsYouEvent
+    : undefined;
   return {
     kind: card.kind,
     title: card.title,
     body: card.body,
     ...(typeof card.preview === "string" ? { preview: card.preview } : {}),
+    ...(needsYou ? { needsYou } : {}),
     status: card.status as TranscriptCardStatus,
     actions,
   };

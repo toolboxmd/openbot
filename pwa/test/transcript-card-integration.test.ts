@@ -19,6 +19,15 @@ describe("Transcript Card integration", () => {
     assert.match(source, /answerHostGrant\(botId, messageId, access, duration/);
     assert.match(source, /action\.command\.kind === "retry-message"/);
     assert.match(source, /retryTranscriptCard\(botId, messageId\)/);
+    assert.match(source, /action\.command\.kind === "resolve-needs-you"/);
+    assert.match(source, /resolveNeedsYouCard\(botId, messageId, eventId, resolution\)/);
+  });
+
+  test("routes the Card and Chat header to the same selected Bot Computer", () => {
+    assert.match(source, /action\.command\.kind === "open-computer"/);
+    assert.match(source, /openComputerFor\(botId\)/);
+    assert.match(source, /function openComputer\(\)[\s\S]*openComputerFor\(activeId\)/);
+    assert.match(source, /function openComputerFor\(botId: string\)[\s\S]*activeId !== botId[\s\S]*updateComputerPane\(botId, true\)/);
   });
 
   test("keeps progress local and restores focus from authoritative Card state", () => {

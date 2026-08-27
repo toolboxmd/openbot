@@ -13,6 +13,7 @@ describe("Transcript Card presentation", () => {
     assert.match(source, /card\.title/);
     assert.match(source, /card\.body/);
     assert.match(source, /card\.status\.label/);
+    assert.match(source, /role="status"/);
     assert.match(source, /aria-label=\{action\.label\}/);
     assert.match(source, /disabled=\{busy\}/);
     assert.match(source, /min-h-\[var\(--touch-min\)\]/);

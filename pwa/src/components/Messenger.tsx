@@ -105,6 +105,7 @@ import {
   listHarnesses,
   listInbox,
   markBotRead,
+  resolveNeedsYouCard,
   retryTranscriptCard,
   sendMessage,
   toggleReaction,
@@ -1100,6 +1101,13 @@ export function Messenger() {
           answerHostGrant(botId, messageId, access, duration));
       } else if (action.command.kind === "retry-message") {
         await performBotMutation(botId, () => retryTranscriptCard(botId, messageId));
+      } else if (action.command.kind === "open-computer") {
+        openComputerFor(botId);
+      } else if (action.command.kind === "resolve-needs-you") {
+        const eventId = action.command.eventId;
+        const resolution = action.command.resolution;
+        await performBotMutation(botId, () =>
+          resolveNeedsYouCard(botId, messageId, eventId, resolution));
       }
     } catch (err) {
       if (activeIdRef.current === botId) {
@@ -1567,10 +1575,15 @@ export function Messenger() {
     return performBotMutation(botId, request);
   }
 
+  function openComputerFor(botId: string) {
+    if (activeId !== botId) return;
+    updateComputerPane(botId, true);
+    focusOnNextFrame(closeComputerButtonRef);
+  }
+
   function openComputer() {
     if (!activeId) return;
-    updateComputerPane(activeId, true);
-    focusOnNextFrame(closeComputerButtonRef);
+    openComputerFor(activeId);
   }
 
   function closeComputer() {
