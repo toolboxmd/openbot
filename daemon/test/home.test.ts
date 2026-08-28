@@ -9,7 +9,12 @@ import { describe, test } from "node:test";
 import type { AcpSession } from "../src/bots.ts";
 import { BotStore, channelHistory, talkPrompt } from "../src/bots.ts";
 import { startBox } from "../src/box.ts";
-import { MemoryComputerRuntime } from "../src/computer.ts";
+import {
+  COMPUTER_CONTAINER,
+  DISPLAY_BIN,
+  DockerComputerRuntime,
+  MemoryComputerRuntime,
+} from "../src/computer.ts";
 import { HUMAN_MEMBER_ID, HOME_SCHEMA_VERSION, HomeStore, defaultWorkspaceDir } from "../src/home.ts";
 import type { SpawnSpec } from "../src/harness.ts";
 
@@ -583,12 +588,336 @@ describe("BotStore sqlite is the only Transcript", () => {
     persisted.close();
   });
 
+  test("concurrent Bot creation publishes only after distinct display reservations commit", async () => {
+    const homeDir = await tempHome();
+    let releasePreparation!: () => void;
+    const preparationGate = new Promise<void>((resolve) => {
+      releasePreparation = resolve;
+    });
+    let bothPrepared!: () => void;
+    const bothAtPreparation = new Promise<void>((resolve) => {
+      bothPrepared = resolve;
+    });
+    const reservedIds: string[] = [];
+    class GatedComputer extends MemoryComputerRuntime {
+      override reserve(botId: string) {
+        reservedIds.push(botId);
+        return super.reserve(botId);
+      }
+
+      override async prepare(botId: string) {
+        if (reservedIds.length === 2) bothPrepared();
+        await preparationGate;
+        return super.prepare(botId);
+      }
+    }
+
+    const computer = new GatedComputer({ cookiesDir: join(homeDir, "cookies") });
+    const store = new BotStore(homeDir, { computer });
+    const adaPending = store.create("Ada");
+    const benPending = store.create("Ben");
+    await bothAtPreparation;
+    assert.deepEqual(store.list(), [], "reserved Bots became usable before commit");
+    assert.equal(reservedIds.length, 2);
+    assert.equal(computer.display(reservedIds[0]!), undefined);
+    assert.equal(computer.display(reservedIds[1]!), undefined);
+
+    releasePreparation();
+    const created = await Promise.all([adaPending, benPending]);
+    try {
+      assert.deepEqual(created.map((bot) => bot.display).sort(), [1, 2]);
+      assert.equal(store.list().length, 2);
+      const persisted = new HomeStore(homeDir);
+      assert.equal(persisted.listBots().length, 2);
+      assert.deepEqual(persisted.listBotProvisionings(), []);
+      persisted.close();
+    } finally {
+      store.close();
+    }
+  });
+
+  test("restart preserves exact displays when concurrent commits finish out of reservation order", async () => {
+    const homeDir = await tempHome();
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstReserved!: () => void;
+    const firstAtPreparation = new Promise<void>((resolve) => {
+      firstReserved = resolve;
+    });
+    class OutOfOrderComputer extends MemoryComputerRuntime {
+      override async prepare(botId: string) {
+        const reservation = this.reserve(botId);
+        if (reservation.display === 1) {
+          firstReserved();
+          await firstGate;
+        }
+        return super.prepare(botId);
+      }
+    }
+
+    const store = new BotStore(homeDir, {
+      computer: new OutOfOrderComputer({ cookiesDir: join(homeDir, "cookies-a") }),
+    });
+    const firstPending = store.create("First");
+    await firstAtPreparation;
+    const second = await store.create("Second");
+    assert.equal(second.display, 2);
+    releaseFirst();
+    const first = await firstPending;
+    assert.equal(first.display, 1);
+    store.close();
+
+    const restarted = new BotStore(homeDir, {
+      computer: new MemoryComputerRuntime({ cookiesDir: join(homeDir, "cookies-b") }),
+    });
+    await restarted.reattachDisplays();
+    try {
+      const byId = new Map(restarted.list().map((bot) => [bot.id, bot.display]));
+      assert.equal(byId.get(first.id), 1);
+      assert.equal(byId.get(second.id), 2);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  test("SQLite Bot commit failure releases the reserved display for retry", async () => {
+    const homeDir = await tempHome();
+    const databasePath = join(homeDir, "talk.sqlite");
+    const seed = new HomeStore(homeDir);
+    seed.close();
+    const failingDatabase = new DatabaseSync(databasePath);
+    failingDatabase.exec(`
+      CREATE TRIGGER fail_bot_commit
+      BEFORE INSERT ON bots
+      BEGIN
+        SELECT RAISE(FAIL, 'controlled Bot commit failure');
+      END;
+    `);
+    failingDatabase.close();
+
+    const attemptedIds: string[] = [];
+    class TrackingComputer extends MemoryComputerRuntime {
+      override reserve(botId: string) {
+        attemptedIds.push(botId);
+        return super.reserve(botId);
+      }
+    }
+
+    const computer = new TrackingComputer({ cookiesDir: join(homeDir, "cookies") });
+    const store = new BotStore(homeDir, { computer });
+    try {
+      await assert.rejects(store.create("Ada"), /controlled Bot commit failure/);
+      assert.equal(attemptedIds.length, 1);
+      assert.equal(computer.display(attemptedIds[0]!), undefined, "failed creation leaked display 1");
+      assert.deepEqual(store.list(), []);
+
+      const repairedDatabase = new DatabaseSync(databasePath);
+      repairedDatabase.exec("DROP TRIGGER fail_bot_commit");
+      repairedDatabase.close();
+
+      const retry = await store.create("Ada retry");
+      assert.equal(retry.display, 1, "retry did not reuse the compensated display slot");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("restart discards a persisted pre-prepare display reservation and retry reuses that display", async () => {
+    const homeDir = await tempHome();
+    const seeded = new BotStore(homeDir, {
+      computer: new MemoryComputerRuntime({ cookiesDir: join(homeDir, "cookies-seed") }),
+    });
+    const existing = await seeded.create("Existing");
+    assert.equal(existing.display, 1);
+    seeded.close();
+
+    const interruptedBotId = crypto.randomUUID();
+    const interrupted = new HomeStore(homeDir);
+    interrupted.beginBotProvisioning(interruptedBotId);
+    interrupted.setBotProvisioningWorkspaceOwned(interruptedBotId, false);
+    interrupted.setBotProvisioningDisplay(interruptedBotId, 2);
+    interrupted.close();
+
+    const dockerCalls: string[][] = [];
+    const computer = new DockerComputerRuntime({
+      hostPorts: [16911, 16912],
+      cookiesDir: join(homeDir, "cookies-restart"),
+      docker: async (args) => {
+        dockerCalls.push(args);
+        if (args[0] === "inspect") return { code: 0, stdout: "true\n", stderr: "" };
+        if (args[3] === "stop") {
+          return { code: 73, stdout: "", stderr: "cookies_out requires a published epoch\n" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    const restarted = new BotStore(homeDir, { computer, screenReady: async () => true });
+    try {
+      await restarted.reattachDisplays();
+      assert.deepEqual(restarted.list().map((bot) => [bot.id, bot.display]), [[existing.id, 1]]);
+      assert.equal(
+        existsSync(join(defaultWorkspaceDir(homeDir), "bots", interruptedBotId)),
+        false,
+        "pre-prepare recovery created or leaked an unpublished workspace",
+      );
+
+      const recoveredHome = new HomeStore(homeDir);
+      assert.deepEqual(recoveredHome.listBotProvisionings(), []);
+      recoveredHome.close();
+
+      const retry = await restarted.create("Retry");
+      assert.equal(retry.display, 2);
+      assert.deepEqual(
+        restarted.list().map((bot) => bot.display).sort(),
+        [1, 2],
+        "retry published a duplicate or wrong display",
+      );
+      assert.deepEqual(
+        dockerCalls.filter((args) => args.includes(DISPLAY_BIN)),
+        [
+          ["exec", COMPUTER_CONTAINER, DISPLAY_BIN, "discard", "2"],
+          ["exec", COMPUTER_CONTAINER, DISPLAY_BIN, "start", "2"],
+        ],
+      );
+    } finally {
+      restarted.close();
+    }
+  });
+
+  test("SQLite publication failure discards its runtime slot while published release uses normal stop", async () => {
+    const homeDir = await tempHome();
+    const dockerCalls: string[][] = [];
+    const computer = new DockerComputerRuntime({
+      hostPorts: [16911, 16912],
+      cookiesDir: join(homeDir, "cookies"),
+      docker: async (args) => {
+        dockerCalls.push(args);
+        return { code: 0, stdout: args[0] === "inspect" ? "true\n" : "", stderr: "" };
+      },
+    });
+    const store = new BotStore(homeDir, { computer, screenReady: async () => true });
+    try {
+      const existing = await store.create("Existing");
+      assert.equal(existing.display, 1);
+
+      const database = new DatabaseSync(join(homeDir, "talk.sqlite"));
+      database.exec(`
+        CREATE TRIGGER fail_runtime_slot_publication
+        BEFORE INSERT ON bots
+        WHEN NEW.name = 'Commit fail'
+        BEGIN
+          SELECT RAISE(FAIL, 'controlled runtime slot publication failure');
+        END;
+      `);
+      database.close();
+
+      await assert.rejects(store.create("Commit fail"), /controlled runtime slot publication failure/i);
+      assert.deepEqual(store.list().map((bot) => bot.display), [1]);
+
+      const repaired = new DatabaseSync(join(homeDir, "talk.sqlite"));
+      repaired.exec("DROP TRIGGER fail_runtime_slot_publication");
+      repaired.close();
+
+      const retry = await store.create("Published retry");
+      assert.equal(retry.display, 2);
+      await computer.release(retry.id);
+      assert.equal(computer.display(retry.id), undefined);
+      assert.deepEqual(
+        dockerCalls.filter((args) => args.includes(DISPLAY_BIN)),
+        [
+          ["exec", COMPUTER_CONTAINER, DISPLAY_BIN, "start", "2"],
+          ["exec", COMPUTER_CONTAINER, DISPLAY_BIN, "discard", "2"],
+          ["exec", COMPUTER_CONTAINER, DISPLAY_BIN, "start", "2"],
+          ["exec", COMPUTER_CONTAINER, DISPLAY_BIN, "stop", "2"],
+        ],
+      );
+    } finally {
+      store.close();
+    }
+  });
+
+  test("cleanup failure persists exact provisioning state and restart recovers display 2", async () => {
+    const homeDir = await tempHome();
+    let failedBotId = "";
+    let failCleanup = false;
+    class CleanupFailComputer extends MemoryComputerRuntime {
+      override reserve(botId: string) {
+        if (failCleanup) failedBotId = botId;
+        return super.reserve(botId);
+      }
+
+      override async rollback(botId: string, display?: number): Promise<void> {
+        if (failCleanup && botId === failedBotId) throw new Error("controlled display cleanup failure");
+        await super.rollback(botId, display);
+      }
+    }
+
+    const computer = new CleanupFailComputer({ cookiesDir: join(homeDir, "cookies-a") });
+    const store = new BotStore(homeDir, { computer });
+    const existing = await store.create("Existing");
+    assert.equal(existing.display, 1);
+
+    const failingDatabase = new DatabaseSync(join(homeDir, "talk.sqlite"));
+    failingDatabase.exec(`
+      CREATE TRIGGER fail_second_bot_commit
+      BEFORE INSERT ON bots
+      WHEN NEW.name = 'Cleanup fail'
+      BEGIN
+        SELECT RAISE(FAIL, 'controlled second Bot commit failure');
+      END;
+    `);
+    failingDatabase.close();
+    failCleanup = true;
+
+    let createError: unknown;
+    try {
+      await store.create("Cleanup fail");
+    } catch (error) {
+      createError = error;
+    } finally {
+      store.close();
+    }
+
+    const failure = createError as Error & { code?: string; provisioningId?: string; recoverable?: boolean };
+    assert.equal(failure.code, "BOT_PROVISIONING_CLEANUP_REQUIRED", failure.message);
+    assert.equal(failure.provisioningId, failedBotId);
+    assert.equal(failure.recoverable, true);
+    assert.equal(existsSync(join(defaultWorkspaceDir(homeDir), "bots", failedBotId)), false);
+
+    const pending = new HomeStore(homeDir);
+    assert.deepEqual(pending.listBotProvisionings(), [{
+      botId: failedBotId,
+      display: 2,
+      workspaceOwned: false,
+      state: "cleanup-required",
+    }]);
+    pending.close();
+
+    const recoveredComputer = new MemoryComputerRuntime({ cookiesDir: join(homeDir, "cookies-b") });
+    const restarted = new BotStore(homeDir, { computer: recoveredComputer });
+    await restarted.reattachDisplays();
+    try {
+      assert.deepEqual(restarted.list().map((bot) => [bot.name, bot.display]), [["Existing", 1]]);
+      assert.deepEqual(
+        recoveredComputer.commands.filter((args) => args.includes(DISPLAY_BIN)),
+        [["exec", COMPUTER_CONTAINER, DISPLAY_BIN, "discard", "2"]],
+      );
+      const recoveredHome = new HomeStore(homeDir);
+      assert.deepEqual(recoveredHome.listBotProvisionings(), []);
+      recoveredHome.close();
+    } finally {
+      restarted.close();
+    }
+  });
+
   test("later failure preserves a modified new Bot workspace and reports cleanup", async () => {
     const homeDir = await tempHome();
     const botsDir = join(defaultWorkspaceDir(homeDir), "bots");
     let failedBotId = "";
     class UserWritingComputer extends MemoryComputerRuntime {
-      override async allocate(botId: string): Promise<never> {
+      override async prepare(botId: string): Promise<never> {
         failedBotId = botId;
         await writeFile(join(botsDir, botId, "user-owned.txt"), "keep\n");
         throw new Error("fixture allocation failure");
@@ -637,6 +966,43 @@ describe("BotStore sqlite is the only Transcript", () => {
     assert.equal(listed[0]?.display, 1);
     assert.equal(listed[1]?.display, 2);
     store.close();
+  });
+
+  test("persisted display prepare failure uses committed release instead of provisioning discard", async () => {
+    const homeDir = await tempHome();
+    const seeded = new BotStore(homeDir, {
+      computer: new MemoryComputerRuntime({ cookiesDir: join(homeDir, "cookies-seed") }),
+    });
+    await seeded.create("Ada");
+    await seeded.create("Bob");
+    seeded.close();
+
+    const dockerCalls: string[][] = [];
+    const computer = new DockerComputerRuntime({
+      hostPorts: [16911, 16912],
+      cookiesDir: join(homeDir, "cookies-restart"),
+      docker: async (args) => {
+        dockerCalls.push(args);
+        if (args[0] === "inspect") return { code: 0, stdout: "true\n", stderr: "" };
+        if (args[3] === "start") {
+          return { code: 61, stdout: "", stderr: "controlled persisted prepare failure\n" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    const restarted = new BotStore(homeDir, { computer });
+    try {
+      await assert.rejects(restarted.reattachDisplays(), /controlled persisted prepare failure/i);
+      assert.deepEqual(
+        dockerCalls.filter((args) => args.includes(DISPLAY_BIN)),
+        [
+          ["exec", COMPUTER_CONTAINER, DISPLAY_BIN, "start", "2"],
+          ["exec", COMPUTER_CONTAINER, DISPLAY_BIN, "stop", "2"],
+        ],
+      );
+    } finally {
+      restarted.close();
+    }
   });
 
   test("after send, sqlite session_id is the id returned by session/new", async () => {

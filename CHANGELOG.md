@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.8] - 2026-08-28
+
+### Changed
+
+- Make Screen readiness and Bot provisioning transactional, including idempotent discard of interrupted unpublished displays without exporting committed cookies
+
 ## [0.9.7] - 2026-08-28
 
 ### Changed

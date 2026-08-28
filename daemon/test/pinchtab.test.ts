@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readlinkSync,
@@ -15,6 +16,7 @@ import {
 } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import http from "node:http";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, relative, resolve } from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -949,6 +951,39 @@ function cookieManifest(snapshot: string): Record<string, string> {
         return [line.slice(0, separator), line.slice(separator + 1)];
       }),
   );
+}
+
+function privateTreeSnapshot(root: string): unknown[] {
+  const entries: unknown[] = [];
+  const visit = (relativePath: string) => {
+    const absolutePath = relativePath ? join(root, relativePath) : root;
+    const state = lstatSync(absolutePath, { bigint: true });
+    const kind = state.isDirectory() ? "directory" : state.isSymbolicLink() ? "symlink" : "file";
+    entries.push({
+      path: relativePath || ".",
+      kind,
+      mode: Number(state.mode & 0o7777n),
+      uid: state.uid.toString(),
+      gid: state.gid.toString(),
+      size: state.size.toString(),
+      mtimeNs: state.mtimeNs.toString(),
+      target: kind === "symlink" ? readlinkSync(absolutePath) : undefined,
+      bytes: kind === "file" ? readFileSync(absolutePath).toString("base64") : undefined,
+    });
+    if (kind === "directory") {
+      for (const name of readdirSync(absolutePath).sort()) {
+        visit(relativePath ? join(relativePath, name) : name);
+      }
+    }
+  };
+  visit("");
+  return entries;
+}
+
+function committedCookieStoreSnapshot(root: string): unknown[] {
+  const entries = structuredClone(privateTreeSnapshot(root)) as Array<Record<string, unknown>>;
+  if (entries[0]?.path === ".") delete entries[0].mtimeNs;
+  return entries;
 }
 
 function collectChild(child: ReturnType<typeof spawn>): Promise<{
@@ -3382,6 +3417,7 @@ describe("PinchTab display lifecycle", () => {
     try {
       const invalidCommands = [
         ["start", "1", /display must be 2-8/u],
+        ["discard", "1", /display must be 2-8/u],
         ["stop", "9", /display must be 1-8/u],
         ["seed", "9", /display must be 1-8/u],
         ["cookies-in", "9", /display must be 1-8/u],
@@ -3424,6 +3460,720 @@ describe("PinchTab display lifecycle", () => {
       assert.equal(existsSync(traversalTarget), false, "display suffix escaped Screen Home");
       assert.deepEqual(readdirSync(traversalHome), [], "traversal payload mutated Screen Home");
     } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("display discard is idempotent before start and preserves the committed cookie jar", async () => {
+    const root = await tempDir("openbot-display-discard-never-started-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    const binDir = join(root, "bin");
+    mkdirSync(join(jar, "Network"), { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(jar, "Network", "Cookies"), "committed-cookie");
+    writeFileSync(join(jar, "Local State"), "committed-local-state");
+    for (const name of ["pgrep", "timeout"]) {
+      writeFileSync(join(binDir, name), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    }
+    writeFileSync(join(binDir, "pkill"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(join(binDir, "su"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+    let display = 0;
+    for (const candidate of [8, 7, 6, 5, 4, 3, 2]) {
+      if (!existsSync(`/tmp/.X${candidate}-lock`) && !existsSync(`/tmp/.X11-unix/X${candidate}`)) {
+        display = candidate;
+        break;
+      }
+    }
+    assert.notEqual(display, 0, "no unused test display id was available");
+    const env = {
+      ...process.env,
+      COOKIE_JAR: jar,
+      OPENBOT_PINCHTAB_PORT_BASE: "29866",
+      OPENBOT_SCREEN_HOME: home,
+      PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
+    try {
+      const imported = spawnSync("bash", [displaySh, "cookies-in", "1"], { encoding: "utf8", env });
+      assert.equal(imported.status, 0, imported.stderr);
+      const committedSnapshot = currentCookieSnapshot(jar);
+      const committedSnapshotState = privateTreeSnapshot(committedSnapshot);
+      const stopped = spawnSync("bash", [displaySh, "stop", String(display)], {
+        encoding: "utf8",
+        env,
+        timeout: 5_000,
+      });
+      assert.equal(stopped.signal, null, stopped.stdout + stopped.stderr);
+      assert.equal(stopped.status, 1, stopped.stdout + stopped.stderr);
+      assert.match(stopped.stderr, /invalidated.*import|failed to commit cookies/iu);
+      assert.equal(currentCookieSnapshot(jar), committedSnapshot);
+      assert.deepEqual(privateTreeSnapshot(committedSnapshot), committedSnapshotState);
+      const committedBefore = committedCookieStoreSnapshot(jar);
+
+      for (const attempt of [1, 2]) {
+        const discarded = spawnSync("bash", [displaySh, "discard", String(display)], {
+          encoding: "utf8",
+          env,
+          timeout: 5_000,
+        });
+        assert.equal(discarded.signal, null, `attempt ${attempt}: ${discarded.stdout}${discarded.stderr}`);
+        assert.equal(discarded.status, 0, `attempt ${attempt}: ${discarded.stdout}${discarded.stderr}`);
+        assert.deepEqual(committedCookieStoreSnapshot(jar), committedBefore, `attempt ${attempt} mutated committed cookies`);
+        assert.equal(existsSync(join(home, ".config", `google-chrome-d${display}`)), false);
+        assert.equal(existsSync(join(home, `.config-d${display}`)), false);
+        assert.equal(existsSync(join(home, `.pinchtab-d${display}`)), false);
+      }
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("display discard serializes profile deletion behind the canonical cookie lock", async () => {
+    const root = await tempDir("openbot-display-discard-cookie-lock-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    const binDir = join(root, "bin");
+    const ownerScript = join(root, "cookie-lock-owner.sh");
+    const ready = join(root, "owner-ready");
+    const release = join(root, "owner-release");
+    const cleanupLog = join(root, "cleanup.log");
+    const display = 8;
+    const profile = join(home, ".config", `google-chrome-d${display}`);
+    const config = join(home, `.config-d${display}`);
+    mkdirSync(join(jar, "Network"), { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(jar, "Network", "Cookies"), "committed-cookie");
+    const baseEnv = {
+      ...process.env,
+      COOKIE_JAR: jar,
+      OPENBOT_PINCHTAB_PORT_BASE: "29866",
+      OPENBOT_SCREEN_HOME: home,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
+    const imported = spawnSync("bash", [displaySh, "cookies-in", "1"], { encoding: "utf8", env: baseEnv });
+    assert.equal(imported.status, 0, imported.stderr);
+    mkdirSync(join(profile, "Default", "Network"), { recursive: true });
+    mkdirSync(config, { recursive: true });
+    writeFileSync(join(profile, "owned-profile"), "retain-until-lock-release");
+    writeFileSync(join(config, "owned-config"), "retain-until-lock-release");
+    const committedBefore = committedCookieStoreSnapshot(jar);
+    const snapshot = currentCookieSnapshot(jar);
+    const snapshotBefore = privateTreeSnapshot(snapshot);
+
+    writeFileSync(
+      ownerScript,
+      `#!/bin/bash
+set -euo pipefail
+lock="$1"
+ready="$2"
+release="$3"
+mkdir "$lock"
+printf '%s\\n' "$$" > "$lock/pid"
+if [ -r "/proc/$$/stat" ]; then
+  awk '{print $22}' "/proc/$$/stat" > "$lock/start"
+else
+  ps -o lstart= -p "$$" | sed 's/^[[:space:]]*//' > "$lock/start"
+fi
+chmod 700 "$lock"
+chmod 600 "$lock/pid" "$lock/start"
+: > "$ready"
+while [ ! -e "$release" ]; do sleep 0.02; done
+rm -f -- "$lock/pid" "$lock/start"
+rmdir "$lock"
+`,
+      { mode: 0o755 },
+    );
+    for (const [name, status] of [["pgrep", 1], ["pkill", 0], ["su", 0], ["timeout", 1]] as const) {
+      writeFileSync(
+        join(binDir, name),
+        `#!/bin/sh
+printf '%s\\n' '${name}' >> "$OPENBOT_DISCARD_CALL_LOG"
+exit ${status}
+`,
+        { mode: 0o755 },
+      );
+    }
+
+    const lock = join(jar, ".sync.lock");
+    const owner = spawn("bash", [ownerScript, lock, ready, release], { stdio: "ignore" });
+    const ownerPid = owner.pid;
+    assert.ok(ownerPid, "cookie lock fixture did not spawn an owner process");
+    const ownerDone = collectChild(owner);
+    let discard: ReturnType<typeof spawn> | null = null;
+    let discardDone: ReturnType<typeof collectChild> | null = null;
+    try {
+      await waitUntil(() => existsSync(ready) && existsSync(join(lock, "start")));
+      assert.equal(readFileSync(join(lock, "pid"), "utf8").trim(), String(ownerPid));
+      assert.equal(
+        readFileSync(join(lock, "start"), "utf8").replace(/\r?\n$/u, ""),
+        processStartId(ownerPid),
+      );
+
+      discard = spawn("bash", [displaySh, "discard", String(display)], {
+        env: {
+          ...baseEnv,
+          OPENBOT_DISCARD_CALL_LOG: cleanupLog,
+          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      discardDone = collectChild(discard);
+      await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+      assert.equal(discard.exitCode, null, "discard bypassed a live canonical cookie lock");
+      assert.equal(existsSync(profile), true, "discard removed the profile while another operation owned the lock");
+      assert.equal(existsSync(config), true, "discard removed display config while another operation owned the lock");
+      assert.equal(existsSync(cleanupLog), false, "discard began cleanup before acquiring the cookie lock");
+      assert.deepEqual(privateTreeSnapshot(snapshot), snapshotBefore, "waiting discard mutated committed cookies");
+
+      writeFileSync(release, "release\n");
+      const ownerResult = await ownerDone;
+      assert.equal(ownerResult.status, 0, ownerResult.stdout + ownerResult.stderr);
+      const discarded = await discardDone;
+      assert.equal(discarded.signal, null, discarded.stdout + discarded.stderr);
+      assert.equal(discarded.status, 0, discarded.stdout + discarded.stderr);
+      assert.equal(existsSync(profile), false);
+      assert.equal(existsSync(config), false);
+      assert.deepEqual(committedCookieStoreSnapshot(jar), committedBefore);
+    } finally {
+      if (!existsSync(release)) writeFileSync(release, "release\n");
+      if (processAlive(ownerPid)) owner.kill("SIGKILL");
+      if (discard && processAlive(discard.pid)) discard.kill("SIGKILL");
+      await Promise.allSettled([ownerDone, ...(discardDone ? [discardDone] : [])]);
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("display discard compensates start failures before and after cookie marker publication", async () => {
+    for (const markerPublished of [false, true]) {
+      const root = await tempDir(`openbot-display-discard-marker-${markerPublished ? "after" : "before"}-`);
+      const home = join(root, "home");
+      const jar = join(root, "cookies");
+      const binDir = join(root, "bin");
+      mkdirSync(join(jar, "Network"), { recursive: true });
+      mkdirSync(binDir, { recursive: true });
+      writeFileSync(join(jar, "Network", "Cookies"), "committed-cookie");
+      writeFileSync(join(jar, "Local State"), "committed-local-state");
+
+      let display = 0;
+      for (const candidate of [8, 7, 6, 5, 4, 3, 2]) {
+        if (!existsSync(`/tmp/.X${candidate}-lock`) && !existsSync(`/tmp/.X11-unix/X${candidate}`)) {
+          display = candidate;
+          break;
+        }
+      }
+      assert.notEqual(display, 0, "no unused test display id was available");
+      const baseEnv = {
+        ...process.env,
+        COOKIE_JAR: jar,
+        OPENBOT_SCREEN_HOME: home,
+        VNC_USER: process.env.USER ?? "openbot",
+      };
+      try {
+        const imported = spawnSync("bash", [displaySh, "cookies-in", "1"], {
+          encoding: "utf8",
+          env: baseEnv,
+        });
+        assert.equal(imported.status, 0, imported.stderr);
+        const committedSnapshot = currentCookieSnapshot(jar);
+        const committedSnapshotState = privateTreeSnapshot(committedSnapshot);
+
+        writeFileSync(
+          join(binDir, "cp"),
+          `#!/bin/bash
+src="\${1:-}"
+for arg in "$@"; do dest="$arg"; done
+if [ "\${OPENBOT_FAIL_SNAPSHOT_COPY:-}" = "1" ] && [[ "$src" == *"/snapshots/"* ]]; then
+  exit 41
+fi
+if [ -d "$dest" ]; then dest="$dest/fixture"; fi
+mkdir -p "$(dirname "$dest")"
+: > "$dest"
+`,
+          { mode: 0o755 },
+        );
+        writeFileSync(join(binDir, "su"), "#!/bin/sh\nexit 55\n", { mode: 0o755 });
+        writeFileSync(join(binDir, "pkill"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+        for (const name of ["pgrep", "timeout"]) {
+          writeFileSync(join(binDir, name), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+        }
+        const env = {
+          ...baseEnv,
+          OPENBOT_FAIL_SNAPSHOT_COPY: markerPublished ? "0" : "1",
+          OPENBOT_PINCHTAB_PORT_BASE: "29866",
+          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+        };
+        const started = spawnSync("bash", [displaySh, "start", String(display)], {
+          encoding: "utf8",
+          env,
+          timeout: 5_000,
+        });
+        assert.equal(started.signal, null, started.stdout + started.stderr);
+        assert.notEqual(started.status, 0, "controlled start failure unexpectedly succeeded");
+        const profile = join(home, ".config", `google-chrome-d${display}`);
+        const marker = join(profile, ".openbot-cookie-epoch");
+        assert.equal(existsSync(profile), true, "start failure did not leave a partial profile to compensate");
+        assert.equal(existsSync(marker), markerPublished, "fixture failed on the wrong marker side");
+        writeFileSync(join(profile, "Default", "Network", "Cookies"), "unpublished-stale-cookie");
+        assert.equal(currentCookieSnapshot(jar), committedSnapshot);
+        assert.deepEqual(privateTreeSnapshot(committedSnapshot), committedSnapshotState);
+        const jarBeforeDiscard = committedCookieStoreSnapshot(jar);
+
+        const discarded = spawnSync("bash", [displaySh, "discard", String(display)], {
+          encoding: "utf8",
+          env,
+          timeout: 5_000,
+        });
+        assert.equal(discarded.signal, null, discarded.stdout + discarded.stderr);
+        assert.equal(discarded.status, 0, discarded.stdout + discarded.stderr);
+        assert.deepEqual(committedCookieStoreSnapshot(jar), jarBeforeDiscard, "discard mutated committed cookie state");
+        assert.equal(existsSync(profile), false, "discard retained a partial cookie profile");
+        assert.equal(existsSync(join(home, `.config-d${display}`)), false, "discard retained partial XFCE state");
+      } finally {
+        rmSync(root, { force: true, recursive: true });
+      }
+    }
+  });
+
+  test("display discard refuses symlinked state and forged live ownership without touching foreign targets", async () => {
+    const symlinkRoot = await tempDir("openbot-display-discard-symlink-");
+    const symlinkHome = join(symlinkRoot, "home");
+    const symlinkJar = join(symlinkRoot, "cookies");
+    const symlinkOutside = join(symlinkRoot, "outside");
+    const symlinkBin = join(symlinkRoot, "bin");
+    const callLog = join(symlinkRoot, "calls.log");
+    mkdirSync(join(symlinkJar, "Network"), { recursive: true });
+    mkdirSync(symlinkOutside, { recursive: true });
+    mkdirSync(symlinkBin, { recursive: true });
+    writeFileSync(join(symlinkJar, "Network", "Cookies"), "committed-cookie");
+    writeFileSync(join(symlinkOutside, "sentinel"), "foreign-state");
+    const symlinkBaseEnv = {
+      ...process.env,
+      COOKIE_JAR: symlinkJar,
+      OPENBOT_SCREEN_HOME: symlinkHome,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
+    try {
+      const imported = spawnSync("bash", [displaySh, "cookies-in", "1"], {
+        encoding: "utf8",
+        env: symlinkBaseEnv,
+      });
+      assert.equal(imported.status, 0, imported.stderr);
+      const jarBefore = committedCookieStoreSnapshot(symlinkJar);
+      const display = 8;
+      symlinkSync(symlinkOutside, join(symlinkHome, ".config", `google-chrome-d${display}`), "dir");
+      for (const name of ["pgrep", "pkill", "su", "timeout"]) {
+        writeFileSync(
+          join(symlinkBin, name),
+          `#!/bin/sh\nprintf '%s\\n' '${name}' >> "$OPENBOT_DISCARD_CALL_LOG"\nexit 0\n`,
+          { mode: 0o755 },
+        );
+      }
+      const discarded = spawnSync("bash", [displaySh, "discard", String(display)], {
+        encoding: "utf8",
+        env: {
+          ...symlinkBaseEnv,
+          OPENBOT_DISCARD_CALL_LOG: callLog,
+          PATH: `${symlinkBin}${delimiter}${process.env.PATH ?? ""}`,
+        },
+        timeout: 5_000,
+      });
+      assert.equal(discarded.signal, null, discarded.stdout + discarded.stderr);
+      assert.equal(discarded.status, 1, discarded.stdout + discarded.stderr);
+      assert.match(discarded.stderr, /real directory|symlink/iu);
+      assert.equal(readFileSync(join(symlinkOutside, "sentinel"), "utf8"), "foreign-state");
+      assert.deepEqual(committedCookieStoreSnapshot(symlinkJar), jarBefore);
+      assert.equal(existsSync(callLog), false, "unsafe state reached a cleanup subprocess");
+    } finally {
+      rmSync(symlinkRoot, { force: true, recursive: true });
+    }
+
+    const ownerRoot = await tempDir("openbot-display-discard-foreign-owner-");
+    const ownerHome = join(ownerRoot, "home");
+    const ownerBin = join(ownerRoot, "bin");
+    const display = 8;
+    const ownerDir = join(ownerHome, `.pinchtab-d${display}`);
+    const ownerPath = join(ownerDir, "bridge-owner.json");
+    mkdirSync(ownerDir, { recursive: true });
+    mkdirSync(ownerBin, { recursive: true });
+    writeFileSync(join(ownerBin, "timeout"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const owner = {
+      schema: 1,
+      display,
+      port: 29_866 + display,
+      supervisorPid: process.pid,
+      supervisorStart: processStartId(process.pid),
+      childPid: process.pid,
+      childStart: processStartId(process.pid),
+      binary: "/foreign/pinchtab",
+      config: join(ownerDir, "foreign-config.json"),
+    };
+    writeFileSync(ownerPath, JSON.stringify(owner), { mode: 0o600 });
+    try {
+      const discarded = spawnSync("bash", [displaySh, "discard", String(display)], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          COOKIE_JAR: join(ownerRoot, "cookies"),
+          OPENBOT_PINCHTAB_BIN: "/expected/pinchtab",
+          OPENBOT_PINCHTAB_PORT_BASE: "29866",
+          OPENBOT_SCREEN_HOME: ownerHome,
+          PATH: `${ownerBin}${delimiter}${process.env.PATH ?? ""}`,
+          VNC_USER: process.env.USER ?? "openbot",
+        },
+        timeout: 5_000,
+      });
+      assert.equal(discarded.signal, null, discarded.stdout + discarded.stderr);
+      assert.equal(discarded.status, 1, discarded.stdout + discarded.stderr);
+      assert.match(discarded.stderr, /foreign live ownership/iu);
+      assert.equal(processAlive(process.pid), true, "discard killed the forged owner target");
+      assert.deepEqual(JSON.parse(readFileSync(ownerPath, "utf8")), owner);
+    } finally {
+      rmSync(ownerRoot, { force: true, recursive: true });
+    }
+  });
+
+  test("display discard rejects incoherent X socket state before any cleanup", async (t) => {
+    for (const fixture of ["non-socket", "unverified-socket"] as const) {
+      await t.test(fixture, async () => {
+        const root = await tempDir(`openbot-display-discard-x-${fixture}-`);
+        const home = join(root, "home");
+        const jar = join(root, "cookies");
+        const binDir = join(root, "bin");
+        const xRoot = await mkdtemp(join(tmpdir(), "ob93x-"));
+        const xLockDir = join(xRoot, "l");
+        const xSocketDir = join(xRoot, "s");
+        const cleanupLog = join(root, "cleanup.log");
+        const display = 8;
+        const profile = join(home, ".config", `google-chrome-d${display}`);
+        const config = join(home, `.config-d${display}`);
+        const xLock = join(xLockDir, `.X${display}-lock`);
+        const xSocket = join(xSocketDir, `X${display}`);
+        mkdirSync(join(jar, "Network"), { recursive: true });
+        mkdirSync(binDir, { recursive: true });
+        mkdirSync(xLockDir, { recursive: true });
+        mkdirSync(xSocketDir, { recursive: true });
+        writeFileSync(join(jar, "Network", "Cookies"), "committed-cookie");
+        const baseEnv = {
+          ...process.env,
+          COOKIE_JAR: jar,
+          OPENBOT_PINCHTAB_PORT_BASE: "29866",
+          OPENBOT_SCREEN_HOME: home,
+          OPENBOT_X_LOCK_DIR: xLockDir,
+          OPENBOT_X_SOCKET_DIR: xSocketDir,
+          VNC_USER: process.env.USER ?? "openbot",
+        };
+        const imported = spawnSync("bash", [displaySh, "cookies-in", "1"], {
+          encoding: "utf8",
+          env: baseEnv,
+        });
+        assert.equal(imported.status, 0, imported.stderr);
+        mkdirSync(profile, { recursive: true });
+        mkdirSync(config, { recursive: true });
+        writeFileSync(join(profile, "sentinel"), "owned-profile");
+        writeFileSync(join(config, "sentinel"), "owned-config");
+        for (const [name, status] of [["pgrep", 1], ["pkill", 0], ["su", 0], ["timeout", 1]] as const) {
+          writeFileSync(
+            join(binDir, name),
+            `#!/bin/sh
+printf '%s\\n' '${name}' >> "$OPENBOT_DISCARD_CALL_LOG"
+exit ${status}
+`,
+            { mode: 0o755 },
+          );
+        }
+
+        const xServer = net.createServer();
+        if (fixture === "non-socket") {
+          writeFileSync(xSocket, "foreign-non-socket");
+        } else {
+          writeFileSync(xLock, "not-a-pid\n", { mode: 0o600 });
+          await new Promise<void>((resolveListen, rejectListen) => {
+            xServer.once("error", rejectListen);
+            xServer.listen(xSocket, () => resolveListen());
+          });
+        }
+        const jarBefore = committedCookieStoreSnapshot(jar);
+        const socketBytes = fixture === "non-socket" ? readFileSync(xSocket) : null;
+        const lockBytes = fixture === "unverified-socket" ? readFileSync(xLock) : null;
+        try {
+          if (fixture === "unverified-socket") {
+            const socketType = spawnSync("bash", ["-c", "[ -S \"$1\" ]", "_", xSocket], {
+              encoding: "utf8",
+            });
+            assert.equal(socketType.status, 0, "fixture did not publish a real Unix socket");
+          }
+          const discarded = spawnSync("bash", [displaySh, "discard", String(display)], {
+            encoding: "utf8",
+            env: {
+              ...baseEnv,
+              OPENBOT_DISCARD_CALL_LOG: cleanupLog,
+              PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+            },
+            timeout: 5_000,
+          });
+          assert.equal(discarded.signal, null, discarded.stdout + discarded.stderr);
+          assert.equal(
+            discarded.status,
+            1,
+            JSON.stringify({ fixture, stdout: discarded.stdout, stderr: discarded.stderr }),
+          );
+          assert.match(discarded.stderr, /X socket|verified ownership|Unix socket/iu);
+          assert.equal(existsSync(cleanupLog), false, "incoherent X state reached a cleanup subprocess");
+          assert.equal(readFileSync(join(profile, "sentinel"), "utf8"), "owned-profile");
+          assert.equal(readFileSync(join(config, "sentinel"), "utf8"), "owned-config");
+          assert.deepEqual(committedCookieStoreSnapshot(jar), jarBefore);
+          if (fixture === "non-socket") {
+            assert.equal(lstatSync(xSocket).isFile(), true);
+            assert.deepEqual(readFileSync(xSocket), socketBytes);
+            assert.equal(existsSync(xLock), false);
+          } else {
+            assert.equal(lstatSync(xSocket).isSocket(), true);
+            assert.deepEqual(readFileSync(xLock), lockBytes);
+          }
+        } finally {
+          if (xServer.listening) {
+            await new Promise<void>((resolveClose) => xServer.close(() => resolveClose()));
+          }
+          rmSync(root, { force: true, recursive: true });
+          rmSync(xRoot, { force: true, recursive: true });
+        }
+      });
+    }
+  });
+
+  test("display discard reports exact Chrome cleanup failure and retains recoverable partial state", async () => {
+    const root = await tempDir("openbot-display-discard-chrome-failure-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    const binDir = join(root, "bin");
+    const cleanupLog = join(root, "cleanup.log");
+    mkdirSync(join(jar, "Network"), { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(jar, "Network", "Cookies"), "committed-cookie");
+    let display = 0;
+    for (const candidate of [8, 7, 6, 5, 4, 3, 2]) {
+      if (!existsSync(`/tmp/.X${candidate}-lock`) && !existsSync(`/tmp/.X11-unix/X${candidate}`)) {
+        display = candidate;
+        break;
+      }
+    }
+    assert.notEqual(display, 0, "no unused test display id was available");
+    const baseEnv = {
+      ...process.env,
+      COOKIE_JAR: jar,
+      OPENBOT_SCREEN_HOME: home,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
+    try {
+      const imported = spawnSync("bash", [displaySh, "cookies-in", String(display)], {
+        encoding: "utf8",
+        env: baseEnv,
+      });
+      assert.equal(imported.status, 0, imported.stderr);
+      const profile = join(home, ".config", `google-chrome-d${display}`);
+      const config = join(home, `.config-d${display}`);
+      mkdirSync(config, { recursive: true });
+      writeFileSync(join(config, "partial-state"), "retain-for-retry");
+      const jarBefore = committedCookieStoreSnapshot(jar);
+
+      writeFileSync(
+        join(binDir, "pkill"),
+        '#!/bin/sh\nprintf "%s\\n" "$*" >> "$OPENBOT_DISCARD_CLEANUP_LOG"\nexit 0\n',
+        { mode: 0o755 },
+      );
+      writeFileSync(join(binDir, "pgrep"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      writeFileSync(join(binDir, "sleep"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      writeFileSync(join(binDir, "timeout"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+      const discarded = spawnSync("bash", [displaySh, "discard", String(display)], {
+        encoding: "utf8",
+        env: {
+          ...baseEnv,
+          OPENBOT_DISCARD_CLEANUP_LOG: cleanupLog,
+          OPENBOT_PINCHTAB_PORT_BASE: "29866",
+          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+        },
+        timeout: 5_000,
+      });
+      assert.equal(discarded.signal, null, discarded.stdout + discarded.stderr);
+      assert.equal(discarded.status, 1, discarded.stdout + discarded.stderr);
+      assert.match(discarded.stderr, /Chrome still owns profile/iu);
+      assert.match(readFileSync(cleanupLog, "utf8"), /-9/iu);
+      assert.equal(existsSync(profile), true, "failed cleanup discarded the recoverable profile");
+      assert.equal(readFileSync(join(config, "partial-state"), "utf8"), "retain-for-retry");
+      assert.deepEqual(committedCookieStoreSnapshot(jar), jarBefore, "failed discard mutated committed cookies");
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("display discard reaps exact owned runtime resources for a fully prepared unpublished display", async () => {
+    const root = await tempDir("openbot-display-discard-prepared-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    const binDir = join(root, "bin");
+    const xLockDir = join(root, "x-locks");
+    const xSocketDir = join(root, "x-sockets");
+    const display = 8;
+    const profile = join(home, ".config", `google-chrome-d${display}`);
+    const config = join(home, `.config-d${display}`);
+    const ownerDir = join(home, `.pinchtab-d${display}`);
+    const ownerPath = join(ownerDir, "bridge-owner.json");
+    const xLock = join(xLockDir, `.X${display}-lock`);
+    const xSocket = join(xSocketDir, `X${display}`);
+    mkdirSync(join(jar, "Network"), { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(xLockDir, { recursive: true });
+    mkdirSync(xSocketDir, { recursive: true });
+    writeFileSync(join(jar, "Network", "Cookies"), "committed-cookie");
+    const baseEnv = {
+      ...process.env,
+      COOKIE_JAR: jar,
+      OPENBOT_SCREEN_HOME: home,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
+    const imported = spawnSync("bash", [displaySh, "cookies-in", String(display)], {
+      encoding: "utf8",
+      env: baseEnv,
+    });
+    assert.equal(imported.status, 0, imported.stderr);
+    mkdirSync(config, { recursive: true });
+    mkdirSync(ownerDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(config, "prepared"), "unpublished");
+    writeFileSync(join(ownerDir, "config.json"), "{}", { mode: 0o600 });
+
+    const managerFile = join(root, "owner-manager.mjs");
+    const pidsFile = join(root, "owner-pids.json");
+    writeFileSync(
+      managerFile,
+      `import fs from "node:fs";
+import { spawn } from "node:child_process";
+const [pidsFile, profile, display] = process.argv.slice(2);
+const idle = "setInterval(() => {}, 1000)";
+const supervisor = spawn(process.execPath, ["-e", idle], { stdio: "ignore" });
+const child = spawn(process.execPath, ["-e", idle], { stdio: "ignore" });
+const chrome = spawn(process.execPath, ["-e", idle, "--user-data-dir=" + profile, "fixture"], { stdio: "ignore" });
+const xOwner = spawn(process.execPath, ["-e", idle, "X", ":" + display], { stdio: "ignore" });
+supervisor.once("close", () => { if (child.exitCode === null) child.kill("SIGTERM"); });
+const pidsFilePending = pidsFile + ".pending";
+fs.writeFileSync(pidsFilePending, JSON.stringify({
+  supervisor: supervisor.pid,
+  child: child.pid,
+  chrome: chrome.pid,
+  xOwner: xOwner.pid,
+}));
+fs.renameSync(pidsFilePending, pidsFile);
+const all = [supervisor, child, chrome, xOwner];
+process.on("SIGTERM", () => {
+  for (const owned of all) if (owned.exitCode === null) owned.kill("SIGKILL");
+  setTimeout(() => process.exit(0), 50);
+});
+setInterval(() => {}, 1000);
+`,
+      { mode: 0o600 },
+    );
+    const manager = spawn(process.execPath, [managerFile, pidsFile, profile, String(display)], { stdio: "ignore" });
+    type OwnedProcesses = {
+      supervisor: number;
+      child: number;
+      chrome: number;
+      xOwner: number;
+    };
+    let owned: OwnedProcesses | null = null;
+    const xServer = net.createServer();
+    try {
+      await waitUntil(() => existsSync(pidsFile));
+      const currentOwned = JSON.parse(readFileSync(pidsFile, "utf8")) as OwnedProcesses;
+      owned = currentOwned;
+      await new Promise<void>((resolveListen, rejectListen) => {
+        xServer.once("error", rejectListen);
+        xServer.listen(xSocket, () => resolveListen());
+      });
+      await waitUntil(
+        () =>
+          processAlive(currentOwned.supervisor) && processAlive(currentOwned.child)
+          && processAlive(currentOwned.chrome) && processAlive(currentOwned.xOwner)
+          && processStartId(currentOwned.supervisor).length > 0
+          && processStartId(currentOwned.child).length > 0,
+      );
+      assert.match(processCommand(currentOwned.xOwner), new RegExp(`(?:^|\\s)X\\s+:${display}(?:\\s|$)`, "u"));
+      writeFileSync(xLock, `${currentOwned.xOwner}\n`, { mode: 0o600 });
+      const owner = {
+        schema: 1,
+        display,
+        port: 29_866 + display,
+        supervisorPid: currentOwned.supervisor,
+        supervisorStart: processStartId(currentOwned.supervisor),
+        childPid: currentOwned.child,
+        childStart: processStartId(currentOwned.child),
+        binary: "/fixture/pinchtab",
+        config: join(ownerDir, "config.json"),
+      };
+      writeFileSync(ownerPath, JSON.stringify(owner), { mode: 0o600 });
+      writeFileSync(join(binDir, "timeout"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+      writeFileSync(
+        join(binDir, "su"),
+        `#!/bin/bash
+pid="$(awk 'NR == 1 { print $1 }' "$OPENBOT_TEST_X_LOCK")"
+kill "$pid" || exit 61
+rm -f -- "$OPENBOT_TEST_X_LOCK" "$OPENBOT_TEST_X_SOCKET"
+`,
+        { mode: 0o755 },
+      );
+      const env = {
+        ...baseEnv,
+        OPENBOT_PINCHTAB_BIN: "/fixture/pinchtab",
+        OPENBOT_PINCHTAB_PORT_BASE: "29866",
+        OPENBOT_TEST_X_LOCK: xLock,
+        OPENBOT_TEST_X_SOCKET: xSocket,
+        OPENBOT_X_LOCK_DIR: xLockDir,
+        OPENBOT_X_SOCKET_DIR: xSocketDir,
+        PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+      };
+      const jarBefore = committedCookieStoreSnapshot(jar);
+      const discarded = spawnSync("bash", [displaySh, "discard", String(display)], {
+        encoding: "utf8",
+        env,
+        timeout: 10_000,
+      });
+      assert.equal(discarded.signal, null, discarded.stdout + discarded.stderr);
+      assert.equal(discarded.status, 0, discarded.stdout + discarded.stderr);
+      await waitUntil(
+        () =>
+          !processAlive(currentOwned.supervisor) && !processAlive(currentOwned.child)
+          && !processAlive(currentOwned.chrome),
+      );
+      assert.equal(processAlive(currentOwned.xOwner), false, "discard left the exact owned X process alive");
+      assert.equal(existsSync(profile), false);
+      assert.equal(existsSync(config), false);
+      assert.equal(existsSync(ownerDir), false);
+      assert.equal(existsSync(xLock), false);
+      assert.equal(existsSync(xSocket), false);
+      assert.deepEqual(committedCookieStoreSnapshot(jar), jarBefore);
+
+      const repeated = spawnSync("bash", [displaySh, "discard", String(display)], {
+        encoding: "utf8",
+        env,
+        timeout: 5_000,
+      });
+      assert.equal(repeated.status, 0, repeated.stdout + repeated.stderr);
+      assert.deepEqual(committedCookieStoreSnapshot(jar), jarBefore);
+    } finally {
+      if (owned) {
+        for (const processId of [owned.supervisor, owned.child, owned.chrome, owned.xOwner]) {
+          if (processAlive(processId)) process.kill(processId, "SIGKILL");
+        }
+      }
+      if (processAlive(manager.pid)) manager.kill("SIGTERM");
+      if (manager.exitCode === null && manager.signalCode === null) {
+        await new Promise<void>((resolveManager) => manager.once("close", () => resolveManager()));
+      }
+      if (xServer.listening) {
+        await new Promise<void>((resolveClose) => xServer.close(() => resolveClose()));
+      }
+      rmSync(xLock, { force: true });
+      rmSync(xSocket, { force: true });
       rmSync(root, { force: true, recursive: true });
     }
   });

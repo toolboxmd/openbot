@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { after, before, describe, mock, test } from "node:test";
 import { startBox, type RunningBox } from "../src/box.ts";
-import { MemoryComputerRuntime } from "../src/computer.ts";
+import { DISPLAY_BIN, DockerComputerRuntime, MemoryComputerRuntime } from "../src/computer.ts";
 
 const PASSWORD = "correct-horse";
 const KASM_USER = "kasm";
@@ -34,6 +34,68 @@ async function emptyPwa(): Promise<string> {
   const pwaDir = await mkdtemp(join(tmpdir(), "openbot-pwa-"));
   await writeFile(join(pwaDir, "index.html"), `<!doctype html><title>OpenBot</title>`);
   return pwaDir;
+}
+
+function kasmDocumentOfBytes(bytes: number): string {
+  const prefix = "<!doctype html><html><head><title>KasmVNC</title></head><body>";
+  const suffix = "</body></html>";
+  const padding = bytes - Buffer.byteLength(prefix) - Buffer.byteLength(suffix);
+  assert.ok(padding >= 0, "Kasm fixture size must cover its required markup");
+  const body = `${prefix}${"x".repeat(padding)}${suffix}`;
+  assert.equal(Buffer.byteLength(body), bytes);
+  return body;
+}
+
+async function publicReadinessForDocument(document: string): Promise<{ reachable?: boolean; ready?: boolean }> {
+  const stub = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(document);
+  });
+  await new Promise<void>((resolve, reject) => {
+    stub.once("error", reject);
+    stub.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = stub.address();
+  if (!address || typeof address === "string") throw new Error("readiness document stub failed to bind");
+  let box: RunningBox | undefined;
+  try {
+    box = await startBox({
+      password: PASSWORD,
+      pwaDir: await emptyPwa(),
+      host: "127.0.0.1",
+      port: 0,
+      screenUpstream: `http://127.0.0.1:${address.port}`,
+      homeDir: await mkdtemp(join(tmpdir(), "openbot-document-readiness-home-")),
+    });
+    const cookie = await login(box.url);
+    const api = await fetch(`${box.url}/api/computer`, { headers: { cookie } });
+    assert.equal(api.status, 200);
+    return api.json() as Promise<{ reachable?: boolean; ready?: boolean }>;
+  } finally {
+    await box?.close();
+    await closeHttpServer(stub);
+  }
+}
+
+async function startReadyKasmFixture(): Promise<{ port: number; server: http.Server }> {
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end("<html><title>KasmVNC</title></html>");
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  server.unref();
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Kasm fixture failed to bind");
+  return { port: address.port, server };
+}
+
+async function closeHttpServer(server: http.Server): Promise<void> {
+  server.closeAllConnections();
+  if (!server.listening) return;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
 describe("Computer Screen HTTP", () => {
@@ -258,6 +320,417 @@ describe("Computer Screen with an unreachable upstream", () => {
     const body = (await api.json()) as { path?: string; ready?: boolean };
     assert.equal(body.path, "/screen/");
     assert.equal(body.ready, false);
+  });
+});
+
+describe("Computer Screen readiness semantics", () => {
+  test("public readiness accepts the real 70,673-byte Kasm application document", async () => {
+    const body = await publicReadinessForDocument(kasmDocumentOfBytes(70_673));
+    assert.equal(body.reachable, true);
+    assert.equal(body.ready, true);
+  });
+
+  test("public readiness accepts a valid Kasm application document at exactly 128 KiB", async () => {
+    const body = await publicReadinessForDocument(kasmDocumentOfBytes(128 * 1024));
+    assert.equal(body.reachable, true);
+    assert.equal(body.ready, true);
+  });
+
+  test("public readiness rejects a valid Kasm application document at 128 KiB plus one", async () => {
+    const body = await publicReadinessForDocument(kasmDocumentOfBytes((128 * 1024) + 1));
+    assert.equal(body.reachable, true);
+    assert.equal(body.ready, false);
+  });
+
+  test("public readiness aborts an oversized Kasm stream near the bounded body ceiling", async (t) => {
+    let bytesWritten = 0;
+    let streaming = true;
+    let resolveClosed: (bytes: number) => void = () => undefined;
+    const responseClosed = new Promise<number>((resolve) => {
+      resolveClosed = resolve;
+    });
+    const stub = http.createServer((_req, res) => {
+      const prefix = "<!doctype html><html><head><title>KasmVNC</title></head><body>";
+      const chunk = Buffer.alloc(8 * 1024, "x");
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      bytesWritten += Buffer.byteLength(prefix);
+      res.write(prefix);
+      const writeChunk = () => {
+        if (!streaming) return;
+        bytesWritten += chunk.length;
+        if (res.write(chunk)) {
+          setImmediate(writeChunk);
+        } else {
+          res.once("drain", () => setImmediate(writeChunk));
+        }
+      };
+      res.once("close", () => {
+        streaming = false;
+        resolveClosed(bytesWritten);
+      });
+      setImmediate(writeChunk);
+    });
+    await new Promise<void>((resolve, reject) => {
+      stub.once("error", reject);
+      stub.listen(0, "127.0.0.1", () => resolve());
+    });
+    t.after(async () => {
+      streaming = false;
+      await closeHttpServer(stub);
+    });
+    const address = stub.address();
+    if (!address || typeof address === "string") throw new Error("streaming readiness stub failed to bind");
+    const box = await startBox({
+      password: PASSWORD,
+      pwaDir: await emptyPwa(),
+      host: "127.0.0.1",
+      port: 0,
+      screenUpstream: `http://127.0.0.1:${address.port}`,
+      homeDir: await mkdtemp(join(tmpdir(), "openbot-streaming-readiness-home-")),
+    });
+    t.after(() => box.close());
+
+    const cookie = await login(box.url);
+    const api = await fetch(`${box.url}/api/computer`, { headers: { cookie } });
+    assert.equal(api.status, 200);
+    const body = (await api.json()) as { reachable?: boolean; ready?: boolean };
+    assert.equal(body.reachable, true);
+    assert.equal(body.ready, false);
+    const timeout = new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error("readiness client did not abort the oversized stream")), 1_000).unref();
+    });
+    const abortedAt = await Promise.race([responseClosed, timeout]);
+    assert.ok(abortedAt <= 256 * 1024, `readiness buffered ${abortedAt} bytes before aborting`);
+  });
+
+  test("duplicate configured Screen endpoints cannot publish a second Bot and corrected configuration can retry", async (t) => {
+    const firstKasm = await startReadyKasmFixture();
+    const secondKasm = await startReadyKasmFixture();
+    t.after(async () => {
+      await Promise.all([
+        closeHttpServer(firstKasm.server),
+        closeHttpServer(secondKasm.server),
+      ]);
+    });
+    const homeDir = await mkdtemp(join(tmpdir(), "openbot-duplicate-screen-home-"));
+    const cookieDir = join(homeDir, "computer-cookies");
+    const duplicateDockerCalls: string[][] = [];
+    const duplicateComputer = new DockerComputerRuntime({
+      hostPorts: [firstKasm.port, firstKasm.port],
+      cookiesDir: cookieDir,
+      docker: async (args) => {
+        duplicateDockerCalls.push(args);
+        return { code: 0, stdout: args[0] === "inspect" ? "true\n" : "", stderr: "" };
+      },
+    });
+    const duplicateBox = await startBox({
+      password: PASSWORD,
+      pwaDir: await emptyPwa(),
+      host: "127.0.0.1",
+      port: 0,
+      homeDir,
+      computer: duplicateComputer,
+    });
+    let firstBotId = "";
+
+    try {
+      const cookie = await login(duplicateBox.url);
+      const create = (name: string) => fetch(`${duplicateBox.url}/api/bots`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      const first = await create("First Screen");
+      assert.equal(first.status, 201);
+      const firstBot = (await first.json()) as { id: string; display?: number };
+      firstBotId = firstBot.id;
+      assert.equal(firstBot.display, 1);
+
+      const aliased = await create("Aliased Screen");
+      assert.equal(aliased.status, 409);
+      const aliasedBody = (await aliased.json()) as { code?: string; recoverable?: boolean };
+      assert.equal(aliasedBody.code, "SCREEN_ENDPOINT_CONFLICT");
+      assert.equal(aliasedBody.recoverable, true);
+      const list = await fetch(`${duplicateBox.url}/api/bots`, { headers: { cookie } });
+      const afterFailure = (await list.json()) as { bots?: Array<{ id: string }> };
+      assert.deepEqual(afterFailure.bots?.map((bot) => bot.id), [firstBotId]);
+      assert.equal(
+        duplicateDockerCalls.some((args) =>
+          args[0] === "exec"
+          && args[2] === DISPLAY_BIN
+          && args[3] === "start"
+          && args[4] === "2"),
+        false,
+        "an aliased Screen endpoint started display 2 before failing",
+      );
+    } finally {
+      await duplicateBox.close();
+    }
+
+    const correctedDockerCalls: string[][] = [];
+    const correctedComputer = new DockerComputerRuntime({
+      hostPorts: [firstKasm.port, secondKasm.port],
+      cookiesDir: cookieDir,
+      docker: async (args) => {
+        correctedDockerCalls.push(args);
+        return { code: 0, stdout: args[0] === "inspect" ? "true\n" : "", stderr: "" };
+      },
+    });
+    const correctedBox = await startBox({
+      password: PASSWORD,
+      pwaDir: await emptyPwa(),
+      host: "127.0.0.1",
+      port: 0,
+      homeDir,
+      computer: correctedComputer,
+    });
+
+    try {
+      const cookie = await login(correctedBox.url);
+      const retried = await fetch(`${correctedBox.url}/api/bots`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ name: "Corrected Screen" }),
+      });
+      assert.equal(retried.status, 201);
+      const secondBot = (await retried.json()) as { id: string; display?: number };
+      assert.equal(secondBot.display, 2);
+      assert.notEqual(correctedComputer.upstream(firstBotId), correctedComputer.upstream(secondBot.id));
+      assert.equal(
+        correctedDockerCalls.filter((args) =>
+          args[0] === "exec"
+          && args[2] === DISPLAY_BIN
+          && args[3] === "start"
+          && args[4] === "2").length,
+        1,
+      );
+    } finally {
+      await correctedBox.close();
+    }
+  });
+
+  test("restart keeps Talk available when a persisted Bot Screen is not application-ready", async (t) => {
+    const kasm = await startReadyKasmFixture();
+    t.after(() => closeHttpServer(kasm.server));
+    const homeDir = await mkdtemp(join(tmpdir(), "openbot-restart-unready-screen-home-"));
+    const cookiesDir = join(homeDir, "computer-cookies");
+    const docker = async (args: string[]) => ({
+      code: 0,
+      stdout: args[0] === "inspect" ? "true\n" : "",
+      stderr: "",
+    });
+    const seedComputer = new DockerComputerRuntime({ hostPorts: [kasm.port], cookiesDir, docker });
+    const seedBox = await startBox({
+      password: PASSWORD,
+      pwaDir: await emptyPwa(),
+      host: "127.0.0.1",
+      port: 0,
+      homeDir,
+      computer: seedComputer,
+    });
+    let botId = "";
+
+    try {
+      const cookie = await login(seedBox.url);
+      const created = await fetch(`${seedBox.url}/api/bots`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ name: "Persisted Screen" }),
+      });
+      assert.equal(created.status, 201);
+      const bot = (await created.json()) as { id: string; display?: number };
+      botId = bot.id;
+      assert.equal(bot.display, 1);
+    } finally {
+      await seedBox.close();
+    }
+
+    await closeHttpServer(kasm.server);
+    const restartComputer = new DockerComputerRuntime({ hostPorts: [kasm.port], cookiesDir, docker });
+    const restartedBox = await startBox({
+      password: PASSWORD,
+      pwaDir: await emptyPwa(),
+      host: "127.0.0.1",
+      port: 0,
+      homeDir,
+      computer: restartComputer,
+    });
+
+    try {
+      const cookie = await login(restartedBox.url);
+      const list = await fetch(`${restartedBox.url}/api/bots`, { headers: { cookie } });
+      assert.equal(list.status, 200);
+      const body = (await list.json()) as { bots?: Array<{ id: string; display?: number }> };
+      assert.deepEqual(body.bots?.map((bot) => ({ id: bot.id, display: bot.display })), [{ id: botId, display: 1 }]);
+      assert.equal(restartComputer.display(botId)?.display, 1);
+      assert.equal(restartComputer.upstream(botId), `http://127.0.0.1:${kasm.port}`);
+
+      const computer = await fetch(
+        `${restartedBox.url}/api/computer?botId=${encodeURIComponent(botId)}`,
+        { headers: { cookie } },
+      );
+      assert.equal(computer.status, 200);
+      const state = (await computer.json()) as {
+        display?: number;
+        path?: string;
+        reachable?: boolean;
+        ready?: boolean;
+      };
+      assert.equal(state.display, 1);
+      assert.equal(state.path, `/screen/${botId}/`);
+      assert.equal(state.reachable, false);
+      assert.equal(state.ready, false);
+    } finally {
+      await restartedBox.close();
+    }
+  });
+
+  test("public readiness distinguishes HTTP transport from a valid Kasm application", async () => {
+    let response = { status: 503, type: "text/html; charset=utf-8", body: "<title>KasmVNC</title>" };
+    const stub = http.createServer((_req, res) => {
+      res.writeHead(response.status, { "content-type": response.type });
+      res.end(response.body);
+    });
+    await new Promise<void>((resolve, reject) => {
+      stub.once("error", reject);
+      stub.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = stub.address();
+    if (!address || typeof address === "string") throw new Error("readiness stub failed to bind");
+    const box = await startBox({
+      password: PASSWORD,
+      pwaDir: await emptyPwa(),
+      host: "127.0.0.1",
+      port: 0,
+      screenUpstream: `http://127.0.0.1:${address.port}`,
+      homeDir: await mkdtemp(join(tmpdir(), "openbot-readiness-home-")),
+    });
+
+    try {
+      const cookie = await login(box.url);
+      const read = async () => {
+        const api = await fetch(`${box.url}/api/computer`, { headers: { cookie } });
+        assert.equal(api.status, 200);
+        return api.json() as Promise<{ reachable?: boolean; ready?: boolean }>;
+      };
+
+      const failedStatus = await read();
+      assert.equal(failedStatus.reachable, true);
+      assert.equal(failedStatus.ready, false);
+      const zoom = await fetch(`${box.url}/api/computer/zoom`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ zoom: false }),
+      });
+      assert.equal(zoom.status, 200);
+      const zoomBody = (await zoom.json()) as { reachable?: boolean; ready?: boolean };
+      assert.equal(zoomBody.reachable, true);
+      assert.equal(zoomBody.ready, false);
+
+      response = { status: 200, type: "text/html; charset=utf-8", body: "<title>Login proxy</title>" };
+      const invalidPayload = await read();
+      assert.equal(invalidPayload.reachable, true);
+      assert.equal(invalidPayload.ready, false);
+
+      response = { status: 200, type: "text/html; charset=utf-8", body: "<html><title>KasmVNC</title></html>" };
+      const ready = await read();
+      assert.equal(ready.reachable, true);
+      assert.equal(ready.ready, true);
+    } finally {
+      await box.close();
+      await new Promise<void>((resolve) => stub.close(() => resolve()));
+    }
+  });
+
+  test("Bot publication waits for application readiness and retry reuses display 1", async () => {
+    let ready = false;
+    const stub = http.createServer((_req, res) => {
+      res.writeHead(ready ? 200 : 503, { "content-type": "text/html; charset=utf-8" });
+      res.end("<html><title>KasmVNC</title></html>");
+    });
+    await new Promise<void>((resolve, reject) => {
+      stub.once("error", reject);
+      stub.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = stub.address();
+    if (!address || typeof address === "string") throw new Error("provisioning readiness stub failed to bind");
+    const upstream = `http://127.0.0.1:${address.port}`;
+    const homeDir = await mkdtemp(join(tmpdir(), "openbot-provision-readiness-home-"));
+    const computer = new MemoryComputerRuntime({
+      cookiesDir: join(homeDir, "cookies"),
+      upstreams: [upstream],
+      requiresReadiness: true,
+    });
+    const box = await startBox({
+      password: PASSWORD,
+      pwaDir: await emptyPwa(),
+      host: "127.0.0.1",
+      port: 0,
+      homeDir,
+      computer,
+    });
+
+    try {
+      const cookie = await login(box.url);
+      const create = (name: string) => fetch(`${box.url}/api/bots`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+
+      const failed = await create("Not ready");
+      assert.equal(failed.status, 503);
+      const failedBody = (await failed.json()) as { code?: string; recoverable?: boolean };
+      assert.equal(failedBody.code, "SCREEN_NOT_READY");
+      assert.equal(failedBody.recoverable, true);
+      const afterFailure = await fetch(`${box.url}/api/bots`, { headers: { cookie } });
+      const failedList = (await afterFailure.json()) as { bots?: unknown[] };
+      assert.deepEqual(failedList.bots, []);
+
+      ready = true;
+      const retried = await create("Ready");
+      assert.equal(retried.status, 201);
+      const bot = (await retried.json()) as { display?: number };
+      assert.equal(bot.display, 1);
+    } finally {
+      await box.close();
+      await new Promise<void>((resolve) => stub.close(() => resolve()));
+    }
+  });
+
+  test("readiness body stall remains transport-reachable but not application-ready", async () => {
+    const stub = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.write("<html><title>KasmVNC</title>");
+    });
+    await new Promise<void>((resolve, reject) => {
+      stub.once("error", reject);
+      stub.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = stub.address();
+    if (!address || typeof address === "string") throw new Error("readiness stall stub failed to bind");
+    const box = await startBox({
+      password: PASSWORD,
+      pwaDir: await emptyPwa(),
+      host: "127.0.0.1",
+      port: 0,
+      screenUpstream: `http://127.0.0.1:${address.port}`,
+      homeDir: await mkdtemp(join(tmpdir(), "openbot-readiness-stall-home-")),
+    });
+
+    try {
+      const cookie = await login(box.url);
+      const startedAt = Date.now();
+      const api = await fetch(`${box.url}/api/computer`, { headers: { cookie } });
+      const body = (await api.json()) as { reachable?: boolean; ready?: boolean };
+      assert.equal(body.reachable, true);
+      assert.equal(body.ready, false);
+      assert.ok(Date.now() - startedAt < 1_500);
+    } finally {
+      await box.close();
+      stub.closeAllConnections();
+      await new Promise<void>((resolve) => stub.close(() => resolve()));
+    }
   });
 });
 

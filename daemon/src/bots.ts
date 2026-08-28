@@ -140,6 +140,7 @@ type Bot = {
 
 export type BotStoreDeps = {
   computer?: ComputerRuntime;
+  screenReady?: (upstream: string) => Promise<boolean>;
   spawnAcp?: (spec: SpawnSpec, cwd: string, handlers?: AcpHandlers) => AcpSession;
   listHarnesses?: () => HarnessInfo[];
   workspaceDir?: string;
@@ -157,6 +158,7 @@ export class BotStore {
   private readonly home: HomeStore;
   private readonly workspaceDir: string;
   private readonly computer: ComputerRuntime;
+  private readonly screenReadyFn: (upstream: string) => Promise<boolean>;
   private readonly spawnAcpFn: (spec: SpawnSpec, cwd: string, handlers?: AcpHandlers) => AcpSession;
   private readonly listHarnessesFn: () => HarnessInfo[];
   private zoomedId: string | null = null;
@@ -168,6 +170,7 @@ export class BotStore {
     this.home = new HomeStore(homeDir);
     this.workspaceDir = deps.workspaceDir ?? defaultWorkspaceDir(homeDir);
     this.computer = deps.computer ?? new NoopComputerRuntime();
+    this.screenReadyFn = deps.screenReady ?? (async () => false);
     this.spawnAcpFn = deps.spawnAcp ?? spawnAcp;
     this.listHarnessesFn = deps.listHarnesses ?? listHarnessesOnPath;
     try {
@@ -190,9 +193,78 @@ export class BotStore {
   }
 
   async reattachDisplays(): Promise<void> {
+    await this.recoverBotProvisionings();
     for (const bot of this.bots.values()) {
-      bot.display = await this.computer.allocate(bot.id);
+      const persistedDisplay = this.home.botDisplay(bot.id);
+      if (persistedDisplay === undefined) throw new Error("Bot display state is missing");
+      this.computer.reserve(bot.id, persistedDisplay);
+      try {
+        await this.computer.prepare(bot.id);
+        // Persisted Bots are already published. Screen readiness remains observable without blocking Talk startup.
+        bot.display = this.computer.commit(bot.id);
+      } catch (error) {
+        await this.computer.release(bot.id);
+        throw error;
+      }
     }
+  }
+
+  private async recoverBotProvisionings(): Promise<void> {
+    for (const provisioning of this.home.listBotProvisionings()) {
+      await this.compensateBotProvisioning({
+        botId: provisioning.botId,
+        display: provisioning.display,
+        workspace: provisioning.workspaceOwned
+          ? { dir: botWorkspaceDir(this.workspaceDir, provisioning.botId), created: true }
+          : null,
+        cause: new Error("Interrupted Bot provisioning requires recovery"),
+      });
+    }
+  }
+
+  private async compensateBotProvisioning(input: {
+    botId: string;
+    display: number | null;
+    workspace: PreparedBotWorkspace | null;
+    cause: unknown;
+  }): Promise<void> {
+    const failures: string[] = [];
+    if (input.display !== null) {
+      try {
+        await this.computer.rollback(input.botId, input.display);
+        this.home.setBotProvisioningDisplay(input.botId, null);
+      } catch (error) {
+        failures.push(`display ${input.display}: ${errorDetail(error)}`);
+      }
+    }
+    const displayCleanupFailed = failures.length > 0;
+    let workspaceRollback: BotWorkspaceRollback | null = null;
+    if (input.workspace) {
+      workspaceRollback = rollbackPreparedBotWorkspace(input.workspace);
+      if (workspaceRollback.removed) {
+        try {
+          this.home.setBotProvisioningWorkspaceOwned(input.botId, false);
+        } catch (error) {
+          failures.push(`workspace state: ${errorDetail(error)}`);
+        }
+      } else {
+        failures.push(
+          `workspace ${JSON.stringify(workspaceRollback.preservedPath)}: ${workspaceRollback.reason}`,
+        );
+      }
+    }
+    if (failures.length > 0) {
+      const detail = failures.join("; ");
+      this.home.markBotProvisioningCleanupRequired(input.botId, detail);
+      if (workspaceRollback && !workspaceRollback.removed && !displayCleanupFailed && failures.length === 1) {
+        throw Object.assign(
+          botWorkspaceCleanupRequiredError("Bot creation failed", input.cause, workspaceRollback),
+          { provisioningId: input.botId },
+        );
+      }
+      throw botProvisioningCleanupRequiredError(input.botId, input.cause, detail);
+    }
+    this.home.clearBotProvisioning(input.botId);
   }
 
   listHarnesses(): HarnessInfo[] {
@@ -276,18 +348,27 @@ export class BotStore {
       configMode: "isolated",
       createdAt: nowIso(),
     };
+    this.home.beginBotProvisioning(id);
     let preparedWorkspace: PreparedBotWorkspace;
     try {
       preparedWorkspace = prepareBotWorkspace(this.workspaceDir, id);
     } catch (error) {
       let bootstrapError = error;
+      const prepared = error instanceof BotWorkspacePreparationError
+        ? error.preparedWorkspace
+        : { dir: botWorkspaceDir(this.workspaceDir, id), created: true };
       if (error instanceof BotWorkspacePreparationError) {
         bootstrapError = error.cause;
-        const rollback = rollbackPreparedBotWorkspace(error.preparedWorkspace);
-        if (!rollback.removed) {
-          throw botWorkspaceCleanupRequiredError("Bot workspace bootstrap failed", bootstrapError, rollback);
-        }
       }
+      const rollback = rollbackPreparedBotWorkspace(prepared);
+      if (!rollback.removed) {
+        this.home.markBotProvisioningCleanupRequired(id, rollback.reason ?? "workspace cleanup failed");
+        throw Object.assign(botWorkspaceCleanupRequiredError("Bot workspace bootstrap failed", bootstrapError, rollback), {
+          provisioningId: id,
+        });
+      }
+      this.home.setBotProvisioningWorkspaceOwned(id, false);
+      this.home.clearBotProvisioning(id);
       const detail = bootstrapError instanceof Error ? bootstrapError.message : String(bootstrapError);
       throw Object.assign(new Error(`Bot workspace bootstrap failed: ${detail}`), {
         status: 503,
@@ -296,14 +377,28 @@ export class BotStore {
       });
     }
     let display: DisplayHandle;
+    let reservedDisplay: number | null = null;
     try {
-      display = await this.computer.allocate(id);
-      this.home.createBot(stored, crypto.randomUUID());
-    } catch (error) {
-      const rollback = rollbackPreparedBotWorkspace(preparedWorkspace);
-      if (!rollback.removed) {
-        throw botWorkspaceCleanupRequiredError("Bot creation failed", error, rollback);
+      const reservation = this.computer.reserve(id);
+      reservedDisplay = reservation.display;
+      this.home.setBotProvisioningDisplay(id, reservation.display);
+      await this.computer.prepare(id);
+      if (this.computer.requiresReadiness && !(await this.screenReadyFn(reservation.upstream))) {
+        throw Object.assign(new Error("Screen application is not ready"), {
+          status: 503,
+          code: "SCREEN_NOT_READY",
+          recoverable: true,
+        });
       }
+      display = this.computer.commit(id);
+      this.home.commitProvisionedBot(stored, crypto.randomUUID());
+    } catch (error) {
+      await this.compensateBotProvisioning({
+        botId: id,
+        display: reservedDisplay,
+        workspace: preparedWorkspace,
+        cause: error,
+      });
       throw error;
     }
     const bot = this.runtimeBot(stored, display);
@@ -885,6 +980,29 @@ function botWorkspaceCleanupRequiredError(
     {
       status: typeof status === "number" ? status : 503,
       code: "BOT_WORKSPACE_CLEANUP_REQUIRED",
+      recoverable: true,
+    },
+  );
+}
+
+function errorDetail(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function botProvisioningCleanupRequiredError(botId: string, cause: unknown, cleanup: string): Error {
+  const status = typeof cause === "object" && cause !== null
+    ? (cause as { status?: unknown }).status
+    : undefined;
+  return Object.assign(
+    new Error(
+      `Bot provisioning failed: ${errorDetail(cause)}. Cleanup is incomplete for ${botId}: ${cleanup}. `
+      + "The recoverable provisioning state was preserved for daemon restart or explicit retry.",
+      { cause },
+    ),
+    {
+      status: typeof status === "number" ? status : 503,
+      code: "BOT_PROVISIONING_CLEANUP_REQUIRED",
+      provisioningId: botId,
       recoverable: true,
     },
   );
