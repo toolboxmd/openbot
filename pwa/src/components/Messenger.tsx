@@ -13,6 +13,12 @@ import {
 import { ArrowUp, Check, Menu, MessageSquare, Monitor, MonitorCog, Plug, Plus, Reply, Search, Smile, X } from "lucide-react";
 import { AppSettings } from "@/components/AppSettings";
 import { BotSettings } from "@/components/BotSettings";
+import {
+  CommandPalette,
+  buildCommandPaletteActions,
+  executeCommandPaletteResult,
+  type CommandPaletteResult,
+} from "@/components/CommandPalette";
 import { ComputerScreen } from "@/components/Computer";
 import { Eyes } from "@/components/Eyes";
 import {
@@ -221,6 +227,70 @@ export function SelectedBotPanelAppSettings({
   );
 }
 
+export function MessengerCommandPalette({
+  open,
+  enabled,
+  chats,
+  selectedBot,
+  appFocusRef,
+  onOpenChange,
+  onOpenChat,
+  onNewBot,
+  onAppSettings,
+  onBotSettings,
+  onPlugins,
+  onComputer,
+}: {
+  open: boolean;
+  enabled: boolean;
+  chats: ChatInboxRow[];
+  selectedBot: {
+    id: string;
+    name: string;
+    settings: boolean;
+    computer: boolean;
+  } | null;
+  appFocusRef: RefObject<HTMLElement | null>;
+  onOpenChange: (open: boolean) => void;
+  onOpenChat: (chat: ChatInboxRow) => void;
+  onNewBot: () => void;
+  onAppSettings: () => void;
+  onBotSettings: (botId: string) => void;
+  onPlugins: () => void;
+  onComputer: (botId: string) => void;
+}) {
+  const actions = buildCommandPaletteActions({
+    newBot: true,
+    appSettings: true,
+    plugins: true,
+    selectedBot,
+  });
+  const handlers = {
+    openChat: onOpenChat,
+    newBot: onNewBot,
+    appSettings: onAppSettings,
+    botSettings: onBotSettings,
+    plugins: onPlugins,
+    computer: onComputer,
+  };
+
+  return (
+    <CommandPalette
+      open={open}
+      enabled={enabled}
+      chats={chats}
+      actions={actions}
+      appFocusRef={appFocusRef}
+      onOpenChange={onOpenChange}
+      onSelect={(result: CommandPaletteResult) => executeCommandPaletteResult(
+        result,
+        selectedBot?.id ?? null,
+        handlers,
+      )}
+    />
+  );
+}
+
 function replaceLocationHash(hash: string) {
   window.history.replaceState(
     window.history.state,
@@ -412,6 +482,7 @@ export function Messenger() {
   const [desktopLayout, setDesktopLayout] = useState(
     () => window.matchMedia(TRANSCRIPT_DESKTOP_QUERY).matches,
   );
+  const [commandPaletteOpen, setCommandPaletteOpenState] = useState(false);
   const openChatsButtonRef = useRef<HTMLButtonElement | null>(null);
   const closeChatsButtonRef = useRef<HTMLButtonElement | null>(null);
   const computerButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -478,6 +549,8 @@ export function Messenger() {
   const { preferences, updateComputerPane } = useUiPreferences();
   const preferencesRef = useRef(preferences);
   const updateComputerPaneRef = useRef(updateComputerPane);
+  const commandPaletteOpenRef = useRef(commandPaletteOpen);
+  const appSettingsEntryRef = useRef<HTMLDivElement | null>(null);
   const computerOpen = computerPaneIsOpen(preferences, activeId);
   const selectedBotPanelOpen = selectedBotPanel.open && selectedBotPanel.botId === activeId;
   const botSettingsSection = selectedBotPanel.section;
@@ -494,9 +567,18 @@ export function Messenger() {
   preferencesRef.current = preferences;
   updateComputerPaneRef.current = updateComputerPane;
   visibleComputerOpenRef.current = visibleComputerOpen;
-  const blockingChatSurfaceOpen = appSettingsOpen
+  commandPaletteOpenRef.current = commandPaletteOpen;
+  const selectedBotPanelBlocksCurrentChat = selectedBotPanelBlocksChat({
+    desktopLayout,
+    panelOpen: selectedBotPanelOpen,
+  });
+  const paletteShortcutEnabled = !appSettingsOpen
+    && !newBotOpen
+    && !selectedBotPanelBlocksCurrentChat;
+  const blockingChatSurfaceOpen = commandPaletteOpen
+    || appSettingsOpen
     || newBotOpen
-    || selectedBotPanelBlocksChat({ desktopLayout, panelOpen: selectedBotPanelOpen });
+    || selectedBotPanelBlocksCurrentChat;
   const composerKind = activeGroup ? "group" : active?.messages !== undefined ? "direct" : null;
   const activeDraftKey = activeGroup
     ? channelDraftKey(activeGroup.id)
@@ -513,6 +595,11 @@ export function Messenger() {
   function setNewBotOpen(next: boolean) {
     newBotOpenRef.current = next;
     setNewBotOpenState(next);
+  }
+
+  function setCommandPaletteOpen(next: boolean) {
+    commandPaletteOpenRef.current = next;
+    setCommandPaletteOpenState(next);
   }
 
   function transitionSelectedBotPanel(
@@ -555,7 +642,8 @@ export function Messenger() {
   function blockingChatSurfaceIsOpen(): boolean {
     const panel = selectedBotPanelRef.current;
     const panelOpen = panel.open && panel.botId === activeIdRef.current;
-    return appSettingsOpenRef.current
+    return commandPaletteOpenRef.current
+      || appSettingsOpenRef.current
       || newBotOpenRef.current
       || selectedBotPanelBlocksChat({ desktopLayout: desktopLayoutRef.current, panelOpen });
   }
@@ -842,7 +930,7 @@ export function Messenger() {
       openingBlockingDialog,
     })) return;
     const selectionGeneration = selectionGenerationRef.current;
-    readReceiptControllersRef.current.get(bot.id)?.abort();
+    if (readReceiptControllersRef.current.has(bot.id)) return;
     const controller = new AbortController();
     readReceiptControllersRef.current.set(bot.id, controller);
     void markBotRead(bot.id, bot.activity.cursor, controller.signal)
@@ -1938,6 +2026,30 @@ export function Messenger() {
     );
   }
 
+  function openCommandPaletteChat(row: ChatInboxRow) {
+    const bot = row.kind === "bot" ? inboxBots.get(row.id) : undefined;
+    const channel = row.kind === "group" ? inboxChannels.get(row.id) : undefined;
+    if (bot) openBot(bot);
+    else if (channel) openGroup(channel);
+    else return;
+    focusOnNextFrame(chatRegionRef);
+  }
+
+  function openAppSettingsFromPalette() {
+    if (!desktopLayoutRef.current) setMobileSurface("sidebar");
+    appSettingsEntryRef.current?.querySelector<HTMLButtonElement>("button")?.click();
+  }
+
+  function openNewBotFromPalette() {
+    if (!desktopLayoutRef.current) setMobileSurface("sidebar");
+    openNewBotFromMenu();
+  }
+
+  function openBotSettingsFromPalette(botId: string) {
+    if (activeIdRef.current !== botId || activeId !== botId) return;
+    openBotSettings();
+  }
+
   function openBotSettings(event?: MouseEvent<HTMLButtonElement>) {
     if (!activeId) return;
     botSettingsNavigationRef.current += 1;
@@ -2026,8 +2138,11 @@ export function Messenger() {
         <Welcome
           onNewBot={openNewBot}
           onPlugins={() => openPlugins("welcome")}
+          newBotRef={newBotOpenerRef}
           pluginsRef={welcomePluginsRef}
           destinationRef={welcomeDestinationRef}
+          appSettingsOpen={appSettingsOpen}
+          onAppSettingsOpenChange={setAppSettingsOpen}
         />
         <NewBotDialog
           open={newBotOpen}
@@ -2036,6 +2151,24 @@ export function Messenger() {
           destinationRef={newBotDestinationRef}
           onCreate={createBot}
           onCreated={openCreatedBot}
+        />
+        <MessengerCommandPalette
+          open={commandPaletteOpen}
+          enabled={paletteShortcutEnabled}
+          chats={[]}
+          selectedBot={null}
+          appFocusRef={welcomeDestinationRef}
+          onOpenChange={setCommandPaletteOpen}
+          onOpenChat={() => undefined}
+          onNewBot={() => newBotOpenerRef.current?.click()}
+          onAppSettings={() => {
+            welcomeDestinationRef.current
+              ?.querySelector<HTMLButtonElement>("[data-first-use-app-settings] button")
+              ?.click();
+          }}
+          onBotSettings={() => undefined}
+          onPlugins={() => welcomePluginsRef.current?.click()}
+          onComputer={() => undefined}
         />
       </>
     );
@@ -2287,15 +2420,17 @@ export function Messenger() {
             <Plug />
             Plugins
           </Button>
-          <SelectedBotPanelAppSettings
-            open={appSettingsOpen}
-            selectedBotPanelOpen={selectedBotPanel.open}
-            harnesses={harnesses}
-            harnessesState={harnessesState}
-            onOpenChange={setAppSettingsOpen}
-            onCloseSelectedBotPanel={closeSelectedBotPanelForAppSettings}
-            onRetryHarnesses={retryHarnesses}
-          />
+          <div ref={appSettingsEntryRef} className="contents">
+            <SelectedBotPanelAppSettings
+              open={appSettingsOpen}
+              selectedBotPanelOpen={selectedBotPanel.open}
+              harnesses={harnesses}
+              harnessesState={harnessesState}
+              onOpenChange={setAppSettingsOpen}
+              onCloseSelectedBotPanel={closeSelectedBotPanelForAppSettings}
+              onRetryHarnesses={retryHarnesses}
+            />
+          </div>
         </div>
         </>
       }
@@ -2614,6 +2749,25 @@ export function Messenger() {
         destinationRef={newBotDestinationRef}
         onCreate={createOrderedBot}
         onCreated={openCreatedBot}
+      />
+      <MessengerCommandPalette
+        open={commandPaletteOpen}
+        enabled={paletteShortcutEnabled}
+        chats={inboxRows}
+        selectedBot={active && !activeGroup ? {
+          id: active.id,
+          name: active.name,
+          settings: true,
+          computer: true,
+        } : null}
+        appFocusRef={chatRegionRef}
+        onOpenChange={setCommandPaletteOpen}
+        onOpenChat={openCommandPaletteChat}
+        onNewBot={openNewBotFromPalette}
+        onAppSettings={openAppSettingsFromPalette}
+        onBotSettings={openBotSettingsFromPalette}
+        onPlugins={() => openPlugins("direct")}
+        onComputer={openComputerFor}
       />
       {error ? (
         <Toast

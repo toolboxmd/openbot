@@ -13,13 +13,19 @@ import type { Bot } from "@/lib/session";
 export function Welcome({
   onNewBot,
   onPlugins,
+  newBotRef,
   pluginsRef,
   destinationRef,
+  appSettingsOpen,
+  onAppSettingsOpenChange,
 }: {
   onNewBot: (event: MouseEvent<HTMLButtonElement>) => void;
   onPlugins: () => void;
+  newBotRef: RefObject<HTMLButtonElement | null>;
   pluginsRef: RefObject<HTMLButtonElement | null>;
   destinationRef: RefObject<HTMLElement | null>;
+  appSettingsOpen: boolean;
+  onAppSettingsOpenChange: (open: boolean) => void;
 }) {
   return (
     <main
@@ -54,6 +60,7 @@ export function Welcome({
             </CardHeader>
             <CardFooter className="px-5">
               <Button
+                ref={newBotRef}
                 type="button"
                 size="lg"
                 onClick={onNewBot}
@@ -78,7 +85,13 @@ export function Welcome({
           <Plug />
           Plugins
         </Button>
-        <AppSettings className="w-auto" />
+        <div className="contents" data-first-use-app-settings={true}>
+          <AppSettings
+            className="w-auto"
+            open={appSettingsOpen}
+            onOpenChange={onAppSettingsOpenChange}
+          />
+        </div>
       </footer>
     </main>
   );

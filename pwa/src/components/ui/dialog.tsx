@@ -29,11 +29,27 @@ function DialogContent({
   className,
   children,
   showCloseButton = true,
+  onEscapeKeyDown,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean;
 }) {
   const [closeTooltipOpen, setCloseTooltipOpen] = React.useState(false);
+  const escapeEvents = React.useRef(new WeakMap<Event, {
+    firstLayer: "dialog" | "tooltip";
+    vetoed: boolean;
+  }>());
+
+  function handleEscapeKeyDown(
+    event: KeyboardEvent,
+    firstLayer: "dialog" | "tooltip",
+  ) {
+    if (escapeEvents.current.has(event)) return;
+    const state = { firstLayer, vetoed: false };
+    escapeEvents.current.set(event, state);
+    onEscapeKeyDown?.(event);
+    state.vetoed = event.defaultPrevented;
+  }
 
   return (
     <DialogPortal>
@@ -45,6 +61,7 @@ function DialogContent({
           className,
         )}
         {...props}
+        onEscapeKeyDown={(event) => handleEscapeKeyDown(event, "dialog")}
       >
         {children}
         {showCloseButton ? (
@@ -55,13 +72,28 @@ function DialogContent({
                 aria-label="Close"
                 onBlur={() => setCloseTooltipOpen(false)}
                 onFocus={() => setCloseTooltipOpen(true)}
+                onKeyDown={(event) => {
+                  const escapeState = escapeEvents.current.get(event.nativeEvent);
+                  if (
+                    event.key !== "Escape"
+                    || escapeState?.firstLayer !== "tooltip"
+                    || escapeState.vetoed
+                  ) return;
+                  event.currentTarget.click();
+                }}
                 onPointerEnter={() => setCloseTooltipOpen(true)}
                 onPointerLeave={() => setCloseTooltipOpen(false)}
               >
                 <X className="size-[var(--icon-default)]" strokeWidth="var(--icon-stroke)" />
               </DialogPrimitive.Close>
             </TooltipTrigger>
-            <TooltipContent>Close</TooltipContent>
+            <TooltipContent
+              onEscapeKeyDown={(event) => {
+                handleEscapeKeyDown(event, "tooltip");
+              }}
+            >
+              Close
+            </TooltipContent>
           </Tooltip>
         ) : null}
       </DialogPrimitive.Content>
