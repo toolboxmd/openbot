@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.9] - 2026-08-28
+
+### Changed
+
+- Issue #119: keep Working Eyes stable on the first animation frame
+
 ## [0.9.8] - 2026-08-28
 
 ### Changed
