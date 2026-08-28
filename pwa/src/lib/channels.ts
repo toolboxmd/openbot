@@ -33,14 +33,30 @@ export function botMembers(channel: Channel): ChannelMember[] {
   return channel.members.filter((member) => member.kind === "bot");
 }
 
+export function newChannelValidation(titleValue: string, selectedBotIds: string[]): {
+  valid: boolean;
+  title: string;
+  botIds: string[];
+  titleError: string | null;
+  membersError: string | null;
+} {
+  const title = titleValue.trim();
+  const botIds = [...new Set(selectedBotIds.map((id) => id.trim()).filter(Boolean))];
+  const titleError = title ? null : "Enter a title for your Channel.";
+  const membersError = botIds.length >= 2 ? null : "Choose at least two Bots.";
+  return {
+    valid: titleError === null && membersError === null,
+    title,
+    botIds,
+    titleError,
+    membersError,
+  };
+}
+
 export function groupDisplayTitle(channel: Pick<Channel, "title" | "members">): string {
   const trimmed = channel.title?.trim();
   if (trimmed) return trimmed;
-  const names = channel.members
-    .filter((member) => member.kind === "bot")
-    .map((member) => member.name)
-    .filter(Boolean);
-  return names.join(", ") || "Group";
+  return "Untitled Channel";
 }
 
 export function composerSendEnabled(kind: ChannelKind | null): boolean {

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.14.0] - 2026-08-28
+
+### Added
+
+- Require titled group Channel creation with existing Bots
+
 ## [0.13.0] - 2026-08-28
 
 ### Added
