@@ -7,7 +7,7 @@ import path from "node:path";
 import { BotStore, type BotStoreDeps } from "./bots.ts";
 import { defaultHomeDir, defaultWorkspaceDir } from "./home.ts";
 import { NoopComputerRuntime, type ComputerRuntime } from "./computer.ts";
-import { kasmUpdateWrite } from "./kasm.ts";
+import { KasmWriteOwnership, kasmUpdateWrite } from "./kasm.ts";
 
 export type BoxOptions = {
   password: string;
@@ -39,6 +39,7 @@ export type RunningBox = {
 const COOKIE = "openbot";
 const MAX_AGE = 60 * 60 * 24 * 30;
 const SCREEN_PREFIX = "/screen";
+const ROOT_COMPUTER_TARGET = "$computer";
 const DEFAULT_SCREEN_PROXY_DEADLINES: ScreenProxyDeadlines = {
   connectMs: 1_000,
   headerMs: 5_000,
@@ -634,7 +635,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
   async function applyKasmWrite(botId: string | null, write: boolean): Promise<void> {
     if (!options.kasmUser || options.kasmPassword === undefined) return;
     const upstream = upstreamFor(botId);
-    if (!upstream) return;
+    if (!upstream) throw new Error("Kasm write endpoint is unavailable");
     await kasmUpdateWrite({
       upstream,
       user: options.kasmUser,
@@ -642,6 +643,42 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       name: options.kasmUser,
       write,
     });
+  }
+
+  const writeOwnership = new KasmWriteOwnership({
+    update: (target, write) =>
+      applyKasmWrite(target === ROOT_COMPUTER_TARGET ? null : target, write),
+    publish: (target, state) => {
+      if (target === ROOT_COMPUTER_TARGET || !store.get(target)) return;
+      store.setComputerOwnership(target, state.authority);
+    },
+  });
+  const existingBotIds = store.list().map((bot) => bot.id);
+  await writeOwnership.reconcile(
+    existingBotIds.length > 0 ? existingBotIds : [ROOT_COMPUTER_TARGET],
+  );
+
+  function ownershipTarget(botId: string | null): string {
+    if (botId) return botId;
+    const rootUpstream = upstreamFor(null);
+    const firstDisplay = rootUpstream
+      ? store.list().find((bot) => upstreamFor(bot.id) === rootUpstream)
+      : undefined;
+    return firstDisplay?.id ?? ROOT_COMPUTER_TARGET;
+  }
+
+  function computerOwnership(botId: string | null) {
+    const state = writeOwnership.state(ownershipTarget(botId));
+    const known = state.authority !== "unknown";
+    const write = state.authority === "write";
+    return {
+      ownership: state.authority,
+      ownershipError: state.error ?? null,
+      ownershipEpoch: writeOwnership.epoch(),
+      write: known ? write : null,
+      viewOnly: known ? !write : null,
+      zoom: write,
+    };
   }
 
   const server = http.createServer((req, res) => {
@@ -757,8 +794,14 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         }
         try {
           const name = typeof body.name === "string" ? body.name : "";
-          const bot = await store.create(name);
-          sendJson(res, 201, bot);
+          const created = await store.create(name);
+          if (upstreamFor(created.id) === upstreamFor(null)) {
+            await writeOwnership
+              .transition(ROOT_COMPUTER_TARGET, false)
+              .catch(() => undefined);
+          }
+          await writeOwnership.register(created.id).catch(() => undefined);
+          sendJson(res, 201, store.get(created.id));
         } catch (err) {
           sendStoreError(res, err);
         }
@@ -1045,38 +1088,52 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         }
         const botId = typeof body.botId === "string" ? body.botId : "";
         const zoom = body.zoom !== false && body.zoom !== "false";
-        try {
-          if (!botId) {
-            await applyKasmWrite(null, zoom);
-            sendJson(res, 200, {
-              path: `${SCREEN_PREFIX}/`,
-              ready: true,
-              botId: null,
-              write: zoom,
-              viewOnly: !zoom,
-              zoom,
-              container: computer.containerName(),
-            });
+        let expectedEpoch: string | undefined;
+        if (body.ownershipEpoch !== undefined) {
+          if (
+            typeof body.ownershipEpoch !== "string"
+            || body.ownershipEpoch.length === 0
+            || body.ownershipEpoch.length > 128
+          ) {
+            sendJson(res, 400, { error: "invalid Computer ownership epoch" });
             return;
           }
-          const bot = zoom ? store.zoom(botId) : store.unzoom(botId);
-          try {
-            await applyKasmWrite(botId, zoom);
-          } catch (err) {
-            if (zoom) store.unzoom(botId);
-            throw err;
+          expectedEpoch = body.ownershipEpoch;
+        }
+        try {
+          if (botId && !store.get(botId)) {
+            sendJson(res, 404, { error: "Bot not found" });
+            return;
           }
-          sendJson(res, 200, {
-            ...bot,
-            path: `${SCREEN_PREFIX}/${botId}/`,
-            ready: true,
-            write: zoom,
-            viewOnly: !zoom,
+          const selectedBotId = botId || null;
+          await writeOwnership.transition(
+            ownershipTarget(selectedBotId),
             zoom,
+            expectedEpoch,
+          );
+          const bot = selectedBotId ? store.get(selectedBotId) : null;
+          sendJson(res, 200, {
+            ...(bot ?? {}),
+            path: selectedBotId ? `${SCREEN_PREFIX}/${selectedBotId}/` : `${SCREEN_PREFIX}/`,
+            ready: Boolean(upstreamFor(selectedBotId)),
+            botId: selectedBotId,
+            ...computerOwnership(selectedBotId),
             container: computer.containerName(),
           });
         } catch (err) {
-          sendStoreError(res, err);
+          const status = typeof (err as { status?: unknown })?.status === "number"
+            ? (err as { status: number }).status
+            : 500;
+          const message = err instanceof Error ? err.message : "box error";
+          const selectedBotId = botId || null;
+          sendJson(res, status, {
+            error: message,
+            path: selectedBotId ? `${SCREEN_PREFIX}/${selectedBotId}/` : `${SCREEN_PREFIX}/`,
+            ready: Boolean(upstreamFor(selectedBotId)),
+            botId: selectedBotId,
+            ...computerOwnership(selectedBotId),
+            container: computer.containerName(),
+          });
         }
         return;
       }
@@ -1094,16 +1151,13 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         }
         const botId = bot?.id ?? null;
         const upstream = upstreamFor(botId);
-        const zoomed = botId ? store.isZoomed(botId) : false;
         const pathFor = botId ? `${SCREEN_PREFIX}/${botId}/` : `${SCREEN_PREFIX}/`;
         const ready = await screenIsReachable(upstream, auth);
         sendJson(res, 200, {
           path: upstream ? pathFor : pathFor,
           ready: Boolean(upstream) && ready,
           botId,
-          write: zoomed,
-          viewOnly: !zoomed,
-          zoom: zoomed,
+          ...computerOwnership(botId),
           display: bot?.display ?? (upstream ? 1 : null),
           container: computer.containerName(),
           cookieJar: computer.cookieJar(),
@@ -1176,13 +1230,46 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
   }
 
   const hostname = host === "0.0.0.0" ? "127.0.0.1" : host;
+  let closeResult: Promise<void> | null = null;
+  function close(): Promise<void> {
+    if (closeResult) return closeResult;
+    const serverClosed = new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+    closeResult = (async () => {
+      let ownershipFailure: unknown = null;
+      let serverFailure: unknown = null;
+      let storeFailure: unknown = null;
+      try {
+        await writeOwnership.shutdown();
+      } catch (error) {
+        ownershipFailure = error;
+      }
+      try {
+        await serverClosed;
+      } catch (error) {
+        serverFailure = error;
+      }
+      try {
+        store.close();
+      } catch (error) {
+        storeFailure = error;
+      }
+      const failures = [ownershipFailure, serverFailure, storeFailure]
+        .filter((error): error is NonNullable<unknown> => error !== null);
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw Object.assign(
+          new AggregateError(failures, "Box shutdown did not complete cleanly."),
+          { status: 503 },
+        );
+      }
+    })();
+    return closeResult;
+  }
   return {
     url: `http://${hostname}:${addr.port}`,
     port: addr.port,
-    close: () =>
-      new Promise((resolve, reject) => {
-        store.close();
-        server.close((err) => (err ? reject(err) : resolve()));
-      }),
+    close,
   };
 }
