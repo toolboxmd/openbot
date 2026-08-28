@@ -60,6 +60,7 @@ import {
   unsupportedPermissionTranscriptCard,
 } from "./transcript-card.ts";
 import {
+  callbackFailedTransport,
   cancellationClosedTransport,
   computerHelpResponseWasFlushed,
   isAuthError,
@@ -142,11 +143,15 @@ export type AcpSession = {
   respondComputerHelp?(
     rpcId: ComputerHelpPrompt["rpcId"],
     resolution: ComputerHelpResolution,
-    onFlushed?: () => void,
+    onFlushed?: () => void | Promise<void>,
   ): void | Promise<void>;
 };
 
-type BotPermission = PermissionPrompt & PublicPermission;
+type BotPermission = PermissionPrompt & PublicPermission & {
+  client?: AcpSession;
+  turnSeq?: number;
+  queueGeneration?: number;
+};
 
 type BotComputerHelp = {
   eventId: string;
@@ -154,6 +159,28 @@ type BotComputerHelp = {
   rpcId: ComputerHelpPrompt["rpcId"];
   client: AcpSession;
   turnSeq: number;
+  queueGeneration: number;
+};
+
+type CallbackQueueDetachment = {
+  publicError: Error;
+};
+
+type BotCallbackQueues = {
+  generation: number;
+  permissionTail: Promise<void>;
+  computerHelpTail: Promise<void>;
+  detached: Promise<CallbackQueueDetachment>;
+  detachment: CallbackQueueDetachment | null;
+  detach(detachment: CallbackQueueDetachment): void;
+};
+
+type CallbackQueueTail = "permissionTail" | "computerHelpTail";
+
+type CallbackQueueRotation = {
+  invalidateClient?: boolean;
+  responseFlushed?: boolean;
+  publicError?: Error;
 };
 
 type Bot = {
@@ -175,8 +202,7 @@ type Bot = {
   activeUserId: string | null;
   turnSeq: number;
   startingTurn: boolean;
-  permissionQueue: Promise<void>;
-  computerHelpQueue: Promise<void>;
+  callbackQueues: BotCallbackQueues;
   client: AcpSession | null;
 };
 
@@ -218,6 +244,36 @@ function publicPermission(p: BotPermission | null): PublicPermission | null {
   return out;
 }
 
+function botActionNoLongerActive(): Error {
+  return Object.assign(new Error("Bot action is no longer active"), { status: 409 });
+}
+
+function unconfirmedComputerHelpResponse(): Error {
+  return Object.assign(
+    new Error("The response was sent, but OpenBot could not confirm this Card."),
+    { status: 409 },
+  );
+}
+
+function callbackQueues(generation = 0): BotCallbackQueues {
+  let resolveDetached!: (detachment: CallbackQueueDetachment) => void;
+  const queues: BotCallbackQueues = {
+    generation,
+    permissionTail: Promise.resolve(),
+    computerHelpTail: Promise.resolve(),
+    detached: new Promise<CallbackQueueDetachment>((resolve) => {
+      resolveDetached = resolve;
+    }),
+    detachment: null,
+    detach(detachment) {
+      if (queues.detachment) return;
+      queues.detachment = detachment;
+      resolveDetached(detachment);
+    },
+  };
+  return queues;
+}
+
 function pickGenericRejectOption(options: PermissionPrompt["options"]): string | null {
   return options.find((option) => permissionOptionKind(option) === "reject_once")?.optionId ?? null;
 }
@@ -247,8 +303,9 @@ export class BotStore {
 
   close(): void {
     for (const bot of this.bots.values()) {
-      bot.client?.close();
-      bot.client = null;
+      const client = bot.client;
+      this.rotateCallbackQueues(bot, client, bot.turnSeq, { invalidateClient: true });
+      client?.close();
     }
     this.home.close();
   }
@@ -408,10 +465,11 @@ export class BotStore {
     if (bot.harness === harness) return this.toPublic(bot, true);
 
     this.home.setHarness(bot.id, harness);
+    const client = bot.client;
+    const turnSeq = bot.turnSeq;
+    this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
     bot.turnSeq += 1;
-    this.expireActivePermission(bot);
-    bot.client?.close();
-    bot.client = null;
+    client?.close();
     bot.harness = harness;
     bot.write = false;
     bot.needsYou = null;
@@ -427,10 +485,11 @@ export class BotStore {
       throw Object.assign(new Error("resolve the pending action before changing this Bot"), { status: 409 });
     }
     this.home.setConfigMode(bot.id, configMode);
+    const client = bot.client;
+    const turnSeq = bot.turnSeq;
+    this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
     bot.turnSeq += 1;
-    this.expireActivePermission(bot);
-    bot.client?.close();
-    bot.client = null;
+    client?.close();
     bot.configMode = configMode;
     bot.write = false;
     bot.needsYou = null;
@@ -501,17 +560,21 @@ export class BotStore {
     try {
       attached = await this.ensureClient(bot);
       if (startTurnSeq !== bot.turnSeq) {
+        this.rotateCallbackQueues(bot, attached.client, bot.turnSeq, { invalidateClient: true });
         attached.client.close();
-        if (bot.client === attached.client) bot.client = null;
         this.home.setSessionId(bot.id, channelId, null);
         throw Object.assign(new Error("message start was replaced"), { status: 409 });
       }
       if (bot.write) {
-        replacementTurnSeq = ++bot.turnSeq;
+        const replacedTurnSeq = bot.turnSeq;
+        replacementTurnSeq = replacedTurnSeq + 1;
         bot.pendingAssistant = null;
         bot.assistantMessageIds.clear();
         bot.activeUserId = null;
-        this.expireActivePermission(bot);
+        if (!this.rotateCallbackQueues(bot, attached.client, replacedTurnSeq)) {
+          throw Object.assign(new Error("message start was replaced"), { status: 409 });
+        }
+        bot.turnSeq = replacementTurnSeq;
         let reusable = true;
         try {
           reusable = attached.client.cancel() !== false;
@@ -519,11 +582,15 @@ export class BotStore {
           reusable = false;
         }
         if (!reusable) {
-          if (bot.client === attached.client) bot.client = null;
+          if (!this.rotateCallbackQueues(bot, attached.client, replacementTurnSeq, {
+            invalidateClient: true,
+          })) {
+            throw Object.assign(new Error("message start was replaced"), { status: 409 });
+          }
           attached = await this.ensureClient(bot);
           if (replacementTurnSeq !== bot.turnSeq) {
+            this.rotateCallbackQueues(bot, attached.client, bot.turnSeq, { invalidateClient: true });
             attached.client.close();
-            if (bot.client === attached.client) bot.client = null;
             this.home.setSessionId(bot.id, channelId, null);
             throw Object.assign(new Error("message start was replaced"), { status: 409 });
           }
@@ -570,14 +637,14 @@ export class BotStore {
         attemptClient.prompt(talkPrompt(trimmed, replyTarget?.text, attemptHistory), {
           onComputerHelp: (prompt) => {
             if (turnSeq !== bot.turnSeq) return;
-            this.queueComputerHelp(bot, attemptClient, prompt, turnSeq);
+            return this.queueComputerHelp(bot, attemptClient, prompt, turnSeq);
           },
           onComputerHelpCancelled: (prompt) => {
-            this.queueComputerHelpCancellation(bot, attemptClient, prompt, turnSeq);
+            return this.queueComputerHelpCancellation(bot, attemptClient, prompt, turnSeq);
           },
           onPermission: (prompt) => {
             if (turnSeq !== bot.turnSeq) return;
-            this.queuePermission(bot, attemptClient, prompt, turnSeq);
+            return this.queuePermission(bot, attemptClient, prompt, turnSeq);
           },
           onAssistant: (assistantText, delta) => {
             if (turnSeq !== bot.turnSeq) return;
@@ -599,7 +666,7 @@ export class BotStore {
           reply = await promptWithClient(client, history);
         } catch (err) {
           if (!cancellationClosedTransport(err) || turnSeq !== bot.turnSeq) throw err;
-          if (bot.client === client) bot.client = null;
+          this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
           this.home.setSessionId(bot.id, channelId, null);
           bot.startingTurn = true;
           let recovered: { client: AcpSession; skipHistory: boolean };
@@ -609,8 +676,8 @@ export class BotStore {
             bot.startingTurn = false;
           }
           if (turnSeq !== bot.turnSeq) {
+            this.rotateCallbackQueues(bot, recovered.client, bot.turnSeq, { invalidateClient: true });
             recovered.client.close();
-            if (bot.client === recovered.client) bot.client = null;
             return;
           }
           client = recovered.client;
@@ -626,7 +693,17 @@ export class BotStore {
       } catch (err) {
         if (turnSeq !== bot.turnSeq) return;
         if (isCancelled(err)) {
-          if (cancellationClosedTransport(err) && bot.client === client) bot.client = null;
+          if (cancellationClosedTransport(err)) {
+            this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
+          }
+          return;
+        }
+        if (computerHelpResponseWasFlushed(err)) {
+          this.rotateCallbackQueues(bot, client, turnSeq, {
+            invalidateClient: true,
+            responseFlushed: true,
+          });
+          this.home.setSessionId(bot.id, channelId, null);
           return;
         }
         const needsSignIn = isAuthError(err) || isLikelyLogin(err);
@@ -635,10 +712,10 @@ export class BotStore {
           bot.needsYou = { reason: "login", hint: loginHint("codex") };
         }
         this.discardUnfinishedAssistant(bot);
-        this.expireActivePermission(bot);
         this.appendFailureCard(bot, channelId, userMessage.id, needsSignIn);
-        bot.client?.close();
-        bot.client = null;
+        if (callbackFailedTransport(err)) this.home.setSessionId(bot.id, channelId, null);
+        this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
+        client.close();
       } finally {
         if (turnSeq !== bot.turnSeq) return;
         bot.pendingAssistant = null;
@@ -706,7 +783,7 @@ export class BotStore {
     if (resolution !== "done" && resolution !== "skip") {
       throw Object.assign(new Error("resolution must be done or skip"), { status: 400 });
     }
-    return this.enqueueComputerHelp(bot, async () => {
+    return this.enqueueComputerHelp(bot, async (queues) => {
       const channelId = this.channelId(bot.id);
       const message = this.home.getMessage(channelId, cardId);
       if (!message?.card || message.card.kind !== "computer") {
@@ -717,13 +794,7 @@ export class BotStore {
       const active = bot.computerHelp;
       if (
         !active
-        || active.eventId !== eventId
-        || active.cardId !== cardId
-        || active.client !== bot.client
-        || active.turnSeq !== bot.turnSeq
-        || bot.needsYou?.reason !== "computer-help"
-        || bot.needsYou.eventId !== eventId
-        || bot.needsYou.cardId !== cardId
+        || !this.computerHelpContextIsCurrent(bot, queues, active, eventId, cardId)
         || !active.client.respondComputerHelp
       ) {
         throw Object.assign(new Error("needs-you event is no longer active"), { status: 409 });
@@ -732,12 +803,7 @@ export class BotStore {
       try {
         await active.client.respondComputerHelp(active.rpcId, resolution, () => {
           if (
-            bot.computerHelp !== active
-            || bot.client !== active.client
-            || bot.turnSeq !== active.turnSeq
-            || bot.needsYou?.reason !== "computer-help"
-            || bot.needsYou.eventId !== eventId
-            || bot.needsYou.cardId !== cardId
+            !this.computerHelpContextIsCurrent(bot, queues, active, eventId, cardId)
           ) {
             throw new Error("needs-you event changed before response flush");
           }
@@ -748,8 +814,11 @@ export class BotStore {
           committed = true;
         });
       } catch (err) {
-        if (!committed && bot.computerHelp === active) {
-          if (computerHelpResponseWasFlushed(err)) {
+        if (computerHelpResponseWasFlushed(err)) {
+          if (
+            !committed
+            && this.computerHelpContextIsCurrent(bot, queues, active, eventId, cardId)
+          ) {
             try {
               this.home.updateMessageCard(
                 cardId,
@@ -767,11 +836,13 @@ export class BotStore {
               bot.needsYou = null;
             }
             bot.eyesMode = bot.permission ? "needs-you" : bot.write ? "write" : "idle";
-            throw Object.assign(
-              new Error("The response was sent, but OpenBot could not confirm this Card."),
-              { status: 409 },
-            );
           }
+          throw unconfirmedComputerHelpResponse();
+        }
+        if (!this.callbackQueuesAreCurrent(bot, queues)) {
+          throw queues.detachment?.publicError ?? botActionNoLongerActive();
+        }
+        if (!committed && this.computerHelpContextIsCurrent(bot, queues, active, eventId, cardId)) {
           this.home.updateMessageCard(cardId, failedNeedsYouResumeCard(pendingCard, eventId));
           bot.eyesMode = "needs-you";
         }
@@ -780,13 +851,21 @@ export class BotStore {
       if (!committed) {
         throw Object.assign(new Error("needs-you event is no longer active"), { status: 409 });
       }
+      if (
+        !this.callbackQueuesAreCurrent(bot, queues)
+        || bot.client !== active.client
+        || bot.turnSeq !== active.turnSeq
+        || this.home.getMessage(channelId, cardId)?.id !== cardId
+      ) {
+        throw queues.detachment?.publicError ?? botActionNoLongerActive();
+      }
       return this.toPublic(bot, true);
     });
   }
 
   async answerPermission(id: string, optionId: string, cardId: string): Promise<PublicBot> {
     const bot = this.require(id);
-    return this.enqueuePermission(bot, async () => {
+    return this.enqueuePermission(bot, async (queues) => {
       if (!bot.permission || !bot.client) {
         throw Object.assign(new Error("no permission prompt"), { status: 409 });
       }
@@ -810,23 +889,47 @@ export class BotStore {
       const sourceMessageId = bot.activeUserId;
       const rpcId = activePermission.rpcId;
       const client = bot.client;
+      if (!this.permissionContextIsCurrent(
+        bot,
+        queues,
+        activePermission,
+        client,
+        permissionTurnSeq,
+        activeCardId,
+      )) {
+        throw Object.assign(new Error("permission Card is no longer active"), { status: 409 });
+      }
       try {
         await client.respondPermission(rpcId, optionId);
       } catch {
-        if (
-          bot.turnSeq !== permissionTurnSeq
-          || bot.permission !== activePermission
-          || bot.client !== client
-        ) {
+        if (!this.permissionContextIsCurrent(
+          bot,
+          queues,
+          activePermission,
+          client,
+          permissionTurnSeq,
+          activeCardId,
+        )) {
           throw Object.assign(new Error("permission Card is no longer active"), { status: 409 });
         }
-        this.failPermissionDelivery(bot, message.id, client, sourceMessageId);
+        this.failPermissionDelivery(
+          bot,
+          queues,
+          activePermission,
+          message.id,
+          client,
+          permissionTurnSeq,
+          sourceMessageId,
+        );
       }
-      if (
-        bot.turnSeq !== permissionTurnSeq
-        || bot.permission !== activePermission
-        || bot.client !== client
-      ) {
+      if (!this.permissionContextIsCurrent(
+        bot,
+        queues,
+        activePermission,
+        client,
+        permissionTurnSeq,
+        activeCardId,
+      )) {
         throw Object.assign(new Error("permission Card is no longer active"), { status: 409 });
       }
       this.home.updateMessageCard(message.id, resolvedCard);
@@ -838,7 +941,7 @@ export class BotStore {
 
   async answerHostGrant(id: string, access: string, duration: string, cardId: string): Promise<PublicBot> {
     const bot = this.require(id);
-    return this.enqueuePermission(bot, async () => {
+    return this.enqueuePermission(bot, async (queues) => {
       if (!bot.permission?.hostGrant || !bot.client) {
         throw Object.assign(new Error("no Host grant prompt"), { status: 409 });
       }
@@ -865,23 +968,47 @@ export class BotStore {
         access === "deny" ? pickRejectOption(options) : pickAllowOption(options);
       if (!optionId) throw Object.assign(new Error("no matching permission option"), { status: 409 });
       const client = bot.client;
+      if (!this.permissionContextIsCurrent(
+        bot,
+        queues,
+        activePermission,
+        client,
+        permissionTurnSeq,
+        activeCardId,
+      )) {
+        throw Object.assign(new Error("Host grant Card is no longer active"), { status: 409 });
+      }
       try {
         await client.respondPermission(rpcId, optionId);
       } catch {
-        if (
-          bot.turnSeq !== permissionTurnSeq
-          || bot.permission !== activePermission
-          || bot.client !== client
-        ) {
+        if (!this.permissionContextIsCurrent(
+          bot,
+          queues,
+          activePermission,
+          client,
+          permissionTurnSeq,
+          activeCardId,
+        )) {
           throw Object.assign(new Error("Host grant Card is no longer active"), { status: 409 });
         }
-        this.failPermissionDelivery(bot, message.id, client, sourceMessageId);
+        this.failPermissionDelivery(
+          bot,
+          queues,
+          activePermission,
+          message.id,
+          client,
+          permissionTurnSeq,
+          sourceMessageId,
+        );
       }
-      if (
-        bot.turnSeq !== permissionTurnSeq
-        || bot.permission !== activePermission
-        || bot.client !== client
-      ) {
+      if (!this.permissionContextIsCurrent(
+        bot,
+        queues,
+        activePermission,
+        client,
+        permissionTurnSeq,
+        activeCardId,
+      )) {
         throw Object.assign(new Error("Host grant Card is no longer active"), { status: 409 });
       }
       this.home.resolveHostGrantCard(message.id, resolvedCard, {
@@ -922,8 +1049,7 @@ export class BotStore {
       activeUserId: null,
       turnSeq: 0,
       startingTurn: false,
-      permissionQueue: Promise.resolve(),
-      computerHelpQueue: Promise.resolve(),
+      callbackQueues: callbackQueues(),
       client: null,
     };
   }
@@ -979,15 +1105,15 @@ export class BotStore {
       spawned = this.spawnAcpFn(spec, cwd, {
         onComputerHelp: (prompt) => {
           if (!spawned) return;
-          this.queueComputerHelp(bot, spawned, prompt, bot.turnSeq);
+          return this.queueComputerHelp(bot, spawned, prompt, bot.turnSeq);
         },
         onComputerHelpCancelled: (prompt) => {
           if (!spawned) return;
-          this.queueComputerHelpCancellation(bot, spawned, prompt, bot.turnSeq);
+          return this.queueComputerHelpCancellation(bot, spawned, prompt, bot.turnSeq);
         },
         onPermission: (prompt) => {
           if (!spawned) return;
-          this.queuePermission(bot, spawned, prompt, bot.turnSeq);
+          return this.queuePermission(bot, spawned, prompt, bot.turnSeq);
         },
         onAssistant: (text, delta) => this.applyAssistant(bot, channelId, text, delta),
         onPromptWritten: () => this.setUserReceipt(bot, channelId, "delivered"),
@@ -1176,6 +1302,134 @@ export class BotStore {
     });
   }
 
+  private callbackQueuesAreCurrent(bot: Bot, queues: BotCallbackQueues): boolean {
+    return bot.callbackQueues === queues
+      && bot.callbackQueues.generation === queues.generation
+      && queues.detachment === null;
+  }
+
+  private clientQueueContextIsCurrent(
+    bot: Bot,
+    queues: BotCallbackQueues,
+    client: AcpSession,
+    turnSeq: number,
+  ): boolean {
+    return this.callbackQueuesAreCurrent(bot, queues)
+      && bot.client === client
+      && bot.turnSeq === turnSeq;
+  }
+
+  private permissionBelongsToContext(
+    permission: BotPermission,
+    queues: BotCallbackQueues,
+    client: AcpSession | null,
+    turnSeq: number,
+  ): boolean {
+    return (permission.queueGeneration === undefined || permission.queueGeneration === queues.generation)
+      && (permission.client === undefined || permission.client === client)
+      && (permission.turnSeq === undefined || permission.turnSeq === turnSeq);
+  }
+
+  private permissionContextIsCurrent(
+    bot: Bot,
+    queues: BotCallbackQueues,
+    permission: BotPermission,
+    client: AcpSession,
+    turnSeq: number,
+    cardId: string,
+  ): boolean {
+    return this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)
+      && bot.permission === permission
+      && permission.cardId === cardId
+      && this.permissionBelongsToContext(permission, queues, client, turnSeq);
+  }
+
+  private computerHelpContextIsCurrent(
+    bot: Bot,
+    queues: BotCallbackQueues,
+    computerHelp: BotComputerHelp,
+    eventId: string,
+    cardId: string,
+  ): boolean {
+    return this.clientQueueContextIsCurrent(
+      bot,
+      queues,
+      computerHelp.client,
+      computerHelp.turnSeq,
+    )
+      && bot.computerHelp === computerHelp
+      && computerHelp.queueGeneration === queues.generation
+      && computerHelp.eventId === eventId
+      && computerHelp.cardId === cardId
+      && bot.needsYou?.reason === "computer-help"
+      && bot.needsYou.eventId === eventId
+      && bot.needsYou.cardId === cardId;
+  }
+
+  private rotateCallbackQueues(
+    bot: Bot,
+    client: AcpSession | null,
+    turnSeq: number,
+    rotation: CallbackQueueRotation = {},
+  ): boolean {
+    if (bot.client !== client || bot.turnSeq !== turnSeq) return false;
+    const queues = bot.callbackQueues;
+    if (queues.detachment) return false;
+    const permission = bot.permission;
+    const computerHelp = bot.computerHelp;
+    const next = callbackQueues(queues.generation + 1);
+    const publicError = rotation.publicError
+      ?? (rotation.responseFlushed ? unconfirmedComputerHelpResponse() : botActionNoLongerActive());
+
+    bot.callbackQueues = next;
+    if (rotation.invalidateClient) bot.client = null;
+
+    if (
+      permission
+      && this.permissionBelongsToContext(permission, queues, client, turnSeq)
+    ) {
+      const cardId = permission.cardId;
+      if (cardId) {
+        const message = this.home.getMessage(this.channelId(bot.id), cardId);
+        if (message?.card && message.card.status.tone === "waiting" && message.card.actions.length > 0) {
+          this.home.updateMessageCard(message.id, expiredTranscriptCard(message.card));
+        }
+      }
+      if (bot.permission === permission) bot.permission = null;
+    }
+
+    if (
+      computerHelp
+      && computerHelp.client === client
+      && computerHelp.turnSeq === turnSeq
+      && computerHelp.queueGeneration === queues.generation
+    ) {
+      const message = this.home.getMessage(this.channelId(bot.id), computerHelp.cardId);
+      if (message?.card) {
+        this.home.updateMessageCard(
+          message.id,
+          rotation.responseFlushed
+            ? unconfirmedNeedsYouComputerCard(message.card, computerHelp.eventId)
+            : unavailableNeedsYouComputerCard(message.card),
+        );
+      }
+      if (bot.computerHelp === computerHelp) bot.computerHelp = null;
+      if (
+        bot.needsYou?.reason === "computer-help"
+        && bot.needsYou.eventId === computerHelp.eventId
+        && bot.needsYou.cardId === computerHelp.cardId
+      ) {
+        bot.needsYou = null;
+      }
+    }
+
+    bot.eyesMode = bot.permission || bot.needsYou
+      ? "needs-you"
+      : bot.write ? "write" : "idle";
+    queues.detach({ publicError });
+    return true;
+  }
+
   private expireActivePermission(bot: Bot): void {
     const cardId = bot.permission?.cardId;
     if (cardId) {
@@ -1189,12 +1443,20 @@ export class BotStore {
 
   private async supersedeActivePermission(
     bot: Bot,
+    queues: BotCallbackQueues,
     client: AcpSession,
     turnSeq: number,
   ): Promise<boolean> {
-    if (turnSeq !== bot.turnSeq || bot.client !== client) return false;
+    if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return false;
     const active = bot.permission;
     if (!active) return true;
+    const cardId = active.cardId;
+    if (
+      !cardId
+      || !this.permissionContextIsCurrent(bot, queues, active, client, turnSeq, cardId)
+    ) {
+      return false;
+    }
     const reject = active.hostGrant
       ? pickRejectOption(active.options)
       : pickGenericRejectOption(active.options);
@@ -1203,7 +1465,7 @@ export class BotStore {
         client.cancel();
       } catch {
         client.close();
-        bot.client = null;
+        this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
       }
       this.expireActivePermission(bot);
       return false;
@@ -1211,13 +1473,12 @@ export class BotStore {
     try {
       await client.respondPermission(active.rpcId, reject);
     } catch {
-      if (turnSeq !== bot.turnSeq || bot.client !== client || bot.permission !== active) return false;
+      if (!this.permissionContextIsCurrent(bot, queues, active, client, turnSeq, cardId)) return false;
       client.close();
-      bot.client = null;
-      this.expireActivePermission(bot);
+      this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
       return false;
     }
-    if (turnSeq !== bot.turnSeq || bot.client !== client || bot.permission !== active) return false;
+    if (!this.permissionContextIsCurrent(bot, queues, active, client, turnSeq, cardId)) return false;
     this.expireActivePermission(bot);
     return true;
   }
@@ -1227,11 +1488,11 @@ export class BotStore {
     client: AcpSession,
     prompt: ComputerHelpPrompt,
     turnSeq: number,
-  ): void {
-    void this.enqueueComputerHelp(bot, async () => {
-      if (turnSeq !== bot.turnSeq || bot.client !== client) return;
-      if (!await this.supersedeActivePermission(bot, client, turnSeq)) return;
-      if (turnSeq !== bot.turnSeq || bot.client !== client || bot.computerHelp) return;
+  ): Promise<void> {
+    return this.enqueueComputerHelp(bot, async (queues) => {
+      if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return;
+      if (!await this.supersedeActivePermission(bot, queues, client, turnSeq)) return;
+      if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq) || bot.computerHelp) return;
       const stale = this.home.pendingNeedsYouCard(this.channelId(bot.id));
       if (stale?.card) {
         this.home.updateMessageCard(stale.id, unavailableNeedsYouComputerCard(stale.card));
@@ -1254,6 +1515,7 @@ export class BotStore {
         rpcId: prompt.rpcId,
         client,
         turnSeq,
+        queueGeneration: queues.generation,
       };
       bot.needsYou = {
         reason: "computer-help",
@@ -1262,9 +1524,7 @@ export class BotStore {
         cardId,
       };
       bot.eyesMode = "needs-you";
-    }).catch(() => {
-      void Promise.resolve(client.respondComputerHelp?.(prompt.rpcId, "cancel")).catch(() => undefined);
-    });
+    }, () => undefined);
   }
 
   private queueComputerHelpCancellation(
@@ -1272,14 +1532,16 @@ export class BotStore {
     client: AcpSession,
     prompt: ComputerHelpPrompt,
     turnSeq: number,
-  ): void {
-    void this.enqueueComputerHelp(bot, async () => {
+  ): Promise<void> {
+    return this.enqueueComputerHelp(bot, async (queues) => {
       const active = bot.computerHelp;
       if (
         !active
+        || !this.callbackQueuesAreCurrent(bot, queues)
         || active.client !== client
         || active.rpcId !== prompt.rpcId
         || active.turnSeq !== turnSeq
+        || active.queueGeneration !== queues.generation
       ) {
         return;
       }
@@ -1298,13 +1560,15 @@ export class BotStore {
       bot.eyesMode = bot.permission || bot.needsYou
         ? "needs-you"
         : bot.write ? "write" : "idle";
-    }).catch(() => undefined);
+    }, () => undefined);
   }
 
-  private enqueueComputerHelp<T>(bot: Bot, task: () => Promise<T>): Promise<T> {
-    const result = bot.computerHelpQueue.then(task);
-    bot.computerHelpQueue = result.then(() => undefined, () => undefined);
-    return result;
+  private enqueueComputerHelp<T>(
+    bot: Bot,
+    task: (queues: BotCallbackQueues) => Promise<T>,
+    onDetached?: (error: Error) => T | Promise<T>,
+  ): Promise<T> {
+    return this.enqueueCallbackTask(bot, "computerHelpTail", task, onDetached);
   }
 
   private queuePermission(
@@ -1312,27 +1576,55 @@ export class BotStore {
     client: AcpSession,
     prompt: PermissionPrompt,
     turnSeq: number,
-  ): void {
-    void this.enqueuePermission(bot, async () => {
-      if (turnSeq !== bot.turnSeq || bot.client !== client) return;
-      await this.handlePermission(bot, client, prompt, turnSeq);
-    }).catch(() => this.abortPermissionQueue(bot, client, turnSeq));
+  ): Promise<void> {
+    return this.enqueuePermission(bot, async (queues) => {
+      if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return;
+      await this.handlePermission(bot, queues, client, prompt, turnSeq);
+      if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return;
+    }, () => undefined);
   }
 
-  private enqueuePermission<T>(bot: Bot, task: () => Promise<T>): Promise<T> {
-    const result = bot.permissionQueue.then(task);
-    bot.permissionQueue = result.then(() => undefined, () => undefined);
-    return result;
+  private enqueuePermission<T>(
+    bot: Bot,
+    task: (queues: BotCallbackQueues) => Promise<T>,
+    onDetached?: (error: Error) => T | Promise<T>,
+  ): Promise<T> {
+    return this.enqueueCallbackTask(bot, "permissionTail", task, onDetached);
+  }
+
+  private enqueueCallbackTask<T>(
+    bot: Bot,
+    tail: CallbackQueueTail,
+    task: (queues: BotCallbackQueues) => Promise<T>,
+    onDetached?: (error: Error) => T | Promise<T>,
+  ): Promise<T> {
+    const queues = bot.callbackQueues;
+    const detached = (error: Error): T | Promise<T> => {
+      if (onDetached) return onDetached(error);
+      throw error;
+    };
+    const result = queues[tail].then(() => {
+      if (!this.callbackQueuesAreCurrent(bot, queues)) {
+        return detached(queues.detachment?.publicError ?? botActionNoLongerActive());
+      }
+      return task(queues);
+    });
+    queues[tail] = result.then(() => undefined, () => undefined);
+    return Promise.race([
+      result,
+      queues.detached.then(({ publicError }) => detached(publicError)),
+    ]);
   }
 
   private async handlePermission(
     bot: Bot,
+    queues: BotCallbackQueues,
     client: AcpSession,
     prompt: PermissionPrompt,
     turnSeq: number,
   ): Promise<void> {
-    if (!await this.supersedeActivePermission(bot, client, turnSeq)) return;
-    if (turnSeq !== bot.turnSeq || bot.client !== client) return;
+    if (!await this.supersedeActivePermission(bot, queues, client, turnSeq)) return;
+    if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return;
     const card = permissionTranscriptCard(prompt.toolKind, prompt.options);
     if (card.actions.length === 0) {
       const reject = pickGenericRejectOption(prompt.options);
@@ -1340,11 +1632,11 @@ export class BotStore {
         if (reject) await client.respondPermission(prompt.rpcId, reject);
         else client.cancel();
       } catch {
-        if (turnSeq !== bot.turnSeq || bot.client !== client) return;
+        if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return;
         client.close();
-        bot.client = null;
+        this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
       }
-      if (turnSeq !== bot.turnSeq || bot.client !== client) return;
+      if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return;
       const unsupported = unsupportedPermissionTranscriptCard();
       this.home.appendMessage(this.channelId(bot.id), {
         id: crypto.randomUUID(),
@@ -1369,38 +1661,28 @@ export class BotStore {
       createdAt: nowIso(),
       senderId: bot.id,
     });
-    bot.permission = { ...prompt, cardId };
+    bot.permission = {
+      ...prompt,
+      cardId,
+      client,
+      turnSeq,
+      queueGeneration: queues.generation,
+    };
     bot.eyesMode = "needs-you";
-  }
-
-  private abortPermissionQueue(bot: Bot, client: AcpSession, turnSeq: number): void {
-    if (turnSeq !== bot.turnSeq || bot.client !== client) return;
-    try {
-      client.cancel();
-    } catch {
-      // Closing below is the authoritative local stop.
-    }
-    client.close();
-    bot.client = null;
-    try {
-      this.expireActivePermission(bot);
-    } catch {
-      bot.permission = null;
-    }
-    bot.turnSeq += 1;
-    bot.pendingAssistant = null;
-    bot.assistantMessageIds.clear();
-    bot.activeUserId = null;
-    bot.write = false;
-    bot.eyesMode = bot.needsYou ? "needs-you" : "idle";
   }
 
   private failPermissionDelivery(
     bot: Bot,
+    queues: BotCallbackQueues,
+    permission: BotPermission,
     cardId: string,
     client: AcpSession,
+    turnSeq: number,
     sourceMessageId: string | null,
   ): never {
+    if (!this.permissionContextIsCurrent(bot, queues, permission, client, turnSeq, cardId)) {
+      throw botActionNoLongerActive();
+    }
     const message = this.home.getMessage(this.channelId(bot.id), cardId);
     if (message?.card) {
       const failed = sourceMessageId
@@ -1408,16 +1690,20 @@ export class BotStore {
         : expiredTranscriptCard(message.card);
       this.home.updateMessageCard(cardId, failed);
     }
-    bot.turnSeq += 1;
     bot.permission = null;
     bot.pendingAssistant = null;
     bot.assistantMessageIds.clear();
     bot.activeUserId = null;
     bot.write = false;
     bot.eyesMode = bot.needsYou ? "needs-you" : "idle";
+    const error = Object.assign(new Error("Permission could not be sent to the Harness"), { status: 409 });
+    this.rotateCallbackQueues(bot, client, turnSeq, {
+      invalidateClient: true,
+      publicError: error,
+    });
+    bot.turnSeq += 1;
     client.close();
-    if (bot.client === client) bot.client = null;
-    throw Object.assign(new Error("Permission could not be sent to the Harness"), { status: 409 });
+    throw error;
   }
 
   private toPublicChannel(

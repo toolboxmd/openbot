@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.4] - 2026-08-28
+
+### Changed
+
+- Contain ACP callback failures inside one Bot transport
+
 ## [0.10.3] - 2026-08-28
 
 ### Changed
