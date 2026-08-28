@@ -28,6 +28,7 @@ export type Bot = {
   eyes: { color: string; shape: string; mode: EyesMode };
   write: boolean;
   zoom?: boolean;
+  computerOwnership?: "view-only" | "write" | "unknown";
   display?: number | null;
   permission: {
     title: string;
@@ -252,14 +253,230 @@ export type Computer = {
   path: string;
   ready: boolean;
   botId?: string | null;
-  write?: boolean;
-  viewOnly?: boolean;
+  ownership?: "view-only" | "write" | "unknown";
+  ownershipError?: string | null;
+  ownershipEpoch?: string;
+  write?: boolean | null;
+  viewOnly?: boolean | null;
   zoom?: boolean;
   display?: number | null;
   container?: string;
 };
 
-export async function getComputer(botId?: string | null): Promise<Computer> {
+export type ComputerZoomOptions = {
+  keepalive?: boolean;
+};
+
+export type ComputerOwnershipTransition = (
+  botId: string | null,
+  zoom: boolean,
+  options?: ComputerZoomOptions,
+) => Promise<Computer>;
+
+type ComputerOwnershipRequest = (
+  botId: string | null,
+  zoom: boolean,
+  options?: ComputerZoomOptions,
+  ownershipEpoch?: string,
+) => Promise<Computer>;
+
+type ComputerOwnershipGrantPreparation = (botId: string | null) => Promise<string>;
+
+export type ComputerOwnershipTransitions = {
+  transition: ComputerOwnershipTransition;
+  releaseForNavigation: (botId: string | null) => Promise<Computer>;
+};
+
+export class ComputerOwnershipTransitionError extends Error {
+  readonly computer: Computer | null;
+
+  constructor(message: string, computer: Computer | null) {
+    super(message);
+    this.name = "ComputerOwnershipTransitionError";
+    this.computer = computer;
+  }
+}
+
+export function computerCanWrite(
+  computer: Computer | null,
+  expanded: boolean,
+  botId: string | null = computer?.botId ?? null,
+): boolean {
+  return Boolean(
+    expanded
+      && computer?.ownership === "write"
+      && computer.write === true
+      && (computer.botId ?? null) === botId,
+  );
+}
+
+export function createComputerOwnershipTransitions(
+  request: ComputerOwnershipRequest,
+  prepareGrant?: ComputerOwnershipGrantPreparation,
+): ComputerOwnershipTransitions {
+  let tail: Promise<void> = Promise.resolve();
+  let navigationGeneration = 0;
+
+  const transition: ComputerOwnershipTransition = (botId, zoom, options) => {
+    const generation = navigationGeneration;
+    const run = async () => {
+      let ownershipEpoch: string | undefined;
+      if (generation !== navigationGeneration) {
+        throw new ComputerOwnershipTransitionError(
+          "Computer ownership transition was superseded by navigation.",
+          null,
+        );
+      }
+      if (zoom && prepareGrant) {
+        ownershipEpoch = await prepareGrant(botId);
+        if (generation !== navigationGeneration) {
+          throw new ComputerOwnershipTransitionError(
+            "Computer ownership transition was superseded by navigation.",
+            null,
+          );
+        }
+      }
+      return request(botId, zoom, options, ownershipEpoch);
+    };
+    const result = tail.then(
+      run,
+      run,
+    );
+    tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  };
+
+  function releaseForNavigation(botId: string | null): Promise<Computer> {
+    navigationGeneration += 1;
+    const previous = tail;
+    let result: Promise<Computer>;
+    try {
+      result = request(botId, false, { keepalive: true });
+    } catch (error) {
+      result = Promise.reject(error);
+    }
+    tail = Promise.allSettled([previous, result]).then(() => undefined);
+    return result;
+  }
+
+  return { transition, releaseForNavigation };
+}
+
+type ComputerAuthorityObservation = {
+  order: number;
+  releaseGeneration: number;
+  blockedByRelease: boolean;
+};
+
+type ComputerReleaseAttempt = {
+  order: number;
+  releaseGeneration: number;
+};
+
+type ComputerGrantPreparation =
+  | { kind: "cached"; token: string }
+  | { kind: "preflight"; observation: ComputerAuthorityObservation };
+
+function computerOwnershipToken(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 && value.length <= 128
+    ? value
+    : null;
+}
+
+/** Owns the PWA's one cached opaque grant token and release authority. */
+class ComputerOwnershipAuthority {
+  private ownershipToken: string | null = null;
+  private requestOrder = 0;
+  private acceptedSourceOrder = 0;
+  private releaseGeneration = 0;
+  private pendingReleases = 0;
+  private releaseWindowAmbiguous = false;
+
+  beginGrant(): ComputerGrantPreparation | null {
+    if (this.pendingReleases > 0) return null;
+    if (this.ownershipToken !== null) {
+      return { kind: "cached", token: this.ownershipToken };
+    }
+    return { kind: "preflight", observation: this.beginObservation() };
+  }
+
+  beginObservation(): ComputerAuthorityObservation {
+    this.requestOrder += 1;
+    return {
+      order: this.requestOrder,
+      releaseGeneration: this.releaseGeneration,
+      blockedByRelease: this.pendingReleases > 0,
+    };
+  }
+
+  observe(computer: Partial<Computer>, observation: ComputerAuthorityObservation): void {
+    if (
+      observation.blockedByRelease
+      || observation.releaseGeneration !== this.releaseGeneration
+      || this.pendingReleases > 0
+      || observation.order < this.acceptedSourceOrder
+    ) return;
+    const token = computerOwnershipToken(computer.ownershipEpoch);
+    if (token === null) return;
+    this.ownershipToken = token;
+    this.acceptedSourceOrder = observation.order;
+  }
+
+  finishGrantPreflight(
+    computer: Partial<Computer>,
+    observation: ComputerAuthorityObservation,
+  ): string | null {
+    if (
+      observation.blockedByRelease
+      || observation.releaseGeneration !== this.releaseGeneration
+      || this.pendingReleases > 0
+    ) return null;
+    const token = computerOwnershipToken(computer.ownershipEpoch);
+    if (token === null) return null;
+    if (observation.order >= this.acceptedSourceOrder) {
+      this.ownershipToken = token;
+      this.acceptedSourceOrder = observation.order;
+    }
+    return token;
+  }
+
+  beginRelease(): ComputerReleaseAttempt {
+    this.requestOrder += 1;
+    this.releaseGeneration += 1;
+    this.ownershipToken = null;
+    if (this.pendingReleases > 0) this.releaseWindowAmbiguous = true;
+    this.pendingReleases += 1;
+    return {
+      order: this.requestOrder,
+      releaseGeneration: this.releaseGeneration,
+    };
+  }
+
+  finishRelease(
+    attempt: ComputerReleaseAttempt,
+    computer: Partial<Computer> | null,
+  ): void {
+    const locallyUnambiguous = this.pendingReleases === 1
+      && !this.releaseWindowAmbiguous
+      && attempt.releaseGeneration === this.releaseGeneration;
+    this.pendingReleases -= 1;
+    const token = locallyUnambiguous
+      ? computerOwnershipToken(computer?.ownershipEpoch)
+      : null;
+    this.ownershipToken = token;
+    if (token !== null) {
+      this.acceptedSourceOrder = Math.max(this.acceptedSourceOrder, attempt.order);
+    }
+    if (this.pendingReleases === 0) this.releaseWindowAmbiguous = false;
+  }
+}
+
+const computerOwnershipAuthority = new ComputerOwnershipAuthority();
+
+async function fetchComputer(botId?: string | null): Promise<Computer> {
   const qs = botId ? `?botId=${encodeURIComponent(botId)}` : "";
   const res = await fetch(`/api/computer${qs}`, { credentials: "same-origin" });
   if (!res.ok) {
@@ -268,16 +485,96 @@ export async function getComputer(botId?: string | null): Promise<Computer> {
   return (await res.json()) as Computer;
 }
 
-export async function setComputerZoom(botId: string | null, zoom: boolean): Promise<Computer> {
-  const res = await fetch("/api/computer/zoom", {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ botId, zoom }),
-  });
-  if (!res.ok) {
-    const body = (await res.json().catch(() => ({}))) as { error?: string };
-    throw new Error(body.error ?? "Could not zoom Computer.");
+export async function getComputer(botId?: string | null): Promise<Computer> {
+  const observation = computerOwnershipAuthority.beginObservation();
+  const computer = await fetchComputer(botId);
+  computerOwnershipAuthority.observe(computer, observation);
+  return computer;
+}
+
+async function requestComputerZoom(
+  botId: string | null,
+  zoom: boolean,
+  options: ComputerZoomOptions = {},
+  ownershipEpoch?: string,
+): Promise<Computer> {
+  if (zoom && computerOwnershipToken(ownershipEpoch) === null) {
+    throw new ComputerOwnershipTransitionError(
+      "Computer ownership epoch is unavailable. Refresh Computer before granting write.",
+      null,
+    );
   }
-  return (await res.json()) as Computer;
+  const releaseAttempt = zoom ? null : computerOwnershipAuthority.beginRelease();
+  const observation = zoom ? computerOwnershipAuthority.beginObservation() : null;
+  let releaseResult: Partial<Computer> | null = null;
+  try {
+    const res = await fetch("/api/computer/zoom", {
+      method: "POST",
+      credentials: "same-origin",
+      keepalive: options.keepalive,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        botId,
+        zoom,
+        ...(zoom ? { ownershipEpoch } : {}),
+      }),
+    });
+    const body = (await res.json().catch(() => ({}))) as Partial<Computer> & { error?: string };
+    if (zoom && observation) computerOwnershipAuthority.observe(body, observation);
+    else releaseResult = body;
+    if (!res.ok) {
+      const computer = typeof body.path === "string" && typeof body.ready === "boolean"
+        ? (body as Computer)
+        : null;
+      throw new ComputerOwnershipTransitionError(
+        res.status === 409
+          ? "Computer changed. Refresh and retry Computer."
+          : (body.error ?? "Could not change Computer write ownership."),
+        computer,
+      );
+    }
+    return body as Computer;
+  } finally {
+    if (releaseAttempt) computerOwnershipAuthority.finishRelease(releaseAttempt, releaseResult);
+  }
+}
+
+async function prepareComputerOwnershipGrant(botId: string | null): Promise<string> {
+  const preparation = computerOwnershipAuthority.beginGrant();
+  if (preparation?.kind === "cached") return preparation.token;
+  if (preparation === null) {
+    throw new ComputerOwnershipTransitionError(
+      "Computer ownership epoch is unavailable. Refresh Computer before granting write.",
+      null,
+    );
+  }
+  const computer = await fetchComputer(botId);
+  const token = computerOwnershipAuthority.finishGrantPreflight(
+    computer,
+    preparation.observation,
+  );
+  if (token === null) {
+    throw new ComputerOwnershipTransitionError(
+      "Computer ownership epoch is unavailable. Refresh Computer before granting write.",
+      computer,
+    );
+  }
+  return token;
+}
+
+const transitionComputerOwnership = createComputerOwnershipTransitions(
+  requestComputerZoom,
+  prepareComputerOwnershipGrant,
+);
+
+export function setComputerZoom(
+  botId: string | null,
+  zoom: boolean,
+  options?: ComputerZoomOptions,
+): Promise<Computer> {
+  return transitionComputerOwnership.transition(botId, zoom, options);
+}
+
+export function releaseComputerForNavigation(botId: string | null): Promise<Computer> {
+  return transitionComputerOwnership.releaseForNavigation(botId);
 }

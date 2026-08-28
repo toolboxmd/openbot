@@ -58,6 +58,7 @@ import {
 } from "./acp.ts";
 import { NoopComputerRuntime, type ComputerRuntime, type DisplayHandle } from "./computer.ts";
 import { pinchTabMcpServers, stripPinchTabFromPath } from "./pinchtab.ts";
+import type { KasmWriteAuthority } from "./kasm.ts";
 
 export { defaultHomeDir, defaultWorkspaceDir } from "./home.ts";
 export type { MessageReaction, MessageReceipt } from "./home.ts";
@@ -84,6 +85,7 @@ export type PublicBot = {
   eyes: { color: string; shape: FaceShape; mode: EyesMode };
   write: boolean;
   zoom: boolean;
+  computerOwnership: KasmWriteAuthority;
   display: number | null;
   permission: PublicPermission | null;
   needsYou: { reason: "login"; hint: string } | null;
@@ -125,6 +127,7 @@ type Bot = {
   configMode: ConfigMode;
   write: boolean;
   zoom: boolean;
+  computerOwnership: KasmWriteAuthority;
   display: DisplayHandle | null;
   eyesMode: EyesMode;
   needsYou: { reason: "login"; hint: string } | null;
@@ -309,21 +312,33 @@ export class BotStore {
   }
 
   zoom(id: string): PublicBot {
-    const bot = this.require(id);
-    if (this.zoomedId && this.zoomedId !== id) this.unzoom(this.zoomedId);
-    bot.zoom = true;
-    this.zoomedId = id;
-    return this.toPublic(bot, true);
+    return this.setComputerOwnership(id, "write");
   }
 
   unzoom(id: string): PublicBot {
+    return this.setComputerOwnership(id, "view-only");
+  }
+
+  setComputerOwnership(id: string, authority: KasmWriteAuthority): PublicBot {
     const bot = this.require(id);
-    bot.zoom = false;
-    if (this.zoomedId === id) this.zoomedId = null;
+    if (authority === "write" && this.zoomedId && this.zoomedId !== id) {
+      const previous = this.require(this.zoomedId);
+      previous.zoom = false;
+      previous.computerOwnership = "view-only";
+      this.restoreEyes(previous);
+    }
+    bot.computerOwnership = authority;
+    bot.zoom = authority === "write";
+    if (authority === "write") this.zoomedId = id;
+    else if (this.zoomedId === id) this.zoomedId = null;
+    this.restoreEyes(bot);
+    return this.toPublic(bot, true);
+  }
+
+  private restoreEyes(bot: Bot): void {
     if (bot.needsYou || bot.permission) bot.eyesMode = "needs-you";
     else if (bot.write) bot.eyesMode = "write";
     else bot.eyesMode = "idle";
-    return this.toPublic(bot, true);
   }
 
   async pickHarness(id: string, harness: string): Promise<PublicBot> {
@@ -545,6 +560,7 @@ export class BotStore {
       configMode: stored.configMode ?? "isolated",
       write: false,
       zoom: false,
+      computerOwnership: "view-only",
       display,
       eyesMode: "idle",
       needsYou: null,
@@ -842,6 +858,7 @@ export class BotStore {
       eyes: { color: bot.color, shape: bot.shape, mode },
       write: bot.write,
       zoom: bot.zoom,
+      computerOwnership: bot.computerOwnership,
       display: bot.display?.display ?? null,
       permission: publicPermission(bot.permission),
       needsYou: bot.needsYou,

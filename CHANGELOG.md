@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.7] - 2026-08-28
+
+### Changed
+
+- Issue #92: make Computer write ownership failure-safe
+
 ## [0.9.6] - 2026-08-28
 
 ### Changed
