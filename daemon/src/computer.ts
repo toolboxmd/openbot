@@ -101,15 +101,69 @@ function ensurePrivateDirectory(directory: string): void {
   fs.chmodSync(directory, 0o700);
 }
 
-export function parseScreenPorts(raw: string | undefined): number[] {
-  if (!raw) return [];
-  return raw
-    .split(",")
-    .map((part) => Number(part.trim()))
-    .filter((n) => Number.isInteger(n) && n > 0);
+type HostPortListName = "SCREEN_PORTS" | "PINCHTAB_PORTS";
+
+function validateHostPorts(name: HostPortListName, ports: number[]): void {
+  if (ports.length > DISPLAY_MAX) {
+    throw new Error(`${name} must contain at most ${DISPLAY_MAX} display fields`);
+  }
+  const seen = new Set<number>();
+  ports.forEach((port, index) => {
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+      throw new Error(`${name} field ${index + 1} is outside the host port range`);
+    }
+    if (isForbiddenHostPort(port)) {
+      throw new Error(`${name} field ${index + 1} cannot publish port 6901`);
+    }
+    if (seen.has(port)) {
+      throw new Error(`${name} contains duplicate host port ${port}`);
+    }
+    seen.add(port);
+  });
 }
 
-export const parsePinchTabPorts = parseScreenPorts;
+function validateEndpointMapping(screenPorts: number[], pinchTabPorts: number[]): void {
+  validateHostPorts("SCREEN_PORTS", screenPorts);
+  validateHostPorts("PINCHTAB_PORTS", pinchTabPorts);
+  if (pinchTabPorts.length > 0 && pinchTabPorts.length !== screenPorts.length) {
+    throw new Error(
+      `PINCHTAB_PORTS must contain ${screenPorts.length} fields; one is required for every SCREEN_PORTS display`,
+    );
+  }
+  const screen = new Set(screenPorts);
+  const overlap = pinchTabPorts.find((port) => screen.has(port));
+  if (overlap !== undefined) {
+    throw new Error(`SCREEN_PORTS and PINCHTAB_PORTS overlap at host port ${overlap}`);
+  }
+}
+
+function parseHostPorts(name: HostPortListName, raw: string | undefined): number[] {
+  if (raw === undefined) return [];
+  const ports = raw.split(",").map((part, index) => {
+    const field = part.trim();
+    if (!/^\d+$/u.test(field)) {
+      throw new Error(`${name} field ${index + 1} must be a decimal host port`);
+    }
+    const port = Number(field);
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+      throw new Error(`${name} field ${index + 1} is outside the host port range`);
+    }
+    if (isForbiddenHostPort(port)) {
+      throw new Error(`${name} field ${index + 1} cannot publish port 6901`);
+    }
+    return port;
+  });
+  validateHostPorts(name, ports);
+  return ports;
+}
+
+export function parseScreenPorts(raw: string | undefined): number[] {
+  return parseHostPorts("SCREEN_PORTS", raw);
+}
+
+export function parsePinchTabPorts(raw: string | undefined): number[] {
+  return parseHostPorts("PINCHTAB_PORTS", raw);
+}
 
 export function pinchTabContainerPort(display: number): number {
   return PINCHTAB_CONTAINER_PORT_BASE + display - 1;
@@ -485,9 +539,14 @@ export class DockerComputerRuntime implements ComputerRuntime {
   private docker: DockerFn;
 
   constructor(opts: DockerComputerOptions = {}) {
+    const hostPorts = [...(opts.hostPorts ?? parseScreenPorts(process.env.SCREEN_PORTS))];
+    const pinchTabHostPorts = [
+      ...(opts.pinchTabHostPorts ?? parsePinchTabPorts(process.env.PINCHTAB_PORTS)),
+    ];
+    validateEndpointMapping(hostPorts, pinchTabHostPorts);
     this.name = opts.containerName ?? process.env.OPENBOT_SCREEN_CONTAINER ?? COMPUTER_CONTAINER;
-    this.hostPorts = opts.hostPorts ?? parseScreenPorts(process.env.SCREEN_PORTS);
-    this.pinchTabHostPorts = opts.pinchTabHostPorts ?? parsePinchTabPorts(process.env.PINCHTAB_PORTS);
+    this.hostPorts = hostPorts;
+    this.pinchTabHostPorts = pinchTabHostPorts;
     this.pinchTabTokenValue = opts.pinchTabToken ?? process.env.PINCHTAB_TOKEN;
     this.cookiesDir = opts.cookiesDir ?? defaultCookieJar();
     this.docker = opts.docker ?? defaultDocker(opts.env ?? process.env);

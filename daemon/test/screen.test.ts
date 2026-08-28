@@ -403,7 +403,7 @@ describe("Computer Screen readiness semantics", () => {
     assert.ok(abortedAt <= 256 * 1024, `readiness buffered ${abortedAt} bytes before aborting`);
   });
 
-  test("duplicate configured Screen endpoints cannot publish a second Bot and corrected configuration can retry", async (t) => {
+  test("invalid endpoint configuration cannot publish and corrected pairs survive restart", async (t) => {
     const firstKasm = await startReadyKasmFixture();
     const secondKasm = await startReadyKasmFixture();
     t.after(async () => {
@@ -414,62 +414,26 @@ describe("Computer Screen readiness semantics", () => {
     });
     const homeDir = await mkdtemp(join(tmpdir(), "openbot-duplicate-screen-home-"));
     const cookieDir = join(homeDir, "computer-cookies");
-    const duplicateDockerCalls: string[][] = [];
-    const duplicateComputer = new DockerComputerRuntime({
-      hostPorts: [firstKasm.port, firstKasm.port],
-      cookiesDir: cookieDir,
-      docker: async (args) => {
-        duplicateDockerCalls.push(args);
-        return { code: 0, stdout: args[0] === "inspect" ? "true\n" : "", stderr: "" };
-      },
-    });
-    const duplicateBox = await startBox({
-      password: PASSWORD,
-      pwaDir: await emptyPwa(),
-      host: "127.0.0.1",
-      port: 0,
-      homeDir,
-      computer: duplicateComputer,
-    });
-    let firstBotId = "";
-
-    try {
-      const cookie = await login(duplicateBox.url);
-      const create = (name: string) => fetch(`${duplicateBox.url}/api/bots`, {
-        method: "POST",
-        headers: { cookie, "content-type": "application/json" },
-        body: JSON.stringify({ name }),
-      });
-      const first = await create("First Screen");
-      assert.equal(first.status, 201);
-      const firstBot = (await first.json()) as { id: string; display?: number };
-      firstBotId = firstBot.id;
-      assert.equal(firstBot.display, 1);
-
-      const aliased = await create("Aliased Screen");
-      assert.equal(aliased.status, 409);
-      const aliasedBody = (await aliased.json()) as { code?: string; recoverable?: boolean };
-      assert.equal(aliasedBody.code, "SCREEN_ENDPOINT_CONFLICT");
-      assert.equal(aliasedBody.recoverable, true);
-      const list = await fetch(`${duplicateBox.url}/api/bots`, { headers: { cookie } });
-      const afterFailure = (await list.json()) as { bots?: Array<{ id: string }> };
-      assert.deepEqual(afterFailure.bots?.map((bot) => bot.id), [firstBotId]);
-      assert.equal(
-        duplicateDockerCalls.some((args) =>
-          args[0] === "exec"
-          && args[2] === DISPLAY_BIN
-          && args[3] === "start"
-          && args[4] === "2"),
-        false,
-        "an aliased Screen endpoint started display 2 before failing",
-      );
-    } finally {
-      await duplicateBox.close();
-    }
+    let invalidDockerCalls = 0;
+    assert.throws(
+      () => new DockerComputerRuntime({
+        hostPorts: [firstKasm.port, secondKasm.port],
+        pinchTabHostPorts: [19867, 19867],
+        cookiesDir: cookieDir,
+        docker: async () => {
+          invalidDockerCalls += 1;
+          return { code: 0, stdout: "", stderr: "" };
+        },
+      }),
+      /PINCHTAB_PORTS.*duplicate/iu,
+    );
+    assert.equal(invalidDockerCalls, 0);
 
     const correctedDockerCalls: string[][] = [];
     const correctedComputer = new DockerComputerRuntime({
       hostPorts: [firstKasm.port, secondKasm.port],
+      pinchTabHostPorts: [19867, 19868],
+      pinchTabToken: "endpoint-map-token",
       cookiesDir: cookieDir,
       docker: async (args) => {
         correctedDockerCalls.push(args);
@@ -484,18 +448,36 @@ describe("Computer Screen readiness semantics", () => {
       homeDir,
       computer: correctedComputer,
     });
+    let firstBotId = "";
+    let secondBotId = "";
 
     try {
       const cookie = await login(correctedBox.url);
-      const retried = await fetch(`${correctedBox.url}/api/bots`, {
-        method: "POST",
-        headers: { cookie, "content-type": "application/json" },
-        body: JSON.stringify({ name: "Corrected Screen" }),
-      });
-      assert.equal(retried.status, 201);
-      const secondBot = (await retried.json()) as { id: string; display?: number };
+      const create = async (name: string) => {
+        const response = await fetch(`${correctedBox.url}/api/bots`, {
+          method: "POST",
+          headers: { cookie, "content-type": "application/json" },
+          body: JSON.stringify({ name }),
+        });
+        assert.equal(response.status, 201);
+        return response.json() as Promise<{ id: string; display?: number }>;
+      };
+      const firstBot = await create("Corrected Screen 1");
+      const secondBot = await create("Corrected Screen 2");
+      firstBotId = firstBot.id;
+      secondBotId = secondBot.id;
+      assert.equal(firstBot.display, 1);
       assert.equal(secondBot.display, 2);
-      assert.notEqual(correctedComputer.upstream(firstBotId), correctedComputer.upstream(secondBot.id));
+      assert.equal(correctedComputer.upstream(firstBot.id), `http://127.0.0.1:${firstKasm.port}`);
+      assert.equal(correctedComputer.upstream(secondBot.id), `http://127.0.0.1:${secondKasm.port}`);
+      assert.deepEqual(correctedComputer.pinchTab(firstBot.id), {
+        url: "http://127.0.0.1:19867",
+        token: "endpoint-map-token",
+      });
+      assert.deepEqual(correctedComputer.pinchTab(secondBot.id), {
+        url: "http://127.0.0.1:19868",
+        token: "endpoint-map-token",
+      });
       assert.equal(
         correctedDockerCalls.filter((args) =>
           args[0] === "exec"
@@ -506,6 +488,45 @@ describe("Computer Screen readiness semantics", () => {
       );
     } finally {
       await correctedBox.close();
+    }
+
+    const restartComputer = new DockerComputerRuntime({
+      hostPorts: [firstKasm.port, secondKasm.port],
+      pinchTabHostPorts: [19867, 19868],
+      pinchTabToken: "endpoint-map-token",
+      cookiesDir: cookieDir,
+      docker: async (args) => ({
+        code: 0,
+        stdout: args[0] === "inspect" ? "true\n" : "",
+        stderr: "",
+      }),
+    });
+    const restartedBox = await startBox({
+      password: PASSWORD,
+      pwaDir: await emptyPwa(),
+      host: "127.0.0.1",
+      port: 0,
+      homeDir,
+      computer: restartComputer,
+    });
+    try {
+      const cookie = await login(restartedBox.url);
+      const response = await fetch(`${restartedBox.url}/api/bots`, { headers: { cookie } });
+      assert.equal(response.status, 200);
+      const body = (await response.json()) as { bots?: Array<{ id: string; display?: number }> };
+      assert.deepEqual(
+        body.bots?.map((bot) => ({ id: bot.id, display: bot.display })),
+        [
+          { id: firstBotId, display: 1 },
+          { id: secondBotId, display: 2 },
+        ],
+      );
+      assert.equal(restartComputer.display(firstBotId)?.display, 1);
+      assert.equal(restartComputer.display(secondBotId)?.display, 2);
+      assert.equal(restartComputer.pinchTab(firstBotId)?.url, "http://127.0.0.1:19867");
+      assert.equal(restartComputer.pinchTab(secondBotId)?.url, "http://127.0.0.1:19868");
+    } finally {
+      await restartedBox.close();
     }
   });
 
