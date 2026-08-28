@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.11] - 2026-08-28
+
+### Changed
+
+- Bound Docker commands during Screen provisioning
+
 ## [0.9.10] - 2026-08-28
 
 ### Changed

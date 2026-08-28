@@ -2,13 +2,15 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import http from "node:http";
 import net from "node:net";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { after, before, describe, mock, test } from "node:test";
 import { startBox, type RunningBox } from "../src/box.ts";
 import { DISPLAY_BIN, DockerComputerRuntime, MemoryComputerRuntime } from "../src/computer.ts";
+import { HomeStore, defaultWorkspaceDir } from "../src/home.ts";
 
 const PASSWORD = "correct-horse";
 const KASM_USER = "kasm";
@@ -96,6 +98,27 @@ async function closeHttpServer(server: http.Server): Promise<void> {
   server.closeAllConnections();
   if (!server.listening) return;
   await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+async function waitForPath(file: string, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(file)) {
+    if (Date.now() >= deadline) throw new Error(`fixture did not publish ${file}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function waitForPidExit(pid: number, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`fixture process ${pid} survived cleanup`);
 }
 
 describe("Computer Screen HTTP", () => {
@@ -288,6 +311,118 @@ describe("Computer Screen HTTP", () => {
     assert.equal(adaBody.container, benBody.container);
     assert.equal(computer.commands.filter((args) => args[0] === "run").length, 0);
   });
+});
+
+test("public Bot creation compensates a Docker timeout and retries the intended display", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openbot-docker-timeout-public-"));
+  const binDir = join(root, "bin");
+  const docker = join(binDir, "docker");
+  const childReady = join(root, "docker-child.json");
+  const homeDir = join(root, "home");
+  const workspaceDir = defaultWorkspaceDir(homeDir);
+  const pwaDir = join(root, "pwa");
+  const kasm = await startReadyKasmFixture();
+  let box: RunningBox | undefined;
+  let timedOutPid = 0;
+
+  try {
+    await mkdir(binDir, { recursive: true });
+    await mkdir(pwaDir, { recursive: true });
+    await writeFile(join(pwaDir, "index.html"), "<!doctype html><title>OpenBot</title>");
+    await writeFile(
+      docker,
+      `#!${process.execPath}\nconst { writeFileSync } = require("node:fs"); writeFileSync(process.env.OPENBOT_DOCKER_CHILD_READY, JSON.stringify({ pid: process.pid })); setInterval(() => {}, 60_000);\n`,
+      { mode: 0o755 },
+    );
+    const computer = new DockerComputerRuntime({
+      hostPorts: [kasm.port],
+      cookiesDir: join(root, "cookies"),
+      env: {
+        ...process.env,
+        OPENBOT_DOCKER_CHILD_READY: childReady,
+        PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+      },
+    });
+    box = await startBox({
+      password: PASSWORD,
+      pwaDir,
+      host: "127.0.0.1",
+      port: 0,
+      homeDir,
+      workspaceDir,
+      computer,
+    });
+    const cookie = await login(box.url);
+    const failed = await fetch(`${box.url}/api/bots`, {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({ name: "Timed out Bot" }),
+    });
+    await waitForPath(childReady);
+    timedOutPid = (JSON.parse(await readFile(childReady, "utf8")) as { pid: number }).pid;
+    await waitForPidExit(timedOutPid);
+    const failedBody = (await failed.json()) as {
+      error?: string;
+      code?: string;
+      recoverable?: boolean;
+    };
+    assert.equal(failed.status, 503);
+    assert.deepEqual(failedBody, {
+      error: "docker inspect timed out after 5 seconds; verify Docker is responsive and retry",
+      code: "DOCKER_COMMAND_TIMEOUT",
+      recoverable: true,
+    });
+
+    const listedAfterFailure = await fetch(`${box.url}/api/bots`, { headers: { cookie } });
+    assert.deepEqual(await listedAfterFailure.json(), { bots: [] });
+    assert.deepEqual(computer.commands, [["inspect", "--format", "{{.State.Running}}", "openbot-screen"]]);
+    assert.deepEqual(await readdir(join(workspaceDir, "bots")), []);
+    const failedHome = new HomeStore(homeDir);
+    assert.deepEqual(failedHome.listBots(), []);
+    assert.deepEqual(failedHome.listBotProvisionings(), []);
+    failedHome.close();
+
+    await writeFile(
+      docker,
+      `#!${process.execPath}\nsetTimeout(() => process.stdout.write("true\\n"), 150);\n`,
+      { mode: 0o755 },
+    );
+    const retryStartedAt = Date.now();
+    const retried = await fetch(`${box.url}/api/bots`, {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({ name: "Clean retry" }),
+    });
+    const retryElapsed = Date.now() - retryStartedAt;
+    assert.equal(retried.status, 201);
+    const retryBody = (await retried.json()) as { id: string; display?: number };
+    assert.equal(retryBody.display, 1);
+    assert.ok(retryElapsed >= 100, "slow Docker fixture did not exercise a sub-deadline wait");
+    assert.ok(retryElapsed < 2_000, "slow Docker fixture exceeded its reasonable contention margin");
+    assert.deepEqual(computer.commands, [
+      ["inspect", "--format", "{{.State.Running}}", "openbot-screen"],
+      ["inspect", "--format", "{{.State.Running}}", "openbot-screen"],
+    ]);
+    assert.deepEqual(await readdir(join(workspaceDir, "bots")), [retryBody.id]);
+    const retriedHome = new HomeStore(homeDir);
+    assert.deepEqual(retriedHome.listBots().map((bot) => [bot.id, retriedHome.botDisplay(bot.id)]), [
+      [retryBody.id, 1],
+    ]);
+    assert.deepEqual(retriedHome.listBotProvisionings(), []);
+    retriedHome.close();
+  } finally {
+    if (timedOutPid > 0) {
+      try {
+        process.kill(timedOutPid, "SIGKILL");
+      } catch {
+        // The production timeout should already have reaped it.
+      }
+      await waitForPidExit(timedOutPid);
+    }
+    await box?.close();
+    await closeHttpServer(kasm.server);
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 describe("Computer Screen with an unreachable upstream", () => {
