@@ -16,6 +16,7 @@ let generationFile = null;
 let delayedGeneration = null;
 let promptId = null;
 let pendingElicitation = null;
+let replayTerminalElicitation = false;
 const completionSchema = {
   type: "object",
   properties: {
@@ -132,6 +133,12 @@ input.on("line", (line) => {
       );
       return;
     }
+    if (text === "replay-after-done") {
+      pendingElicitation = 700;
+      replayTerminalElicitation = true;
+      firstParty(pendingElicitation);
+      return;
+    }
     if (text === "overflow") {
       for (let index = 0; index < 128; index += 1) {
         send({
@@ -175,6 +182,7 @@ input.on("line", (line) => {
         id: 805,
         method: "session/request_permission",
         params: {
+          sessionId: "session-1",
           title: "Permission after resume",
           options: [
             { optionId: "allow-once", name: "Allow", kind: "allow_once" },
@@ -183,6 +191,10 @@ input.on("line", (line) => {
         }
       });
       return;
+    }
+    if (replayTerminalElicitation) {
+      replayTerminalElicitation = false;
+      firstParty(pendingElicitation);
     }
     finishPrompt(action + ":" + String(completed ?? ""));
     return;
@@ -268,6 +280,31 @@ describe("ACP Computer-help elicitation", () => {
       assert.equal(calls, 1);
       await acp.respondComputerHelp(prompt.rpcId, "done");
       assert.equal(await running, "accept:done");
+    } finally {
+      acp.close();
+    }
+  });
+
+  test("suppresses a terminal Computer-help id replay before the prompt terminal", async () => {
+    let calls = 0;
+    let resolvePrompt!: (prompt: ComputerHelpPrompt) => void;
+    const event = nextPrompt<ComputerHelpPrompt>((resolve) => { resolvePrompt = resolve; });
+    const acp = await initializedClient({
+      onComputerHelp(prompt) {
+        calls += 1;
+        resolvePrompt(prompt);
+      },
+    });
+    try {
+      const running = acp.prompt("replay-after-done");
+      const prompt = await event;
+      await acp.respondComputerHelp(prompt.rpcId, "done");
+      assert.equal(await running, "accept:done");
+      assert.equal(calls, 1);
+      await assert.rejects(
+        acp.respondComputerHelp(prompt.rpcId, "done"),
+        /no longer active/,
+      );
     } finally {
       acp.close();
     }

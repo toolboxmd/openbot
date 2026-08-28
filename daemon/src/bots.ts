@@ -60,6 +60,7 @@ import {
   unsupportedPermissionTranscriptCard,
 } from "./transcript-card.ts";
 import {
+  cancellationClosedTransport,
   computerHelpResponseWasFlushed,
   isAuthError,
   isCancelled,
@@ -136,7 +137,7 @@ export type AcpSession = {
   loadSession?(sessionId: string): Promise<unknown>;
   resumeSession?(sessionId: string): Promise<unknown>;
   prompt(text: string, handlers?: AcpHandlers): Promise<string>;
-  cancel(): void;
+  cancel(): boolean | void;
   respondPermission(rpcId: PermissionPrompt["rpcId"], optionId: string): void | Promise<void>;
   respondComputerHelp?(
     rpcId: ComputerHelpPrompt["rpcId"],
@@ -494,6 +495,7 @@ export class BotStore {
     const beforeInterrupt = this.home.listMessages(channelId);
     const replyTarget = this.resolveReplyTarget(beforeInterrupt, replyTo);
     const startTurnSeq = bot.turnSeq;
+    let replacementTurnSeq: number | null = null;
     bot.startingTurn = true;
     let attached: { client: AcpSession; skipHistory: boolean };
     try {
@@ -504,27 +506,43 @@ export class BotStore {
         this.home.setSessionId(bot.id, channelId, null);
         throw Object.assign(new Error("message start was replaced"), { status: 409 });
       }
+      if (bot.write) {
+        replacementTurnSeq = ++bot.turnSeq;
+        bot.pendingAssistant = null;
+        bot.assistantMessageIds.clear();
+        bot.activeUserId = null;
+        this.expireActivePermission(bot);
+        let reusable = true;
+        try {
+          reusable = attached.client.cancel() !== false;
+        } catch {
+          reusable = false;
+        }
+        if (!reusable) {
+          if (bot.client === attached.client) bot.client = null;
+          attached = await this.ensureClient(bot);
+          if (replacementTurnSeq !== bot.turnSeq) {
+            attached.client.close();
+            if (bot.client === attached.client) bot.client = null;
+            this.home.setSessionId(bot.id, channelId, null);
+            throw Object.assign(new Error("message start was replaced"), { status: 409 });
+          }
+        }
+      }
     } catch (err) {
-      if (startTurnSeq !== bot.turnSeq) {
+      if ((replacementTurnSeq ?? startTurnSeq) !== bot.turnSeq) {
         throw Object.assign(new Error("message start was replaced"), { status: 409 });
       }
       return this.recordClientFailure(bot, channelId, trimmed, replyTarget, err);
     } finally {
       bot.startingTurn = false;
     }
-    const client = attached.client;
-    const turnSeq = ++bot.turnSeq;
-
-    if (bot.write) {
-      try {
-        client.cancel();
-      } catch {
-        /* local cancel still proceeds */
-      }
-      bot.pendingAssistant = null;
+    let client = attached.client;
+    const turnSeq = replacementTurnSeq ?? ++bot.turnSeq;
+    if (replacementTurnSeq === null) {
+      this.expireActivePermission(bot);
+      bot.assistantMessageIds.clear();
     }
-    this.expireActivePermission(bot);
-    bot.assistantMessageIds.clear();
 
     const prior = this.home.listMessages(channelId);
     const history = attached.skipHistory ? "" : channelHistory(prior, bot.name);
@@ -548,18 +566,18 @@ export class BotStore {
     bot.eyesMode = "write";
 
     void (async () => {
-      try {
-        const reply = await client.prompt(talkPrompt(trimmed, replyTarget?.text, history), {
+      const promptWithClient = (attemptClient: AcpSession, attemptHistory: string) => (
+        attemptClient.prompt(talkPrompt(trimmed, replyTarget?.text, attemptHistory), {
           onComputerHelp: (prompt) => {
             if (turnSeq !== bot.turnSeq) return;
-            this.queueComputerHelp(bot, client, prompt, turnSeq);
+            this.queueComputerHelp(bot, attemptClient, prompt, turnSeq);
           },
           onComputerHelpCancelled: (prompt) => {
-            this.queueComputerHelpCancellation(bot, client, prompt, turnSeq);
+            this.queueComputerHelpCancellation(bot, attemptClient, prompt, turnSeq);
           },
           onPermission: (prompt) => {
             if (turnSeq !== bot.turnSeq) return;
-            this.queuePermission(bot, client, prompt, turnSeq);
+            this.queuePermission(bot, attemptClient, prompt, turnSeq);
           },
           onAssistant: (assistantText, delta) => {
             if (turnSeq !== bot.turnSeq) return;
@@ -573,7 +591,33 @@ export class BotStore {
             if (turnSeq !== bot.turnSeq) return;
             this.setUserReceipt(bot, channelId, "read");
           },
-        });
+        })
+      );
+      try {
+        let reply: string;
+        try {
+          reply = await promptWithClient(client, history);
+        } catch (err) {
+          if (!cancellationClosedTransport(err) || turnSeq !== bot.turnSeq) throw err;
+          if (bot.client === client) bot.client = null;
+          this.home.setSessionId(bot.id, channelId, null);
+          bot.startingTurn = true;
+          let recovered: { client: AcpSession; skipHistory: boolean };
+          try {
+            recovered = await this.ensureClient(bot);
+          } finally {
+            bot.startingTurn = false;
+          }
+          if (turnSeq !== bot.turnSeq) {
+            recovered.client.close();
+            if (bot.client === recovered.client) bot.client = null;
+            return;
+          }
+          client = recovered.client;
+          bot.eyesMode = "write";
+          const retryHistory = recovered.skipHistory ? "" : channelHistory(prior, bot.name);
+          reply = await promptWithClient(client, retryHistory);
+        }
         if (turnSeq !== bot.turnSeq) return;
         const messages = this.home.listMessages(channelId);
         const userIdx = messages.findIndex((item) => item.id === userMessage.id);
@@ -581,7 +625,10 @@ export class BotStore {
         if (assistants.length === 0) this.pushAssistant(bot, channelId, reply || ".");
       } catch (err) {
         if (turnSeq !== bot.turnSeq) return;
-        if (isCancelled(err)) return;
+        if (isCancelled(err)) {
+          if (cancellationClosedTransport(err) && bot.client === client) bot.client = null;
+          return;
+        }
         const needsSignIn = isAuthError(err) || isLikelyLogin(err);
         if (needsSignIn) {
           bot.eyesMode = "needs-you";
@@ -927,34 +974,49 @@ export class BotStore {
     }
 
     const channelId = this.channelId(bot.id);
-    let client: AcpSession | undefined;
-    try {
-      client = this.spawnAcpFn(spec, cwd, {
+    const spawnClient = (): AcpSession => {
+      let spawned: AcpSession | undefined;
+      spawned = this.spawnAcpFn(spec, cwd, {
         onComputerHelp: (prompt) => {
-          if (!client) return;
-          this.queueComputerHelp(bot, client, prompt, bot.turnSeq);
+          if (!spawned) return;
+          this.queueComputerHelp(bot, spawned, prompt, bot.turnSeq);
         },
         onComputerHelpCancelled: (prompt) => {
-          if (!client) return;
-          this.queueComputerHelpCancellation(bot, client, prompt, bot.turnSeq);
+          if (!spawned) return;
+          this.queueComputerHelpCancellation(bot, spawned, prompt, bot.turnSeq);
         },
         onPermission: (prompt) => {
-          if (!client) return;
-          this.queuePermission(bot, client, prompt, bot.turnSeq);
+          if (!spawned) return;
+          this.queuePermission(bot, spawned, prompt, bot.turnSeq);
         },
         onAssistant: (text, delta) => this.applyAssistant(bot, channelId, text, delta),
         onPromptWritten: () => this.setUserReceipt(bot, channelId, "delivered"),
         onPromptFlushed: () => this.setUserReceipt(bot, channelId, "read"),
       });
+      return spawned;
+    };
+    let client: AcpSession | undefined;
+    try {
+      client = spawnClient();
       await client.initialize();
-      const restored = await this.restoreOrCreateSession(bot, client, channelId);
+      const attached = await this.restoreOrCreateSession(
+        bot,
+        client,
+        channelId,
+        async () => {
+          client = spawnClient();
+          await client.initialize();
+          return client;
+        },
+      );
+      client = attached.client;
       bot.client = client;
       this.spawnEnvs.set(bot.id, spec.env);
       this.spawnCwds.set(bot.id, cwd);
       bot.eyesMode = "idle";
       bot.computerHelp = null;
       bot.needsYou = null;
-      return { client, skipHistory: restored };
+      return { client, skipHistory: attached.skipHistory };
     } catch (err) {
       client?.close();
       bot.client = null;
@@ -969,7 +1031,12 @@ export class BotStore {
     }
   }
 
-  private async restoreOrCreateSession(bot: Bot, client: AcpSession, channelId: string): Promise<boolean> {
+  private async restoreOrCreateSession(
+    bot: Bot,
+    client: AcpSession,
+    channelId: string,
+    replaceClient: () => Promise<AcpSession>,
+  ): Promise<{ client: AcpSession; skipHistory: boolean }> {
     const storedId = this.home.getSessionId(bot.id, channelId);
     const channelHarness = this.home.getChannelHarness(bot.id, channelId);
     const sameHarness = Boolean(bot.harness && channelHarness === bot.harness);
@@ -979,18 +1046,22 @@ export class BotStore {
           const loaded = await client.loadSession(storedId);
           const id = typeof loaded === "string" && loaded ? loaded : storedId;
           this.home.setSessionId(bot.id, channelId, id);
-          return true;
+          return { client, skipHistory: true };
         } catch {
-          // Fall back to session/new plus Channel inject.
+          this.home.setSessionId(bot.id, channelId, null);
+          client.close();
+          client = await replaceClient();
         }
       } else if (typeof client.resumeSession === "function") {
         try {
           const resumed = await client.resumeSession(storedId);
           const id = typeof resumed === "string" && resumed ? resumed : storedId;
           this.home.setSessionId(bot.id, channelId, id);
-          return true;
+          return { client, skipHistory: true };
         } catch {
-          // Fall back to session/new plus Channel inject.
+          this.home.setSessionId(bot.id, channelId, null);
+          client.close();
+          client = await replaceClient();
         }
       }
     }
@@ -999,7 +1070,7 @@ export class BotStore {
       throw new Error("session/new did not return a sessionId");
     }
     this.home.setSessionId(bot.id, channelId, created);
-    return false;
+    return { client, skipHistory: false };
   }
 
   private resolveReplyTarget(messages: PublicMessage[], replyTo: string | undefined): PublicMessage | null {
