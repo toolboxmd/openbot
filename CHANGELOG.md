@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.6] - 2026-08-28
+
+### Changed
+
+- Bound ACP Turn output and server-request resources
+
 ## [0.10.5] - 2026-08-28
 
 ### Changed
