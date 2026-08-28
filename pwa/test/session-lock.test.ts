@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, test } from "node:test";
 import {
+  ALL_BOTS_INSTRUCTIONS_SETTINGS_HASH,
   APPEARANCE_SETTINGS_HASH,
+  appSettingsFocusTarget,
   appSettingsRequested,
+  NEW_BOTS_SETTINGS_HASH,
   SECURITY_SETTINGS_HASH,
 } from "../src/lib/app-settings.ts";
 import { lockSession } from "../src/lib/session.ts";
@@ -49,11 +52,12 @@ describe("PWA Password Lock", () => {
   });
 
   test("exposes an accessible App Settings action that reloads only after Lock succeeds", () => {
-    assert.match(appSettingsSource, /import \{ lockSession \} from "@\/lib\/session"/);
+    assert.match(appSettingsSource, /\blockSession\b/);
     assert.match(appSettingsSource, /aria-labelledby="security-heading"/);
     assert.match(appSettingsSource, /id="lock-openbot-description"/);
     assert.match(appSettingsSource, /aria-describedby="lock-openbot-description"/);
-    assert.match(appSettingsSource, /onClick=\{lockOpenBot\}/);
+    assert.match(appSettingsSource, /onClick=\{onLock\}/);
+    assert.match(appSettingsSource, /onLock=\{\(\) => void lockOpenBot\(\)\}/);
     assert.match(appSettingsSource, /disabled=\{lockPending\}/);
     assert.match(appSettingsSource, />\s*Lock OpenBot\s*</);
     assert.match(
@@ -62,17 +66,26 @@ describe("PWA Password Lock", () => {
     );
   });
 
-  test("deep-links both Appearance and Security through the shared App Settings route", () => {
+  test("deep-links every implemented App Settings section through the shared route", () => {
     assert.equal(appSettingsRequested(APPEARANCE_SETTINGS_HASH), true);
+    assert.equal(appSettingsRequested(NEW_BOTS_SETTINGS_HASH), true);
+    assert.equal(appSettingsRequested(ALL_BOTS_INSTRUCTIONS_SETTINGS_HASH), true);
     assert.equal(appSettingsRequested(SECURITY_SETTINGS_HASH), true);
     assert.equal(appSettingsRequested("#settings/about"), false);
+    assert.equal(appSettingsFocusTarget(APPEARANCE_SETTINGS_HASH), null);
+    assert.equal(appSettingsFocusTarget(NEW_BOTS_SETTINGS_HASH), "new-bots");
+    assert.equal(appSettingsFocusTarget(ALL_BOTS_INSTRUCTIONS_SETTINGS_HASH), "all-bots-instructions");
+    assert.equal(appSettingsFocusTarget(SECURITY_SETTINGS_HASH), "security");
     assert.match(appSettingsSource, /appSettingsRequested\(window\.location\.hash\)/);
+    assert.match(appSettingsSource, /id=\{NEW_BOTS_SETTINGS_HASH\.slice\(1\)\}/);
+    assert.match(appSettingsSource, /id=\{ALL_BOTS_INSTRUCTIONS_SETTINGS_HASH\.slice\(1\)\}/);
     assert.match(appSettingsSource, /id=\{SECURITY_SETTINGS_HASH\.slice\(1\)\}/);
-    assert.match(appSettingsSource, /const securitySectionRef = useRef<HTMLElement \| null>\(null\)/);
     assert.match(
       appSettingsSource,
-      /if \(!open \|\| requestedHash !== SECURITY_SETTINGS_HASH\) return;[\s\S]*requestAnimationFrame[\s\S]*scrollIntoView[\s\S]*focus\(\{ preventScroll: true \}\)/,
+      /appSettingsFocusTarget\(requestedHash\)[\s\S]*requestAnimationFrame[\s\S]*scrollIntoView[\s\S]*focus\(\{ preventScroll: true \}\)/,
     );
+    assert.match(appSettingsSource, /ref=\{newBotsSectionRef\}[\s\S]*tabIndex=\{-1\}/);
+    assert.match(appSettingsSource, /ref=\{allBotsInstructionsSectionRef\}[\s\S]*tabIndex=\{-1\}/);
     assert.match(appSettingsSource, /ref=\{securitySectionRef\}[\s\S]*tabIndex=\{-1\}/);
     assert.match(messengerSource, /import \{ appSettingsRequested \} from "@\/lib\/app-settings"/);
     assert.match(

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, test } from "node:test";
 import {
   EMPTY_CHAT_SUGGESTIONS,
@@ -15,6 +16,19 @@ import {
   pluginsHistoryState,
   resolvedPluginsReturnTarget,
 } from "../src/lib/first-use.ts";
+
+const firstUseSource = readFileSync(
+  new URL("../src/components/FirstUse.tsx", import.meta.url),
+  "utf8",
+);
+const messengerSource = readFileSync(
+  new URL("../src/components/Messenger.tsx", import.meta.url),
+  "utf8",
+);
+const newBotDialogSource = readFileSync(
+  new URL("../src/components/NewBotDialog.tsx", import.meta.url),
+  "utf8",
+);
 
 describe("first useful path", () => {
   test("requires a non-empty Bot name and returns the trimmed value", () => {
@@ -44,11 +58,35 @@ describe("first useful path", () => {
     ]);
   });
 
-  test("keeps send unavailable until the selected Bot has an AI connection", () => {
+  test("keeps send unavailable until the selected Bot has a Connection", () => {
     assert.equal(canSendDirectMessage({ active: true, harness: null, draft: "Hello", busy: false }), false);
     assert.equal(canSendDirectMessage({ active: true, harness: "codex", draft: "   ", busy: false }), false);
     assert.equal(canSendDirectMessage({ active: true, harness: "codex", draft: "Hello", busy: true }), false);
     assert.equal(canSendDirectMessage({ active: true, harness: "codex", draft: "Hello", busy: false }), true);
+  });
+
+  test("describes default snapshots and missing Connections truthfully", () => {
+    assert.match(firstUseSource, /The new Bot copies the current App Settings defaults\./);
+    assert.match(firstUseSource, /This Bot has no Connection yet\./);
+    assert.match(firstUseSource, />\s*Choose a Connection\s*</);
+    assert.match(
+      firstUseSource,
+      /Open Bot Settings to choose the supported Codex Connection before you send your first message\./,
+    );
+    assert.doesNotMatch(firstUseSource, /AI connection|Connect an AI|Choose an AI/);
+  });
+
+  test("labels the empty composer with Connection terminology", () => {
+    assert.match(messengerSource, /Choose a Connection to start…/);
+    assert.doesNotMatch(messengerSource, /Choose an AI connection to start/);
+  });
+
+  test("describes the New Bot default snapshot before creation", () => {
+    assert.match(
+      newBotDialogSource,
+      /When created, it copies the current App Settings defaults\./,
+    );
+    assert.doesNotMatch(newBotDialogSource, /AI connection/);
   });
 
   test("shows first launch only after a successful empty Bot list", () => {

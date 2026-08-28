@@ -474,7 +474,6 @@ describe("HomeStore sqlite", () => {
     try {
       const version = probe.prepare("PRAGMA user_version").get() as { user_version?: number };
       assert.equal(version.user_version, HOME_SCHEMA_VERSION);
-      assert.equal(HOME_SCHEMA_VERSION, 5);
       const table = probe
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'channel_reads'")
         .get() as { name?: string } | undefined;

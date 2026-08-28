@@ -1223,6 +1223,8 @@ describe("selected Bot panel", () => {
     assert.equal(panel.open, false);
 
     assert.deepEqual(resolveSelectedBotPanelLocation("#settings/security"), appearance);
+    assert.deepEqual(resolveSelectedBotPanelLocation("#settings/new-bots"), appearance);
+    assert.deepEqual(resolveSelectedBotPanelLocation("#settings/all-bots-instructions"), appearance);
     assert.deepEqual(resolveSelectedBotPanelLocation(""), {
       kind: "close",
       restoreFocus: true,

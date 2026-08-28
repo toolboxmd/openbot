@@ -191,17 +191,26 @@ export function SelectedBotPanelControl({
 export function SelectedBotPanelAppSettings({
   open,
   selectedBotPanelOpen,
+  harnesses,
+  harnessesState,
   onOpenChange,
   onCloseSelectedBotPanel,
+  onRetryHarnesses,
 }: {
   open: boolean;
   selectedBotPanelOpen: boolean;
+  harnesses?: Harness[];
+  harnessesState?: RemoteListState;
   onOpenChange: (open: boolean) => void;
   onCloseSelectedBotPanel: (options: { restoreFocus: boolean }) => void;
+  onRetryHarnesses?: () => void;
 }) {
   return (
     <AppSettings
       open={open}
+      harnesses={harnesses}
+      harnessesState={harnessesState}
+      onRetryHarnesses={onRetryHarnesses}
       onOpenChange={(next) => {
         if (next && selectedBotPanelOpen) {
           onCloseSelectedBotPanel({ restoreFocus: false });
@@ -2281,8 +2290,11 @@ export function Messenger() {
           <SelectedBotPanelAppSettings
             open={appSettingsOpen}
             selectedBotPanelOpen={selectedBotPanel.open}
+            harnesses={harnesses}
+            harnessesState={harnessesState}
             onOpenChange={setAppSettingsOpen}
             onCloseSelectedBotPanel={closeSelectedBotPanelForAppSettings}
+            onRetryHarnesses={retryHarnesses}
           />
         </div>
         </>
@@ -2494,7 +2506,7 @@ export function Messenger() {
                     : active.messages === undefined
                       ? "Opening Chat…"
                       : !active.harness
-                        ? "Choose an AI connection to start…"
+                        ? "Choose a Connection to start…"
                         : replyTo
                           ? "Reply…"
                           : "Message a Bot…"

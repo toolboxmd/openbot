@@ -241,12 +241,44 @@ export async function markChannelRead(
 
 export type Harness = { id: string; name: string; bin: string; talk: boolean };
 
+export type AppSettingsDefaults = {
+  defaultConnection: string | null;
+  defaultConfigMode: "isolated" | "host";
+};
+
 export async function listHarnesses(signal?: AbortSignal): Promise<{ harnesses: Harness[] }> {
   const res = await fetch("/api/harnesses", { credentials: "same-origin", signal });
   if (!res.ok) {
     throw new Error("session expired");
   }
   return (await res.json()) as { harnesses: Harness[] };
+}
+
+export async function getAppSettings(signal?: AbortSignal): Promise<AppSettingsDefaults> {
+  const res = await fetch("/api/app-settings", { credentials: "same-origin", signal });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Could not load App Settings.");
+  }
+  return (await res.json()) as AppSettingsDefaults;
+}
+
+export async function updateAppSettings(
+  patch: Partial<AppSettingsDefaults>,
+  signal?: AbortSignal,
+): Promise<AppSettingsDefaults> {
+  const res = await fetch("/api/app-settings", {
+    method: "PATCH",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(patch),
+    signal,
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Could not save App Settings.");
+  }
+  return (await res.json()) as AppSettingsDefaults;
 }
 
 export async function pickHarness(botId: string, harness: string, signal?: AbortSignal): Promise<Bot> {

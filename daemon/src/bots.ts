@@ -19,6 +19,7 @@ import {
   type ChannelKind,
   type ChannelMember,
   type MessageReceipt,
+  type StoredAppSettings,
   type StoredBot,
   type StoredChannel,
   type StoredChannelSummary,
@@ -341,6 +342,43 @@ export class BotStore {
     return this.listHarnessesFn();
   }
 
+  appSettings(): StoredAppSettings {
+    return this.home.readAppSettings();
+  }
+
+  updateAppSettings(input: {
+    defaultConnection?: unknown;
+    defaultConfigMode?: unknown;
+  }): StoredAppSettings {
+    const patch: Partial<StoredAppSettings> = {};
+    if (Object.hasOwn(input, "defaultConnection")) {
+      const connection = input.defaultConnection;
+      if (connection !== null && (typeof connection !== "string" || !isHarnessId(connection))) {
+        throw Object.assign(new Error("unknown Connection"), { status: 400 });
+      }
+      if (
+        connection !== null
+        && (
+          connection !== "codex"
+          || !this.listHarnesses().some((harness) => harness.id === connection && harness.talk)
+        )
+      ) {
+        throw Object.assign(new Error("Connection is not available"), { status: 400 });
+      }
+      patch.defaultConnection = connection;
+    }
+    if (Object.hasOwn(input, "defaultConfigMode")) {
+      if (!isConfigMode(input.defaultConfigMode)) {
+        throw Object.assign(new Error("unknown config mode"), { status: 400 });
+      }
+      patch.defaultConfigMode = input.defaultConfigMode;
+    }
+    if (Object.keys(patch).length === 0) {
+      throw Object.assign(new Error("no App Settings supplied"), { status: 400 });
+    }
+    return this.home.updateAppSettings(patch);
+  }
+
   hasAcpChild(id: string): boolean {
     return this.require(id).client != null;
   }
@@ -439,13 +477,18 @@ export class BotStore {
     if (!trimmed) throw Object.assign(new Error("name is required"), { status: 400 });
     const taken = [...this.bots.values()].map((bot) => bot.shape);
     const id = crypto.randomUUID();
+    const defaults = this.home.readAppSettings();
+    const defaultConnection = defaults.defaultConnection === "codex"
+      && this.listHarnesses().some((harness) => harness.id === defaults.defaultConnection && harness.talk)
+      ? defaults.defaultConnection
+      : null;
     const stored: StoredBot = {
       id,
       name: trimmed,
       color: pickColor(trimmed),
       shape: pickShape(trimmed, taken),
-      harness: null,
-      configMode: "isolated",
+      harness: defaultConnection,
+      configMode: defaults.defaultConfigMode,
       createdAt: nowIso(),
     };
     const display = await this.computer.allocate(id);

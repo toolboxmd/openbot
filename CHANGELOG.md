@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.12.0] - 2026-08-28
+
+### Added
+
+- Add global instructions and new-Bot defaults to App Settings (#89)
+
 ## [0.11.1] - 2026-08-28
 
 ### Changed
