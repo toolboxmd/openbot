@@ -49,7 +49,7 @@ export function Welcome({
             <CardHeader className="gap-2 px-5">
               <CardTitle>Create your first Bot</CardTitle>
               <CardDescription>
-                Give it a name now, then choose its AI connection in the new Chat.
+                Give it a name. The new Bot copies the current App Settings defaults.
               </CardDescription>
             </CardHeader>
             <CardFooter className="px-5">
@@ -248,7 +248,7 @@ export function EmptyChatStart({
           <p className="text-sm text-muted-foreground">
             {bot.harness
               ? "Choose a suggestion or write your own message."
-              : "Connect an AI before you send your first message."}
+              : "This Bot has no Connection yet."}
           </p>
         </div>
 
@@ -260,10 +260,10 @@ export function EmptyChatStart({
                   aria-hidden="true"
                   className="size-[var(--icon-default)] [stroke-width:var(--icon-stroke)]"
                 />
-                Choose an AI connection
+                Choose a Connection
               </CardTitle>
               <CardDescription>
-                Open Bot Settings to connect Codex before you send your first message.
+                Open Bot Settings to choose the supported Codex Connection before you send your first message.
               </CardDescription>
             </CardHeader>
             <CardFooter className="px-5">

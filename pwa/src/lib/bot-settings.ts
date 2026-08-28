@@ -154,8 +154,12 @@ export function acceptBotInstructionSave(
   };
 }
 
-export function selectableAiConnections(harnesses: Harness[]): Harness[] {
+export function selectableConnections(harnesses: Harness[]): Harness[] {
   return harnesses.filter((harness) => harness.id === "codex" && harness.talk);
+}
+
+export function selectableAiConnections(harnesses: Harness[]): Harness[] {
+  return selectableConnections(harnesses);
 }
 
 export function botSettingsHash(botId: string, section: BotSettingsSection): string {

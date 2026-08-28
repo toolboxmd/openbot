@@ -23,7 +23,7 @@ import {
   type TranscriptCard,
 } from "./transcript-card.ts";
 
-export const HOME_SCHEMA_VERSION = 5;
+export const HOME_SCHEMA_VERSION = 6;
 export const HUMAN_MEMBER_ID = "you";
 
 export type MessageReceipt = "sent" | "delivered" | "read";
@@ -56,6 +56,11 @@ export type StoredBot = {
   harness: HarnessId | null;
   configMode?: ConfigMode;
   createdAt: string;
+};
+
+export type StoredAppSettings = {
+  defaultConnection: HarnessId | null;
+  defaultConfigMode: ConfigMode;
 };
 
 export type StoredHostGrant = {
@@ -205,6 +210,37 @@ export class HomeStore {
       .prepare("SELECT id, name, color, shape, harness, config_mode, created_at FROM bots ORDER BY rowid")
       .all()
       .flatMap((row) => reviveBot(row as SqlRow));
+  }
+
+  readAppSettings(): StoredAppSettings {
+    const row = this.db
+      .prepare("SELECT default_harness, default_config_mode FROM app_settings WHERE singleton = 1")
+      .get() as SqlRow | undefined;
+    return {
+      defaultConnection:
+        typeof row?.default_harness === "string" && isHarnessId(row.default_harness)
+          ? row.default_harness
+          : null,
+      defaultConfigMode: row?.default_config_mode === "host" ? "host" : "isolated",
+    };
+  }
+
+  updateAppSettings(patch: Partial<StoredAppSettings>): StoredAppSettings {
+    const current = this.readAppSettings();
+    const next: StoredAppSettings = {
+      defaultConnection: patch.defaultConnection === undefined
+        ? current.defaultConnection
+        : patch.defaultConnection,
+      defaultConfigMode: patch.defaultConfigMode ?? current.defaultConfigMode,
+    };
+    this.db
+      .prepare(
+        `UPDATE app_settings
+         SET default_harness = ?, default_config_mode = ?
+         WHERE singleton = 1`,
+      )
+      .run(next.defaultConnection, next.defaultConfigMode);
+    return next;
   }
 
   listChannels(): StoredChannel[] {
@@ -930,6 +966,20 @@ export class HomeStore {
           const card = legacyHostGrantTranscriptCard(row.text);
           migrateCard.run(transcriptCardSummary(card), JSON.stringify(card), row.id);
         }
+      }
+      if (version <= 5) {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS app_settings (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            default_harness TEXT CHECK (
+              default_harness IS NULL OR default_harness IN ('codex', 'claude', 'grok', 'kimi')
+            ),
+            default_config_mode TEXT NOT NULL DEFAULT 'isolated'
+              CHECK (default_config_mode IN ('isolated', 'host'))
+          );
+          INSERT OR IGNORE INTO app_settings (singleton, default_harness, default_config_mode)
+          VALUES (1, NULL, 'isolated');
+        `);
       }
       this.db.exec(`PRAGMA user_version = ${HOME_SCHEMA_VERSION};`);
     });

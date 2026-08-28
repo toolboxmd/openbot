@@ -79,6 +79,7 @@ const MIME: Record<string, string> = {
 
 const API_METHODS: ReadonlyArray<{ pattern: RegExp; methods: readonly string[] }> = [
   { pattern: /^\/api\/session$/u, methods: ["GET", "POST", "DELETE"] },
+  { pattern: /^\/api\/app-settings$/u, methods: ["GET", "PATCH"] },
   { pattern: /^\/api\/agents$/u, methods: ["GET", "PUT"] },
   { pattern: /^\/api\/host-grants$/u, methods: ["GET"] },
   { pattern: /^\/api\/harnesses$/u, methods: ["GET"] },
@@ -1140,6 +1141,29 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       if (url.pathname === "/api/session" && method === "GET") {
         if (!requireSession(req, res, key)) return;
         sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (url.pathname === "/api/app-settings" && method === "GET") {
+        if (!requireSession(req, res, key)) return;
+        sendJson(res, 200, store.appSettings());
+        return;
+      }
+
+      if (url.pathname === "/api/app-settings" && method === "PATCH") {
+        if (!requireSession(req, res, key)) return;
+        let body: Record<string, unknown>;
+        try {
+          body = await readRequestObject(req, BODY_LIMITS.action);
+        } catch (error) {
+          sendBodyError(res, error);
+          return;
+        }
+        try {
+          sendJson(res, 200, store.updateAppSettings(body));
+        } catch (error) {
+          sendStoreError(res, error);
+        }
         return;
       }
 

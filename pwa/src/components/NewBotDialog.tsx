@@ -100,7 +100,7 @@ export function NewBotDialog({
             </div>
             <DialogTitle>New Bot</DialogTitle>
             <DialogDescription id="new-bot-description">
-              Give your Bot a name. You can choose its AI connection next.
+              Give your Bot a name. When created, it copies the current App Settings defaults.
             </DialogDescription>
           </DialogHeader>
 
