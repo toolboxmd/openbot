@@ -58,11 +58,12 @@ import {
   unconfirmedNeedsYouComputerCard,
   unavailableNeedsYouComputerCard,
   unsupportedPermissionTranscriptCard,
+  type TranscriptCard,
 } from "./transcript-card.ts";
 import {
+  acpResponseWasFlushed,
   callbackFailedTransport,
   cancellationClosedTransport,
-  computerHelpResponseWasFlushed,
   isAuthError,
   isCancelled,
   permissionOptionKind,
@@ -139,7 +140,11 @@ export type AcpSession = {
   resumeSession?(sessionId: string): Promise<unknown>;
   prompt(text: string, handlers?: AcpHandlers): Promise<string>;
   cancel(): boolean | void;
-  respondPermission(rpcId: PermissionPrompt["rpcId"], optionId: string): void | Promise<void>;
+  respondPermission(
+    rpcId: PermissionPrompt["rpcId"],
+    optionId: string,
+    onFlushed?: () => void | Promise<void>,
+  ): void | Promise<void>;
   respondComputerHelp?(
     rpcId: ComputerHelpPrompt["rpcId"],
     resolution: ComputerHelpResolution,
@@ -152,6 +157,10 @@ type BotPermission = PermissionPrompt & PublicPermission & {
   turnSeq?: number;
   queueGeneration?: number;
 };
+
+type PermissionCardChoice =
+  | { kind: "permission"; optionId: string }
+  | { kind: "host-grant"; access: HostGrantAccess };
 
 type BotComputerHelp = {
   eventId: string;
@@ -206,6 +215,18 @@ type Bot = {
   client: AcpSession | null;
 };
 
+type PermissionResponseContext = {
+  bot: Bot;
+  queues: BotCallbackQueues;
+  permission: BotPermission;
+  client: AcpSession;
+  turnSeq: number;
+  rpcId: PermissionPrompt["rpcId"];
+  cardId: string;
+  optionId: string;
+  choice: PermissionCardChoice;
+};
+
 export type BotStoreDeps = {
   computer?: ComputerRuntime;
   spawnAcp?: (spec: SpawnSpec, cwd: string, handlers?: AcpHandlers) => AcpSession;
@@ -248,7 +269,7 @@ function botActionNoLongerActive(): Error {
   return Object.assign(new Error("Bot action is no longer active"), { status: 409 });
 }
 
-function unconfirmedComputerHelpResponse(): Error {
+function unconfirmedProviderResponse(): Error {
   return Object.assign(
     new Error("The response was sent, but OpenBot could not confirm this Card."),
     { status: 409 },
@@ -698,7 +719,7 @@ export class BotStore {
           }
           return;
         }
-        if (computerHelpResponseWasFlushed(err)) {
+        if (acpResponseWasFlushed(err)) {
           this.rotateCallbackQueues(bot, client, turnSeq, {
             invalidateClient: true,
             responseFlushed: true,
@@ -814,7 +835,7 @@ export class BotStore {
           committed = true;
         });
       } catch (err) {
-        if (computerHelpResponseWasFlushed(err)) {
+        if (acpResponseWasFlushed(err)) {
           if (
             !committed
             && this.computerHelpContextIsCurrent(bot, queues, active, eventId, cardId)
@@ -837,7 +858,7 @@ export class BotStore {
             }
             bot.eyesMode = bot.permission ? "needs-you" : bot.write ? "write" : "idle";
           }
-          throw unconfirmedComputerHelpResponse();
+          throw unconfirmedProviderResponse();
         }
         if (!this.callbackQueuesAreCurrent(bot, queues)) {
           throw queues.detachment?.publicError ?? botActionNoLongerActive();
@@ -889,53 +910,19 @@ export class BotStore {
       const sourceMessageId = bot.activeUserId;
       const rpcId = activePermission.rpcId;
       const client = bot.client;
-      if (!this.permissionContextIsCurrent(
+      return this.commitPermissionResponse({
         bot,
         queues,
-        activePermission,
+        permission: activePermission,
         client,
-        permissionTurnSeq,
-        activeCardId,
-      )) {
-        throw Object.assign(new Error("permission Card is no longer active"), { status: 409 });
-      }
-      try {
-        await client.respondPermission(rpcId, optionId);
-      } catch {
-        if (!this.permissionContextIsCurrent(
-          bot,
-          queues,
-          activePermission,
-          client,
-          permissionTurnSeq,
-          activeCardId,
-        )) {
-          throw Object.assign(new Error("permission Card is no longer active"), { status: 409 });
-        }
-        this.failPermissionDelivery(
-          bot,
-          queues,
-          activePermission,
-          message.id,
-          client,
-          permissionTurnSeq,
-          sourceMessageId,
-        );
-      }
-      if (!this.permissionContextIsCurrent(
-        bot,
-        queues,
-        activePermission,
-        client,
-        permissionTurnSeq,
-        activeCardId,
-      )) {
-        throw Object.assign(new Error("permission Card is no longer active"), { status: 409 });
-      }
-      this.home.updateMessageCard(message.id, resolvedCard);
-      bot.permission = null;
-      bot.eyesMode = bot.write ? "write" : "idle";
-      return this.toPublic(bot, true);
+        turnSeq: permissionTurnSeq,
+        rpcId,
+        cardId: activeCardId,
+        optionId,
+        choice: { kind: "permission", optionId },
+      }, sourceMessageId, () => {
+        this.home.updateMessageCard(message.id, resolvedCard);
+      }, "permission Card is no longer active");
     });
   }
 
@@ -968,57 +955,23 @@ export class BotStore {
         access === "deny" ? pickRejectOption(options) : pickAllowOption(options);
       if (!optionId) throw Object.assign(new Error("no matching permission option"), { status: 409 });
       const client = bot.client;
-      if (!this.permissionContextIsCurrent(
+      return this.commitPermissionResponse({
         bot,
         queues,
-        activePermission,
+        permission: activePermission,
         client,
-        permissionTurnSeq,
-        activeCardId,
-      )) {
-        throw Object.assign(new Error("Host grant Card is no longer active"), { status: 409 });
-      }
-      try {
-        await client.respondPermission(rpcId, optionId);
-      } catch {
-        if (!this.permissionContextIsCurrent(
-          bot,
-          queues,
-          activePermission,
-          client,
-          permissionTurnSeq,
-          activeCardId,
-        )) {
-          throw Object.assign(new Error("Host grant Card is no longer active"), { status: 409 });
-        }
-        this.failPermissionDelivery(
-          bot,
-          queues,
-          activePermission,
-          message.id,
-          client,
-          permissionTurnSeq,
-          sourceMessageId,
-        );
-      }
-      if (!this.permissionContextIsCurrent(
-        bot,
-        queues,
-        activePermission,
-        client,
-        permissionTurnSeq,
-        activeCardId,
-      )) {
-        throw Object.assign(new Error("Host grant Card is no longer active"), { status: 409 });
-      }
-      this.home.resolveHostGrantCard(message.id, resolvedCard, {
-        path: requestPath,
-        access,
-        duration,
-      });
-      bot.permission = null;
-      bot.eyesMode = bot.write ? "write" : "idle";
-      return this.toPublic(bot, true);
+        turnSeq: permissionTurnSeq,
+        rpcId,
+        cardId: activeCardId,
+        optionId,
+        choice: { kind: "host-grant", access },
+      }, sourceMessageId, () => {
+        this.home.resolveHostGrantCard(message.id, resolvedCard, {
+          path: requestPath,
+          access,
+          duration,
+        });
+      }, "Host grant Card is no longer active");
     });
   }
 
@@ -1344,6 +1297,138 @@ export class BotStore {
       && this.permissionBelongsToContext(permission, queues, client, turnSeq);
   }
 
+  private permissionResponseIdentityIsCurrent(context: PermissionResponseContext): boolean {
+    const { bot, queues, permission, client, turnSeq, rpcId, cardId, optionId } = context;
+    return bot.permission === permission
+      && permission.cardId === cardId
+      && this.permissionBelongsToContext(permission, queues, client, turnSeq)
+      && permission.rpcId === rpcId
+      && permission.options.some((option) => option.optionId === optionId);
+  }
+
+  private permissionResponseRuntimeIsCurrent(context: PermissionResponseContext): boolean {
+    const { bot, queues, client, turnSeq } = context;
+    return this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)
+      && this.permissionResponseIdentityIsCurrent(context);
+  }
+
+  private permissionResponseCard(context: PermissionResponseContext): TranscriptCard | null {
+    if (!this.permissionResponseRuntimeIsCurrent(context)) return null;
+    const { bot, cardId, choice } = context;
+    try {
+      const message = this.home.getMessage(this.channelId(bot.id), cardId);
+      return message?.id === cardId && message.card?.kind === choice.kind
+        ? message.card
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private permissionCardAtFlush(context: PermissionResponseContext): TranscriptCard | null {
+    const card = this.permissionResponseCard(context);
+    if (!card || card.status.tone !== "waiting") return null;
+    const { choice } = context;
+    const choiceIsActionable = card.actions.some((action) => {
+      if (choice.kind === "permission") {
+        return action.command.kind === "permission"
+          && action.command.optionId === choice.optionId;
+      }
+      return action.command.kind === "host-grant"
+        && action.command.access === choice.access;
+    });
+    return choiceIsActionable ? card : null;
+  }
+
+  private clearUnconfirmedPermission(context: PermissionResponseContext): void {
+    if (!this.permissionResponseIdentityIsCurrent(context)) return;
+    const { bot, permission, cardId, choice } = context;
+    try {
+      const message = this.home.getMessage(this.channelId(bot.id), cardId);
+      if (
+        message?.card?.kind === choice.kind
+        && message.card.status.tone === "waiting"
+        && message.card.actions.length > 0
+      ) {
+        this.home.updateMessageCard(cardId, expiredTranscriptCard(message.card));
+      }
+    } catch {
+      // The exact in-memory action is still cleared so it cannot resend a flushed choice.
+    }
+    if (bot.permission === permission) bot.permission = null;
+    bot.eyesMode = bot.needsYou ? "needs-you" : bot.write ? "write" : "idle";
+  }
+
+  private async commitPermissionResponse(
+    context: PermissionResponseContext,
+    sourceMessageId: string | null,
+    commitDurableState: () => void,
+    inactiveMessage: string,
+  ): Promise<PublicBot> {
+    const { bot, queues, permission, client, turnSeq, rpcId, cardId, optionId } = context;
+    if (!this.permissionResponseRuntimeIsCurrent(context)) {
+      throw Object.assign(new Error(inactiveMessage), { status: 409 });
+    }
+    let committed = false;
+    const commitAtFlush = () => {
+      if (!this.permissionCardAtFlush(context)) {
+        throw new Error("permission response context changed before flush commit");
+      }
+      commitDurableState();
+      committed = true;
+    };
+    try {
+      await this.respondPermissionAtFlush(client, rpcId, optionId, commitAtFlush);
+    } catch (error) {
+      if (acpResponseWasFlushed(error)) {
+        this.clearUnconfirmedPermission(context);
+        throw unconfirmedProviderResponse();
+      }
+      if (!this.permissionResponseRuntimeIsCurrent(context)) {
+        throw Object.assign(new Error(inactiveMessage), { status: 409 });
+      }
+      this.failPermissionDelivery(
+        bot,
+        queues,
+        permission,
+        cardId,
+        client,
+        turnSeq,
+        sourceMessageId,
+      );
+    }
+    if (!committed || !this.permissionResponseRuntimeIsCurrent(context)) {
+      throw Object.assign(new Error(inactiveMessage), { status: 409 });
+    }
+    bot.permission = null;
+    bot.eyesMode = bot.write ? "write" : "idle";
+    return this.toPublic(bot, true);
+  }
+
+  private async respondPermissionAtFlush(
+    client: AcpSession,
+    rpcId: PermissionPrompt["rpcId"],
+    optionId: string,
+    onFlushed: () => void,
+  ): Promise<void> {
+    let commitInvoked = false;
+    let commitResult: Promise<void> | null = null;
+    const commit = (): Promise<void> => {
+      if (commitInvoked) return commitResult!;
+      commitInvoked = true;
+      try {
+        onFlushed();
+        commitResult = Promise.resolve();
+      } catch (error) {
+        commitResult = Promise.reject(error);
+      }
+      return commitResult;
+    };
+    await client.respondPermission(rpcId, optionId, commit);
+    // Compatibility sessions without onFlushed resolve after their response write.
+    await (commitInvoked ? commitResult : commit());
+  }
+
   private computerHelpContextIsCurrent(
     bot: Bot,
     queues: BotCallbackQueues,
@@ -1379,7 +1464,7 @@ export class BotStore {
     const computerHelp = bot.computerHelp;
     const next = callbackQueues(queues.generation + 1);
     const publicError = rotation.publicError
-      ?? (rotation.responseFlushed ? unconfirmedComputerHelpResponse() : botActionNoLongerActive());
+      ?? (rotation.responseFlushed ? unconfirmedProviderResponse() : botActionNoLongerActive());
 
     bot.callbackQueues = next;
     if (rotation.invalidateClient) bot.client = null;
@@ -1390,9 +1475,13 @@ export class BotStore {
     ) {
       const cardId = permission.cardId;
       if (cardId) {
-        const message = this.home.getMessage(this.channelId(bot.id), cardId);
-        if (message?.card && message.card.status.tone === "waiting" && message.card.actions.length > 0) {
-          this.home.updateMessageCard(message.id, expiredTranscriptCard(message.card));
+        try {
+          const message = this.home.getMessage(this.channelId(bot.id), cardId);
+          if (message?.card && message.card.status.tone === "waiting" && message.card.actions.length > 0) {
+            this.home.updateMessageCard(message.id, expiredTranscriptCard(message.card));
+          }
+        } catch (error) {
+          if (!rotation.responseFlushed) throw error;
         }
       }
       if (bot.permission === permission) bot.permission = null;
@@ -1470,16 +1559,39 @@ export class BotStore {
       this.expireActivePermission(bot);
       return false;
     }
+    const context: PermissionResponseContext = {
+      bot,
+      queues,
+      permission: active,
+      client,
+      turnSeq,
+      rpcId: active.rpcId,
+      cardId,
+      optionId: reject,
+      choice: active.hostGrant
+        ? { kind: "host-grant", access: "deny" }
+        : { kind: "permission", optionId: reject },
+    };
+    let committed = false;
     try {
-      await client.respondPermission(active.rpcId, reject);
-    } catch {
-      if (!this.permissionContextIsCurrent(bot, queues, active, client, turnSeq, cardId)) return false;
+      await this.respondPermissionAtFlush(client, active.rpcId, reject, () => {
+        const card = this.permissionCardAtFlush(context);
+        if (!card) throw new Error("superseded permission changed before response flush commit");
+        this.home.updateMessageCard(cardId, expiredTranscriptCard(card));
+        committed = true;
+      });
+    } catch (error) {
+      if (acpResponseWasFlushed(error)) {
+        this.clearUnconfirmedPermission(context);
+        return false;
+      }
+      if (!this.permissionResponseRuntimeIsCurrent(context)) return false;
       client.close();
       this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
       return false;
     }
-    if (!this.permissionContextIsCurrent(bot, queues, active, client, turnSeq, cardId)) return false;
-    this.expireActivePermission(bot);
+    if (!committed || !this.permissionResponseRuntimeIsCurrent(context)) return false;
+    bot.permission = null;
     return true;
   }
 

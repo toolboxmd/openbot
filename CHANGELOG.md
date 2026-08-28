@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.5] - 2026-08-28
+
+### Changed
+
+- Commit permission Cards truthfully at provider response flush (#115)
+
 ## [0.10.4] - 2026-08-28
 
 ### Changed

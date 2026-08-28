@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import crypto from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
@@ -154,8 +155,13 @@ type CallbackFailureOptions = {
 
 type AcpHandlerResult = void | Promise<void>;
 
+type CallbackInvocation = {
+  active: boolean;
+};
+
 type CallbackTask = {
   invoke: (() => AcpHandlerResult) | null;
+  invocation: CallbackInvocation;
   options: CallbackFailureOptions;
   resolve: () => void;
   settled: boolean;
@@ -170,6 +176,11 @@ type CallbackChain = {
   detached: Promise<void>;
   detach: () => void;
   fail: ((options: CallbackFailureOptions) => void) | null;
+};
+
+type CallbackContext = {
+  chain: CallbackChain;
+  invocation: CallbackInvocation;
 };
 
 function callbackTransportError(options: CallbackFailureOptions = {}): Error {
@@ -345,8 +356,12 @@ export function isCancelled(err: unknown): boolean {
   return /cancel/i.test(code) || /cancel/i.test(msg);
 }
 
-export function computerHelpResponseWasFlushed(err: unknown): boolean {
+export function acpResponseWasFlushed(err: unknown): boolean {
   return (err as { responseFlushed?: unknown })?.responseFlushed === true;
+}
+
+export function computerHelpResponseWasFlushed(err: unknown): boolean {
+  return acpResponseWasFlushed(err);
 }
 
 export function cancellationClosedTransport(err: unknown): boolean {
@@ -380,7 +395,8 @@ export class AcpClient {
   private nextId = 1;
   private pending = new Map<RpcId, Pending>();
   private pendingWriteRejectors = new Set<(error: Error) => void>();
-  private pendingComputerHelpFlushCommits = new Set<symbol>();
+  private pendingResponseFlushCallbacks = new Set<symbol>();
+  private callbackContext = new AsyncLocalStorage<CallbackContext>();
   private callbackChain: CallbackChain;
   private stdoutBuffer = Buffer.alloc(0);
   private closed = false;
@@ -549,6 +565,7 @@ export class AcpClient {
   }
 
   private finishCallbackTask(chain: CallbackChain, task: CallbackTask): void {
+    task.invocation.active = false;
     if (!task.settled) {
       task.settled = true;
       task.resolve();
@@ -567,9 +584,13 @@ export class AcpClient {
     chain.running = true;
     const invoke = task.invoke;
     task.invoke = null;
+    task.invocation.active = true;
     let result: AcpHandlerResult;
     try {
-      result = invoke?.();
+      result = this.callbackContext.run({
+        chain,
+        invocation: task.invocation,
+      }, () => invoke?.());
     } catch {
       chain.fail?.(task.options);
       this.finishCallbackTask(chain, task);
@@ -620,6 +641,7 @@ export class AcpClient {
     const taskDone = new Promise<void>((resolve) => { resolveTask = resolve; });
     const task: CallbackTask = {
       invoke: () => callback(...args),
+      invocation: { active: false },
       options,
       resolve: resolveTask,
       settled: false,
@@ -643,12 +665,12 @@ export class AcpClient {
     obj: unknown,
     commitFlushedState?: () => void,
     applicationCallback?: () => AcpHandlerResult,
-    options: { computerHelpCommit?: boolean } = {},
   ): Promise<void> {
     if (this.transportError) return Promise.reject(this.transportError);
     if (this.closed || this.child.stdin.destroyed) {
       return Promise.reject(new Error("ACP transport is closed"));
     }
+    const responseCallbackContext = this.callbackContext.getStore();
     return new Promise((resolve, reject) => {
       let settled = false;
       const rejectWrite = (error: Error) => {
@@ -656,6 +678,12 @@ export class AcpClient {
         settled = true;
         this.pendingWriteRejectors.delete(rejectWrite);
         reject(error);
+      };
+      const resolveWrite = () => {
+        if (settled) return;
+        settled = true;
+        this.pendingWriteRejectors.delete(rejectWrite);
+        resolve();
       };
       this.pendingWriteRejectors.add(rejectWrite);
       try {
@@ -665,35 +693,72 @@ export class AcpClient {
             this.failTransport(transportFailureError());
             return;
           }
-          const computerHelpCommit = options.computerHelpCommit ? Symbol() : null;
-          if (computerHelpCommit) this.pendingComputerHelpFlushCommits.add(computerHelpCommit);
+          const responseFlushCallback = applicationCallback ? Symbol() : null;
+          if (responseFlushCallback) this.pendingResponseFlushCallbacks.add(responseFlushCallback);
           try {
             commitFlushedState?.();
           } catch {
             this.failTransport(transportFailureError());
             return;
           }
-          const callbackWork = this.invokeCallback(
-            applicationCallback,
-            [],
-            { responseFlushed: true },
+          const commitApplicationCallback = applicationCallback
+            ? () => {
+                const result = applicationCallback();
+                if (result === undefined) {
+                  if (responseFlushCallback) {
+                    this.pendingResponseFlushCallbacks.delete(responseFlushCallback);
+                  }
+                  resolveWrite();
+                  return;
+                }
+                return Promise.resolve(result).then(() => {
+                  if (responseFlushCallback) {
+                    this.pendingResponseFlushCallbacks.delete(responseFlushCallback);
+                  }
+                  resolveWrite();
+                });
+              }
+            : undefined;
+          const responseFromActiveCallback = (
+            responseCallbackContext?.chain === this.callbackChain
+            && responseCallbackContext.chain.active
+            && responseCallbackContext.invocation.active
           );
+          const callbackWork = responseFromActiveCallback && commitApplicationCallback
+            ? this.invokeResponseCallbackInline(commitApplicationCallback)
+            : this.invokeCallback(
+                commitApplicationCallback,
+                [],
+                { responseFlushed: true },
+              );
           void callbackWork.then(() => {
-            if (computerHelpCommit) this.pendingComputerHelpFlushCommits.delete(computerHelpCommit);
+            if (responseFlushCallback) this.pendingResponseFlushCallbacks.delete(responseFlushCallback);
             if (settled) return;
             if (this.transportError) {
               rejectWrite(this.transportError);
               return;
             }
-            settled = true;
-            this.pendingWriteRejectors.delete(rejectWrite);
-            resolve();
+            resolveWrite();
           });
         });
       } catch {
         this.failTransport(transportFailureError());
       }
     });
+  }
+
+  private invokeResponseCallbackInline(callback: () => AcpHandlerResult): Promise<void> {
+    try {
+      return Promise.resolve(callback()).then(
+        () => undefined,
+        () => {
+          this.failTransport(callbackTransportError({ responseFlushed: true }));
+        },
+      );
+    } catch {
+      this.failTransport(callbackTransportError({ responseFlushed: true }));
+      return Promise.resolve();
+    }
   }
 
   private rejectPendingWrites(error: Error): void {
@@ -754,7 +819,7 @@ export class AcpClient {
 
   private failTransport(err: Error): void {
     if (this.transportError) return;
-    const failure = this.pendingComputerHelpFlushCommits.size > 0
+    const failure = this.pendingResponseFlushCallbacks.size > 0
       ? callbackTransportError({
           responseFlushed: true,
           transportClosed: cancellationClosedTransport(err),
@@ -767,7 +832,7 @@ export class AcpClient {
     this.transportError = failure;
     this.closed = true;
     this.detachCallbackChain();
-    this.pendingComputerHelpFlushCommits.clear();
+    this.pendingResponseFlushCallbacks.clear();
     this.stdoutBuffer = Buffer.alloc(0);
     this.generation += 1;
     this.activeGen = this.generation;
@@ -1615,7 +1680,11 @@ export class AcpClient {
     return this.transportError === null;
   }
 
-  async respondPermission(rpcId: RpcId, optionId: string): Promise<void> {
+  async respondPermission(
+    rpcId: RpcId,
+    optionId: string,
+    onFlushed?: () => AcpHandlerResult,
+  ): Promise<void> {
     const pending = this.pendingPermissions.get(rpcId);
     if (
       !pending
@@ -1633,7 +1702,7 @@ export class AcpClient {
       }, () => {
         if (this.pendingPermissions.get(rpcId) === pending) this.pendingPermissions.delete(rpcId);
         this.releaseServerRequest(rpcId, "permission", pending.generation);
-      });
+      }, onFlushed);
     } catch (error) {
       const current = this.pendingPermissions.get(rpcId);
       if (current === pending && !this.transportError) current.responding = false;
@@ -1668,7 +1737,7 @@ export class AcpClient {
         this.pendingComputerHelp.delete(rpcId);
         this.rememberTerminalElicitation(rpcId);
         this.releaseServerRequest(rpcId, "elicitation", pending.generation);
-      }, onFlushed, { computerHelpCommit: true });
+      }, onFlushed);
     } catch (err) {
       const current = this.pendingComputerHelp.get(rpcId);
       if (current === pending) current.responding = false;

@@ -218,6 +218,7 @@ input.on("line", (line) => {
     send({ jsonrpc: "2.0", id: message.id, result: promptResult });
   }
 });
+process.stderr.write("ready\n");
 `;
 
 const WRONG_SESSION_HANDLED_METHOD_ACP = String.raw`
@@ -1374,13 +1375,20 @@ describe("AcpClient input validation", () => {
     ];
     for (const [name, result] of cases) {
       await t.test(name, async () => {
+        let resolveReady!: () => void;
+        const ready = new Promise<void>((resolve) => { resolveReady = resolve; });
         const acp = new AcpClient({
           command: process.execPath,
           args: ["-e", INVALID_PROMPT_RESULT_ACP, JSON.stringify(result)],
           env: { ...process.env },
-        }, process.cwd(), {}, { startDeadlineMs: 100 });
+        }, process.cwd(), {
+          onStderr(line) {
+            if (line === "ready") resolveReady();
+          },
+        }, { startDeadlineMs: 1_000 });
         let settlements = 0;
         try {
+          await within(ready);
           await within(acp.initialize());
           await within(acp.newSession(process.cwd()));
           const prompting = acp.prompt("terminal response must be valid");
