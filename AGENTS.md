@@ -13,4 +13,9 @@ Engineering skills live in the user's global workflows (Grill, Wayfinder, To spe
 
 ## Proof
 
-A fake Harness is for Talk machinery (Home sqlite, inject text, receipts, interrupt). Live Harness is Done for Bot, Session, and PWA claims. Do not treat a fake ACP, fake Harness, mock child, or smoke test as Done.
+A fake Harness is for Talk machinery (Home sqlite, inject text, receipts, interrupt). Live Harness is Done for Bot, Session, and PWA claims. Do not treat a fake ACP, fake Harness, mock PinchTab, or smoke test as Done.
+
+## Recent Changes
+
+- 2026-08-26: PinchTab owns headed Screen Chrome (no CDP-attach, so no `[PinchTab :port]` title). Screen POSTs `/ensure-browser`. Talk focuses the tab before click/type/fill. Isolated v1 auto-allows commands.
+- 2026-08-26: PinchTab Talk MCP. One bridge per Screen Chrome. Talk allowlists stock `pinchtab mcp --server`. Fail closed. Cookie jar stays Screen copy.

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { existsSync, statSync } from "node:fs";
+import { chmodSync, existsSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -61,6 +61,28 @@ describe("HomeStore sqlite", () => {
     );
     assert.equal(home.directChannelId(adaId), channelId);
     assert.equal(channel.messages.length, 0);
+    home.close();
+  });
+
+  test("createBot rejects a manual ID without publishing database state", async () => {
+    const homeDir = await tempHome();
+    const home = new HomeStore(homeDir);
+    assert.throws(
+      () =>
+        home.createBot(
+          {
+            id: "manual-bot",
+            name: "Ada",
+            color: "#ff3b5c",
+            shape: "capsule",
+            harness: null,
+            createdAt: iso(),
+          },
+          crypto.randomUUID(),
+        ),
+      /invalid Bot ID.*lowercase UUID v4/i,
+    );
+    assert.deepEqual(home.listBots(), []);
     home.close();
   });
 
@@ -429,6 +451,169 @@ describe("BotStore sqlite is the only Transcript", () => {
     assert.equal(existsSync(join(defaultWorkspaceDir(homeDir), "bots.json")), false);
     assert.equal(existsSync(join(homeDir, "talk.sqlite")), true);
     store.close();
+  });
+
+  test("startup rejects a corrupt persisted Bot ID before workspace bootstrap touches disk", async () => {
+    const homeDir = await tempHome();
+    const validBotId = crypto.randomUUID();
+    const seed = new HomeStore(homeDir);
+    seed.createBot(
+      {
+        id: validBotId,
+        name: "Ada",
+        color: "#ff3b5c",
+        shape: "capsule",
+        harness: null,
+        createdAt: iso(),
+      },
+      crypto.randomUUID(),
+    );
+    seed.close();
+    const database = new DatabaseSync(join(homeDir, "talk.sqlite"));
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.prepare("UPDATE bots SET id = ? WHERE id = ?").run("../../outside", validBotId);
+    database.close();
+
+    let loadedHome: HomeStore | undefined;
+    let loadError: unknown;
+    try {
+      loadedHome = new HomeStore(homeDir);
+    } catch (error) {
+      loadError = error;
+    } finally {
+      loadedHome?.close();
+    }
+    assert.match(String((loadError as Error | undefined)?.message), /corrupt Home.*invalid persisted Bot ID/i);
+
+    let started: BotStore | undefined;
+    let startupError: unknown;
+    try {
+      started = new BotStore(homeDir);
+    } catch (error) {
+      startupError = error;
+    } finally {
+      started?.close();
+    }
+
+    assert.match(String((startupError as Error | undefined)?.message), /corrupt Home.*invalid persisted Bot ID/i);
+    assert.equal(existsSync(join(homeDir, "workspace")), false);
+    assert.equal(existsSync(join(homeDir, "outside")), false);
+    assert.equal(existsSync(join(homeDir, "workspace", "bots", "outside")), false);
+  });
+
+  test("Bot workspace bootstrap failure is actionable and does not publish a durable Bot", async () => {
+    const homeDir = await tempHome();
+    const store = new BotStore(homeDir);
+    const botsDir = join(defaultWorkspaceDir(homeDir), "bots");
+    chmodSync(botsDir, 0o500);
+    let createError: unknown;
+    try {
+      await store.create("Ada");
+    } catch (error) {
+      createError = error;
+    } finally {
+      chmodSync(botsDir, 0o700);
+    }
+
+    try {
+      assert.match(String((createError as Error | undefined)?.message), /Bot workspace bootstrap failed/i);
+      assert.deepEqual(store.list(), []);
+    } finally {
+      store.close();
+    }
+    const persisted = new HomeStore(homeDir);
+    assert.deepEqual(persisted.listBots(), []);
+    persisted.close();
+  });
+
+  test("partial Bot workspace bootstrap failure removes the new generated directory", async () => {
+    const homeDir = await tempHome();
+    const store = new BotStore(homeDir);
+    const botsDir = join(defaultWorkspaceDir(homeDir), "bots");
+    let createError: unknown;
+    const previousUmask = process.umask(0o777);
+    try {
+      await store.create("Bootstrap fail");
+    } catch (error) {
+      createError = error;
+    } finally {
+      process.umask(previousUmask);
+    }
+
+    const entries = await readdir(botsDir);
+    try {
+      assert.ok(createError instanceof Error, "expected Bot workspace bootstrap to fail");
+      const failure = createError as Error & { code?: string; recoverable?: boolean };
+      assert.equal(failure.code, "BOT_BOOTSTRAP_FAILED", failure.message);
+      assert.equal(failure.recoverable, true);
+      assert.deepEqual(store.list(), []);
+      assert.deepEqual(entries, []);
+    } finally {
+      for (const entry of entries) chmodSync(join(botsDir, entry), 0o700);
+      store.close();
+    }
+    const persisted = new HomeStore(homeDir);
+    assert.deepEqual(persisted.listBots(), []);
+    persisted.close();
+  });
+
+  test("display exhaustion does not leave generated Bot workspace or publish a Bot", async () => {
+    const homeDir = await tempHome();
+    const computer = new MemoryComputerRuntime({ cookiesDir: join(homeDir, "cookies") });
+    const store = new BotStore(homeDir, { computer });
+    const botsDir = join(defaultWorkspaceDir(homeDir), "bots");
+    try {
+      for (let index = 1; index <= 8; index += 1) await store.create(`Bot ${index}`);
+      const before = (await readdir(botsDir)).sort();
+      assert.equal(before.length, 8);
+
+      const afterFailures: string[][] = [];
+      for (const name of ["Overflow one", "Overflow two"]) {
+        await assert.rejects(store.create(name), /Computer is out of displays/i);
+        afterFailures.push((await readdir(botsDir)).sort());
+      }
+
+      assert.deepEqual(afterFailures, [before, before]);
+      assert.equal(store.list().length, 8);
+    } finally {
+      store.close();
+    }
+    const persisted = new HomeStore(homeDir);
+    assert.equal(persisted.listBots().length, 8);
+    persisted.close();
+  });
+
+  test("later failure preserves a modified new Bot workspace and reports cleanup", async () => {
+    const homeDir = await tempHome();
+    const botsDir = join(defaultWorkspaceDir(homeDir), "bots");
+    let failedBotId = "";
+    class UserWritingComputer extends MemoryComputerRuntime {
+      override async allocate(botId: string): Promise<never> {
+        failedBotId = botId;
+        await writeFile(join(botsDir, botId, "user-owned.txt"), "keep\n");
+        throw new Error("fixture allocation failure");
+      }
+    }
+    const computer = new UserWritingComputer({ cookiesDir: join(homeDir, "cookies") });
+    const store = new BotStore(homeDir, { computer });
+    let createError: unknown;
+    try {
+      await store.create("Ada");
+    } catch (error) {
+      createError = error;
+    } finally {
+      store.close();
+    }
+
+    const failure = createError as Error & { code?: string; recoverable?: boolean };
+    assert.equal(failure.code, "BOT_WORKSPACE_CLEANUP_REQUIRED");
+    assert.equal(failure.recoverable, true);
+    assert.match(failure.message, /preserved.*preserve anything you need.*remove.*only if safe/i);
+    assert.deepEqual(await readdir(botsDir), [failedBotId]);
+    assert.equal(existsSync(join(botsDir, failedBotId, "user-owned.txt")), true);
+    const persisted = new HomeStore(homeDir);
+    assert.deepEqual(persisted.listBots(), []);
+    persisted.close();
   });
 
   test("restores Ada display 1 and Bob display 2 from HomeStore created order", async () => {

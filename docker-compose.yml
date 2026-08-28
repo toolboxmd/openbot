@@ -17,9 +17,21 @@ services:
       - "127.0.0.1:${SCREEN_PORT_6:-16906}:6906"
       - "127.0.0.1:${SCREEN_PORT_7:-16907}:6907"
       - "127.0.0.1:${SCREEN_PORT_8:-16908}:6908"
+      - "127.0.0.1:${PINCHTAB_PORT_1:-19867}:9867"
+      - "127.0.0.1:${PINCHTAB_PORT_2:-19868}:9868"
+      - "127.0.0.1:${PINCHTAB_PORT_3:-19869}:9869"
+      - "127.0.0.1:${PINCHTAB_PORT_4:-19870}:9870"
+      - "127.0.0.1:${PINCHTAB_PORT_5:-19871}:9871"
+      - "127.0.0.1:${PINCHTAB_PORT_6:-19872}:9872"
+      - "127.0.0.1:${PINCHTAB_PORT_7:-19873}:9873"
+      - "127.0.0.1:${PINCHTAB_PORT_8:-19874}:9874"
     environment:
       VNC_USER: openbot
       VNC_PASSWORD: ${OPENBOT_PASSWORD:-openbot}
+      PINCHTAB_TOKEN: ${PINCHTAB_TOKEN:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "openbot-cookies.test:host-gateway"
     volumes:
       - ${OPENBOT_WORKSPACE:-${OPENBOT_HOME:-${HOME}/.openbot}/workspace}:/workspace
       - ${OPENBOT_COOKIES:-./computer/cookies}:/computer/cookies

@@ -15,13 +15,18 @@ export type SuperviseDeps = {
   now: () => number;
   onSignal: (handler: (signal: NodeJS.Signals) => void) => () => void;
   pickPorts?: () => Promise<number[]>;
+  pickPinchTabPorts?: () => Promise<number[]>;
   log?: (message: string) => void;
   minRestartDelayMs?: number;
   maxRestartDelayMs?: number;
   stableAfterMs?: number;
 };
 
-export function childEnv(env: NodeJS.ProcessEnv, ports?: number[]): NodeJS.ProcessEnv {
+export function childEnv(
+  env: NodeJS.ProcessEnv,
+  ports?: number[],
+  pinchTabPorts?: number[],
+): NodeJS.ProcessEnv {
   const next: NodeJS.ProcessEnv = { ...env };
   if (ports && ports.length > 0) {
     if (ports.includes(FORBIDDEN_SCREEN_PORT)) {
@@ -34,6 +39,15 @@ export function childEnv(env: NodeJS.ProcessEnv, ports?: number[]): NodeJS.Proce
     next.SCREEN_UPSTREAM = env.SCREEN_UPSTREAM || `http://127.0.0.1:${ports[0]}`;
   } else {
     next.SCREEN_UPSTREAM = env.SCREEN_UPSTREAM || DEFAULT_SCREEN_UPSTREAM;
+  }
+  if (pinchTabPorts && pinchTabPorts.length > 0) {
+    if (pinchTabPorts.includes(FORBIDDEN_SCREEN_PORT)) {
+      throw new Error("refusing to publish Screen on 6901");
+    }
+    next.PINCHTAB_PORTS = pinchTabPorts.join(",");
+    pinchTabPorts.forEach((port, i) => {
+      next[`PINCHTAB_PORT_${i + 1}`] = String(port);
+    });
   }
   return next;
 }
@@ -48,7 +62,8 @@ export async function superviseTalk(
   const log = deps.log ?? ((message) => console.error(message));
 
   const ports = deps.pickPorts ? await deps.pickPorts() : undefined;
-  const daemonEnv = childEnv(env, ports);
+  const pinchTabPorts = deps.pickPinchTabPorts ? await deps.pickPinchTabPorts() : undefined;
+  const daemonEnv = childEnv(env, ports, pinchTabPorts);
   await deps.composeUp(SCREEN_SERVICE, daemonEnv);
 
   let stopping = false;

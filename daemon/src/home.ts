@@ -6,6 +6,8 @@ import { DatabaseSync } from "node:sqlite";
 import { SHAPES, type FaceShape } from "./face.ts";
 import { isHarnessId, type HarnessId } from "./harness.ts";
 import {
+  assertGeneratedBotId,
+  isGeneratedBotId,
   isHostGrantAccess,
   isHostGrantDuration,
   pathCoveredByGrant,
@@ -104,9 +106,19 @@ export class HomeStore {
     if (existed) assertSupportedSchema(this.databasePath);
     else fs.closeSync(fs.openSync(this.databasePath, "wx", 0o600));
     this.db = new DatabaseSync(this.databasePath, { enableForeignKeyConstraints: true });
-    this.migrate();
-    fs.chmodSync(this.databasePath, 0o600);
-    this.db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+    try {
+      this.migrate();
+      this.assertPersistedBotIds();
+      fs.chmodSync(this.databasePath, 0o600);
+      this.db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+    } catch (error) {
+      try {
+        this.db.close();
+      } catch {
+        // Preserve the startup failure that made Home unusable.
+      }
+      throw error;
+    }
   }
 
   get workspaceDir(): string {
@@ -221,6 +233,7 @@ export class HomeStore {
   }
 
   createBot(bot: StoredBot, channelId: string): StoredChannel {
+    assertGeneratedBotId(bot.id);
     const channel: StoredChannel = {
       id: channelId,
       kind: "direct",
@@ -541,6 +554,11 @@ export class HomeStore {
     });
   }
 
+  private assertPersistedBotIds(): void {
+    const rows = this.db.prepare("SELECT id FROM bots").all() as SqlRow[];
+    if (rows.some((row) => !isGeneratedBotId(row.id))) throw invalidPersistedBotIdError();
+  }
+
   private reviveChannel(row: SqlRow): StoredChannel | null {
     if (typeof row.id !== "string" || !isChannelKind(row.kind) || typeof row.created_at !== "string") return null;
     const members = this.db
@@ -608,8 +626,8 @@ export class HomeStore {
 }
 
 function reviveBot(row: SqlRow): StoredBot[] {
+  if (!isGeneratedBotId(row.id)) throw invalidPersistedBotIdError();
   if (
-    typeof row.id !== "string" ||
     typeof row.name !== "string" ||
     typeof row.color !== "string" ||
     typeof row.created_at !== "string" ||
@@ -631,6 +649,12 @@ function reviveBot(row: SqlRow): StoredBot[] {
       createdAt: row.created_at,
     },
   ];
+}
+
+function invalidPersistedBotIdError(): Error {
+  return new Error(
+    "Corrupt Home: invalid persisted Bot ID; repair or remove the Bot row before restarting OpenBot",
+  );
 }
 
 function reviveGrant(row: SqlRow): StoredHostGrant[] {

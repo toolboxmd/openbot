@@ -158,6 +158,40 @@ describe("start supervisor", () => {
     await run;
   });
 
+  test("pickPinchTabPorts publishes loopback PinchTab ports and never 6901", async () => {
+    const spawned = deferred<NodeJS.ProcessEnv>();
+    let composeEnv: NodeJS.ProcessEnv | undefined;
+    let fire: ((signal: NodeJS.Signals) => void) | undefined;
+    const run = superviseTalk(
+      {
+        composeUp: async (_service, env) => {
+          composeEnv = env;
+        },
+        spawnDaemon: (env) => {
+          spawned.resolve(env);
+          return new FakeChild();
+        },
+        sleep: async () => {},
+        now: () => 0,
+        onSignal: (handler) => {
+          fire = handler;
+          return () => {};
+        },
+        pickPorts: async () => [16931, 16932],
+        pickPinchTabPorts: async () => [19867, 19868],
+      },
+      {},
+    );
+    const env = await spawned.promise;
+    assert.equal(env.PINCHTAB_PORTS, "19867,19868");
+    assert.equal(env.PINCHTAB_PORT_1, "19867");
+    assert.equal(env.PINCHTAB_PORT_2, "19868");
+    assert.equal(composeEnv?.PINCHTAB_PORT_1, "19867");
+    assert.ok(!String(env.PINCHTAB_PORTS).split(",").includes("6901"));
+    fire!("SIGINT");
+    await run;
+  });
+
   test("does not spawn Talk when Screen compose fails", async () => {
     let spawns = 0;
     await assert.rejects(

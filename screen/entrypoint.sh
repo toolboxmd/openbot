@@ -8,6 +8,12 @@ export HOME="/home/${USER_NAME}"
 export USER="${USER_NAME}"
 export XDG_RUNTIME_DIR="/tmp/runtime-${USER_NAME}"
 COOKIE_JAR="${COOKIE_JAR:-/computer/cookies}"
+export PINCHTAB_TOKEN="${PINCHTAB_TOKEN:-}"
+if [ -n "$PINCHTAB_TOKEN" ]; then
+  mkdir -p /etc/openbot
+  printf '%s' "$PINCHTAB_TOKEN" > /etc/openbot/pinchtab.token
+  chmod 644 /etc/openbot/pinchtab.token
+fi
 
 if ! id "$USER_NAME" >/dev/null 2>&1; then
   useradd -m -s /bin/bash -G ssl-cert "$USER_NAME"
@@ -37,7 +43,7 @@ printf '%s\n%s\n' "$PASSWORD" "$PASSWORD" | su -s /bin/bash "$USER_NAME" -c "kas
 /usr/local/bin/openbot-display cookies-in 1
 
 cleanup() {
-  /usr/local/bin/openbot-display cookies-out 1 || true
+  /usr/local/bin/openbot-display stop 1 || true
   if [ -n "${VNC_PID:-}" ]; then
     kill "$VNC_PID" 2>/dev/null || true
     wait "$VNC_PID" 2>/dev/null || true

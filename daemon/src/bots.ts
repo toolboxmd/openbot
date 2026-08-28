@@ -22,6 +22,7 @@ import {
   type TranscriptMessage,
 } from "./home.ts";
 import {
+  BotWorkspacePreparationError,
   botWorkspaceDir,
   ensureBotWorkspace,
   ensureHarnessHome,
@@ -33,15 +34,19 @@ import {
   isInsideScreenWorkspace,
   pickAllowOption,
   pickRejectOption,
+  prepareBotWorkspace,
   readAgentsFile,
   requestedAccessFromKind,
+  rollbackPreparedBotWorkspace,
   thisBotAgentsPath,
   writeAgentsFile,
   allBotsAgentsPath,
   applyVendorHomeEnv,
+  type BotWorkspaceRollback,
   type ConfigMode,
   type HostGrantAccess,
   type HostGrantDuration,
+  type PreparedBotWorkspace,
 } from "./harness-home.ts";
 import {
   isAuthError,
@@ -52,6 +57,7 @@ import {
   type PermissionPrompt,
 } from "./acp.ts";
 import { NoopComputerRuntime, type ComputerRuntime, type DisplayHandle } from "./computer.ts";
+import { pinchTabMcpServers, stripPinchTabFromPath } from "./pinchtab.ts";
 
 export { defaultHomeDir, defaultWorkspaceDir } from "./home.ts";
 export type { MessageReaction, MessageReceipt } from "./home.ts";
@@ -153,6 +159,7 @@ export class BotStore {
   private zoomedId: string | null = null;
   private readonly spawnEnvs = new Map<string, NodeJS.ProcessEnv>();
   private readonly spawnCwds = new Map<string, string>();
+  private readonly spawnSpecs = new Map<string, SpawnSpec>();
 
   constructor(homeDir: string, deps: BotStoreDeps = {}) {
     this.home = new HomeStore(homeDir);
@@ -160,9 +167,15 @@ export class BotStore {
     this.computer = deps.computer ?? new NoopComputerRuntime();
     this.spawnAcpFn = deps.spawnAcp ?? spawnAcp;
     this.listHarnessesFn = deps.listHarnesses ?? listHarnessesOnPath;
-    fs.mkdirSync(this.workspaceDir, { recursive: true });
-    ensureHarnessHome(this.home.homeDir, this.workspaceDir);
-    this.load();
+    try {
+      const storedBots = this.home.listBots();
+      fs.mkdirSync(this.workspaceDir, { recursive: true });
+      ensureHarnessHome(this.home.homeDir, this.workspaceDir);
+      this.load(storedBots);
+    } catch (error) {
+      this.home.close();
+      throw error;
+    }
   }
 
   close(): void {
@@ -260,9 +273,36 @@ export class BotStore {
       configMode: "isolated",
       createdAt: nowIso(),
     };
-    const display = await this.computer.allocate(id);
-    this.home.createBot(stored, crypto.randomUUID());
-    ensureBotWorkspace(this.workspaceDir, id);
+    let preparedWorkspace: PreparedBotWorkspace;
+    try {
+      preparedWorkspace = prepareBotWorkspace(this.workspaceDir, id);
+    } catch (error) {
+      let bootstrapError = error;
+      if (error instanceof BotWorkspacePreparationError) {
+        bootstrapError = error.cause;
+        const rollback = rollbackPreparedBotWorkspace(error.preparedWorkspace);
+        if (!rollback.removed) {
+          throw botWorkspaceCleanupRequiredError("Bot workspace bootstrap failed", bootstrapError, rollback);
+        }
+      }
+      const detail = bootstrapError instanceof Error ? bootstrapError.message : String(bootstrapError);
+      throw Object.assign(new Error(`Bot workspace bootstrap failed: ${detail}`), {
+        status: 503,
+        code: "BOT_BOOTSTRAP_FAILED",
+        recoverable: true,
+      });
+    }
+    let display: DisplayHandle;
+    try {
+      display = await this.computer.allocate(id);
+      this.home.createBot(stored, crypto.randomUUID());
+    } catch (error) {
+      const rollback = rollbackPreparedBotWorkspace(preparedWorkspace);
+      if (!rollback.removed) {
+        throw botWorkspaceCleanupRequiredError("Bot creation failed", error, rollback);
+      }
+      throw error;
+    }
     const bot = this.runtimeBot(stored, display);
     this.bots.set(id, bot);
     return this.toPublic(bot, true);
@@ -355,6 +395,10 @@ export class BotStore {
 
   lastSpawnCwd(id: string): string | null {
     return this.spawnCwds.get(id) ?? null;
+  }
+
+  lastSpawnSpec(id: string): SpawnSpec | null {
+    return this.spawnSpecs.get(id) ?? null;
   }
 
   listHostGrants() {
@@ -484,8 +528,8 @@ export class BotStore {
     return this.toPublic(bot, true);
   }
 
-  private load(): void {
-    for (const stored of this.home.listBots()) {
+  private load(storedBots: StoredBot[]): void {
+    for (const stored of storedBots) {
       ensureBotWorkspace(this.workspaceDir, stored.id);
       this.bots.set(stored.id, this.runtimeBot(stored, null));
     }
@@ -529,7 +573,14 @@ export class BotStore {
   }
 
   private async ensureClient(bot: Bot): Promise<{ client: AcpSession; skipHistory: boolean }> {
-    if (bot.client) return { client: bot.client, skipHistory: true };
+    if (bot.client) {
+      const attached = this.spawnSpecs.get(bot.id)?.mcpServers ?? [];
+      if (attached.length > 0) return { client: bot.client, skipHistory: true };
+      const next = await pinchTabMcpServers(this.computer, bot.id, this.spawnSpecs.get(bot.id)?.env);
+      if (next.length === 0) return { client: bot.client, skipHistory: true };
+      bot.client.close();
+      bot.client = null;
+    }
     const harness = bot.harness;
     if (!harness) throw Object.assign(new Error("pick a Harness first"), { status: 400 });
 
@@ -555,6 +606,8 @@ export class BotStore {
         env: spawnSpecEnvFallback(bot.configMode, this.home.homeDir, cwd, bot.id, this.computer.containerName()),
       };
     }
+    spec.mcpServers = await pinchTabMcpServers(this.computer, bot.id, spec.env);
+    this.spawnSpecs.set(bot.id, spec);
 
     const channelId = this.channelId(bot.id);
     let client: AcpSession | undefined;
@@ -573,6 +626,7 @@ export class BotStore {
       bot.client = client;
       this.spawnEnvs.set(bot.id, spec.env);
       this.spawnCwds.set(bot.id, cwd);
+      this.spawnSpecs.set(bot.id, spec);
       bot.eyesMode = "idle";
       bot.needsYou = null;
       return { client, skipHistory: restored };
@@ -685,6 +739,13 @@ export class BotStore {
   private handlePermission(bot: Bot, client: AcpSession, prompt: PermissionPrompt): void {
     const cwd = this.botCwd(bot.id);
     const requestPath = extractPermissionPath(prompt, cwd);
+    if (isPinchTabPermission(prompt)) {
+      const allow = pickAllowOption(prompt.options);
+      if (allow) {
+        client.respondPermission(prompt.rpcId, allow);
+        return;
+      }
+    }
     const requested = requestedAccessFromKind(prompt.toolKind);
     const inJail =
       (requestPath && isInsideWorkspace(requestPath, this.workspaceDir)) ||
@@ -714,6 +775,12 @@ export class BotStore {
         hostGrant: { path: requestPath, requested: requested === "read" ? "read" : "read-write" },
       };
       bot.eyesMode = "needs-you";
+      return;
+    }
+    // Isolated v1 is not a jail (ADR 0010). Pathless commands auto-allow. Host grant is host paths only.
+    const allow = pickAllowOption(prompt.options);
+    if (allow) {
+      client.respondPermission(prompt.rpcId, allow);
       return;
     }
     bot.permission = prompt;
@@ -784,6 +851,41 @@ export class BotStore {
   }
 }
 
+function botWorkspaceCleanupRequiredError(
+  context: string,
+  error: unknown,
+  rollback: BotWorkspaceRollback,
+): Error {
+  const detail = error instanceof Error ? error.message : String(error);
+  const status = typeof error === "object" && error !== null
+    ? (error as { status?: unknown }).status
+    : undefined;
+  return Object.assign(
+    new Error(
+      `${context}: ${detail}. Bot workspace ${JSON.stringify(rollback.preservedPath)} was preserved because ${rollback.reason}. Inspect it, preserve anything you need, and remove the directory only if safe before retrying.`,
+      { cause: error },
+    ),
+    {
+      status: typeof status === "number" ? status : 503,
+      code: "BOT_WORKSPACE_CLEANUP_REQUIRED",
+      recoverable: true,
+    },
+  );
+}
+
+function isPinchTabPermission(prompt: PermissionPrompt): boolean {
+  const blob = `${prompt.title ?? ""}\n${prompt.description ?? ""}\n${prompt.toolKind ?? ""}\n${safePermissionJson(prompt.rawInput)}\n${safePermissionJson(prompt.meta)}\n${safePermissionJson(prompt.raw)}`;
+  return /pinchtab|mcp__pinchtab/i.test(blob);
+}
+
+function safePermissionJson(value: unknown): string {
+  try {
+    return JSON.stringify(value ?? "");
+  } catch {
+    return "";
+  }
+}
+
 function isLikelyLogin(err: unknown): boolean {
   return isAuthError(err) || /login|auth|not signed/i.test(String((err as Error)?.message ?? err));
 }
@@ -839,7 +941,13 @@ function spawnSpecEnvFallback(
   botId: string,
   screenContainer: string,
 ): NodeJS.ProcessEnv {
-  return applyVendorHomeEnv({ ...process.env }, mode, homeDir, botHome, { botId, screenContainer });
+  const env = applyVendorHomeEnv({ ...process.env }, mode, homeDir, botHome, { botId, screenContainer });
+  env.PATH = stripPinchTabFromPath(env.PATH ?? "");
+  delete env.DISPLAY;
+  delete env.PINCHTAB_TOKEN;
+  delete env.OPENBOT_PINCHTAB;
+  delete env.OPENBOT_PINCHTAB_SERVER;
+  return env;
 }
 
 function nowIso(): string {

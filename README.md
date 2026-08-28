@@ -28,14 +28,18 @@ One origin. The host daemon is Talk, the reverse proxy, and the PWA.
 - daemon: Password, session cookie, static PWA, Computer API, Screen proxy, Bots, Codex ACP
 - one Screen container: Debian bookworm, XFCE, KasmVNC, Chrome; extra Bots are extra displays in that container
 - Kasm basic auth is injected by the proxy. WebRTC is off. Preview is view-only; zoom grants write.
-- Talk: host Codex ACP. Picker detects other CLIs. This slice only spawns Codex. No PinchTab. No Takeover button. No docker-stop Sleep.
+- Talk: host Codex ACP. Picker detects other CLIs. This slice only spawns Codex. PinchTab MCP is Talk-injected on Screen Chrome (allowlisted browse loop plus screenshot). No Takeover button. No docker-stop Sleep.
 
 ## Tests
 
 ```bash
 npm install
+npm run test:focused -- daemon/test/messages.test.ts
 npm test
 npm run typecheck
+npm run build:pwa
 ```
 
-Tests talk HTTP. They hit `/api/session`, `/api/bots`, `/api/computer`, `/screen/`, and `GET /`. A fake Kasm server stands in for the container. The Computer runtime is injected: two Bots allocate two displays and never `docker run` a second Screen name. Supervisor tests inject a compose runner, daemon spawner, clock, and signals; they do not start Docker or Codex. `screenIsReachable` uses `node:http`, not `fetch`+AbortSignal.
+Use focused deterministic files while implementing. Before committing or pushing a slice, run the complete deterministic suite, type check, and PWA build. `npm test` excludes every `*.live.test.*` module. Tests talk HTTP through loopback only. A fake Kasm server stands in for the container. The Computer runtime is injected: two Bots allocate two displays and never `docker run` a second Screen name. Supervisor tests inject a compose runner, daemon spawner, clock, and signals; they do not start Docker or Codex. `screenIsReachable` uses `node:http`, not `fetch`+AbortSignal.
+
+Real-Harness, Screen, and PinchTab proof use explicit `test:live:*` commands on the slice's final candidate. Missing live prerequisites fail rather than skip. See [the contributor test workflow](CONTRIBUTING.md#test-workflow) for the lane taxonomy and handoff contract.

@@ -89,5 +89,34 @@ describe("Computer displays",
       });
       await assert.rejects(() => computer.allocate("ada"), /6901/);
     });
+
+    test("refuses a PinchTab host port of 6901", async () => {
+      const cookiesDir = join(await tempDir("openbot-pt-forbidden-"), "cookies");
+      const computer = new DockerComputerRuntime({
+        hostPorts: [16911],
+        pinchTabHostPorts: [6901],
+        pinchTabToken: "token",
+        cookiesDir,
+        docker: async () => ({ code: 0, stdout: "", stderr: "" }),
+      });
+      await assert.rejects(() => computer.allocate("ada"), /6901/);
+    });
+
+    test("allocate fills PinchTab url when host ports are set", async () => {
+      const cookiesDir = join(await tempDir("openbot-pt-ports-"), "cookies");
+      const computer = new DockerComputerRuntime({
+        hostPorts: [16911, 16912],
+        pinchTabHostPorts: [19867, 19868],
+        pinchTabToken: "pt-token",
+        cookiesDir,
+        docker: async () => ({ code: 0, stdout: "", stderr: "" }),
+      });
+      const ada = await computer.allocate("ada");
+      const ben = await computer.allocate("ben");
+      assert.equal(ada.pinchTabUrl, "http://127.0.0.1:19867");
+      assert.equal(ben.pinchTabUrl, "http://127.0.0.1:19868");
+      assert.deepEqual(computer.pinchTab("ada"), { url: "http://127.0.0.1:19867", token: "pt-token" });
+      assert.notEqual(computer.pinchTab("ada")?.url, computer.pinchTab("ben")?.url);
+    });
   },
 );

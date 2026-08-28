@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { applyVendorHomeEnv } from "./harness-home.ts";
+import { stripPinchTabFromPath, type AcpMcpServer } from "./pinchtab.ts";
 
 export const HARNESS_IDS = ["codex", "claude", "grok", "kimi"] as const;
 export type HarnessId = (typeof HARNESS_IDS)[number];
@@ -16,6 +17,7 @@ export type SpawnSpec = {
   command: string;
   args: string[];
   env: NodeJS.ProcessEnv;
+  mcpServers?: AcpMcpServer[];
 };
 
 const CATALOG: HarnessInfo[] = [
@@ -91,8 +93,11 @@ export function spawnSpec(id: HarnessId, opts: SpawnSpecOptions = {}): SpawnSpec
     throw new Error("Talk spawn is Codex-only in this slice");
   }
   let env: NodeJS.ProcessEnv = { ...process.env };
-  env.PATH = pathWithLocalBin(env.PATH ?? "");
+  env.PATH = stripPinchTabFromPath(pathWithLocalBin(env.PATH ?? ""));
   delete env.DISPLAY;
+  delete env.PINCHTAB_TOKEN;
+  delete env.OPENBOT_PINCHTAB;
+  delete env.OPENBOT_PINCHTAB_SERVER;
   if (opts.homeDir) {
     const mode = opts.mode ?? "isolated";
     env = applyVendorHomeEnv(env, mode, opts.homeDir, opts.cwd, {

@@ -1,11 +1,15 @@
 {
   "name": "openbot",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.9.5",
   "type": "module",
   "description": "Self-hosted Grok Bot. Named Bots on one Computer.",
   "scripts": {
-    "test": "tsx --test daemon/test/*.test.ts pwa/test/*.test.ts",
+    "test": "node scripts/test.mjs full",
+    "test:focused": "node scripts/test.mjs focused",
+    "test:live:harness": "node scripts/test.mjs live:harness",
+    "test:live:screen": "node scripts/test.mjs live:screen",
+    "test:live:pinchtab": "node scripts/test.mjs live:pinchtab",
     "typecheck": "tsc -p daemon/tsconfig.json --noEmit && tsc -p pwa/tsconfig.json --noEmit",
     "build:pwa": "vite build --config pwa/vite.config.ts",
     "start": "tsx daemon/src/start.ts",

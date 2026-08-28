@@ -167,9 +167,11 @@ function assistantText(messages: PublicMessage[], afterCount = 0): string {
     .join("\n");
 }
 
-const describeLive = liveCodexAvailable() ? describe : describe.skip;
+if (!liveCodexAvailable()) {
+  throw new Error("codex is required on PATH for live Harness proof; do not skip");
+}
 
-describeLive("Live Codex Talk HTTP", () => {
+describe("Live Codex Talk HTTP", () => {
   test(
     "after restart Ada replies with the first code",
     { timeout: 300_000 },

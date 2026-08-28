@@ -13,6 +13,8 @@ export const SCREEN_IMAGE = "openbot-screen";
 export const COOKIE_MOUNT = "/computer/cookies";
 export const WORKSPACE_MOUNT = "/workspace";
 export const DISPLAY_BIN = "/usr/local/bin/openbot-display";
+export const PINCHTAB_CONTAINER_PORT_BASE = 9867;
+export const CDP_PORT_BASE = 9222;
 
 export type DisplayHandle = {
   botId: string;
@@ -20,6 +22,13 @@ export type DisplayHandle = {
   containerPort: number;
   hostPort: number;
   upstream: string;
+  pinchTabHostPort?: number;
+  pinchTabUrl?: string;
+};
+
+export type PinchTabBridge = {
+  url: string;
+  token: string;
 };
 
 export type ComputerRuntime = {
@@ -29,6 +38,7 @@ export type ComputerRuntime = {
   computerUpstream(): string | undefined;
   cookieJar(): string;
   containerName(): string;
+  pinchTab(botId: string): PinchTabBridge | undefined;
   commands: string[][];
 };
 
@@ -44,6 +54,16 @@ export function parseScreenPorts(raw: string | undefined): number[] {
     .split(",")
     .map((part) => Number(part.trim()))
     .filter((n) => Number.isInteger(n) && n > 0);
+}
+
+export const parsePinchTabPorts = parseScreenPorts;
+
+export function pinchTabContainerPort(display: number): number {
+  return PINCHTAB_CONTAINER_PORT_BASE + display - 1;
+}
+
+export function chromeCdpPort(display: number): number {
+  return CDP_PORT_BASE + display - 1;
 }
 
 export function isForbiddenHostPort(port: number): boolean {
@@ -107,17 +127,23 @@ export class MemoryComputerRuntime implements ComputerRuntime {
   private cookieDir: string;
   private upstreams: string[];
   private name: string;
+  private pinchTabUpstreams: string[];
+  private pinchTabTokenValue?: string;
 
   constructor(
     opts: {
       cookiesDir?: string;
       upstreams?: string[];
       containerName?: string;
+      pinchTabUpstreams?: string[];
+      pinchTabToken?: string;
     } = {},
   ) {
     this.cookieDir = opts.cookiesDir ?? defaultCookieJar();
     this.upstreams = opts.upstreams ?? [`http://127.0.0.1:${HOST_PORT_FLOOR}`];
     this.name = opts.containerName ?? COMPUTER_CONTAINER;
+    this.pinchTabUpstreams = opts.pinchTabUpstreams ?? [];
+    this.pinchTabTokenValue = opts.pinchTabToken;
     fs.mkdirSync(this.cookieDir, { recursive: true });
   }
 
@@ -160,9 +186,25 @@ export class MemoryComputerRuntime implements ComputerRuntime {
     } else {
       this.commands.push(["exec", this.name, DISPLAY_BIN, "start", String(display)]);
     }
-    const handle: DisplayHandle = { botId, display, containerPort, hostPort, upstream };
+    const pinchTabUrl = this.pinchTabUpstreams[display - 1];
+    const pinchTabHostPort = pinchTabUrl ? Number(new URL(pinchTabUrl).port || "0") || undefined : undefined;
+    const handle: DisplayHandle = {
+      botId,
+      display,
+      containerPort,
+      hostPort,
+      upstream,
+      pinchTabHostPort,
+      pinchTabUrl,
+    };
     this.slots.set(botId, handle);
     return handle;
+  }
+
+  pinchTab(botId: string): PinchTabBridge | undefined {
+    const slot = this.slots.get(botId);
+    if (!slot?.pinchTabUrl || !this.pinchTabTokenValue) return undefined;
+    return { url: slot.pinchTabUrl, token: this.pinchTabTokenValue };
   }
 }
 
@@ -207,11 +249,17 @@ export class NoopComputerRuntime implements ComputerRuntime {
       upstream: this.base ?? `http://127.0.0.1:${HOST_PORT_FLOOR}`,
     };
   }
+
+  pinchTab(_botId: string): PinchTabBridge | undefined {
+    return undefined;
+  }
 }
 
 export type DockerComputerOptions = {
   containerName?: string;
   hostPorts?: number[];
+  pinchTabHostPorts?: number[];
+  pinchTabToken?: string;
   cookiesDir?: string;
   workspaceDir?: string;
   password?: string;
@@ -225,12 +273,16 @@ export class DockerComputerRuntime implements ComputerRuntime {
   private nextDisplay = 1;
   private name: string;
   private hostPorts: number[];
+  private pinchTabHostPorts: number[];
+  private pinchTabTokenValue?: string;
   private cookiesDir: string;
   private docker: DockerFn;
 
   constructor(opts: DockerComputerOptions = {}) {
     this.name = opts.containerName ?? process.env.OPENBOT_SCREEN_CONTAINER ?? COMPUTER_CONTAINER;
     this.hostPorts = opts.hostPorts ?? parseScreenPorts(process.env.SCREEN_PORTS);
+    this.pinchTabHostPorts = opts.pinchTabHostPorts ?? parsePinchTabPorts(process.env.PINCHTAB_PORTS);
+    this.pinchTabTokenValue = opts.pinchTabToken ?? process.env.PINCHTAB_TOKEN;
     this.cookiesDir = opts.cookiesDir ?? defaultCookieJar();
     this.docker = opts.docker ?? defaultDocker(opts.env ?? process.env);
     fs.mkdirSync(this.cookiesDir, { recursive: true });
@@ -285,15 +337,27 @@ export class DockerComputerRuntime implements ComputerRuntime {
     } else {
       await this.exec(["inspect", this.name]);
     }
+    const pinchTabHostPort = this.pinchTabHostPorts[display - 1];
+    if (pinchTabHostPort && isForbiddenHostPort(pinchTabHostPort)) {
+      throw new Error("refusing to publish Screen on 6901");
+    }
     const handle: DisplayHandle = {
       botId,
       display,
       containerPort,
       hostPort,
       upstream: `http://127.0.0.1:${hostPort}`,
+      pinchTabHostPort,
+      pinchTabUrl: pinchTabHostPort ? `http://127.0.0.1:${pinchTabHostPort}` : undefined,
     };
     this.slots.set(botId, handle);
     return handle;
+  }
+
+  pinchTab(botId: string): PinchTabBridge | undefined {
+    const slot = this.slots.get(botId);
+    if (!slot?.pinchTabUrl || !this.pinchTabTokenValue) return undefined;
+    return { url: slot.pinchTabUrl, token: this.pinchTabTokenValue };
   }
 
   private async exec(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {

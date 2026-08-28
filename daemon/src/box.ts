@@ -20,7 +20,15 @@ export type BoxOptions = {
   homeDir?: string;
   workspaceDir?: string;
   computer?: ComputerRuntime;
+  screenProxyDeadlines?: Partial<ScreenProxyDeadlines>;
 } & Pick<BotStoreDeps, "spawnAcp" | "listHarnesses">;
+
+export type ScreenProxyDeadlines = {
+  connectMs: number;
+  headerMs: number;
+  bodyMs: number;
+  totalMs: number;
+};
 
 export type RunningBox = {
   url: string;
@@ -31,6 +39,12 @@ export type RunningBox = {
 const COOKIE = "openbot";
 const MAX_AGE = 60 * 60 * 24 * 30;
 const SCREEN_PREFIX = "/screen";
+const DEFAULT_SCREEN_PROXY_DEADLINES: ScreenProxyDeadlines = {
+  connectMs: 1_000,
+  headerMs: 5_000,
+  bodyMs: 15_000,
+  totalMs: 30_000,
+};
 
 const MIME: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
@@ -147,6 +161,108 @@ function requestFor(url: URL) {
   return url.protocol === "https:" ? https.request : http.request;
 }
 
+type UpstreamDeadlinePhase = "connect" | "headers" | "body" | "total";
+
+function normalizeScreenProxyDeadlines(
+  configured: Partial<ScreenProxyDeadlines> | undefined,
+): ScreenProxyDeadlines {
+  const positive = (value: number | undefined, fallback: number) =>
+    typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.ceil(value) : fallback;
+  return {
+    connectMs: positive(configured?.connectMs, DEFAULT_SCREEN_PROXY_DEADLINES.connectMs),
+    headerMs: positive(configured?.headerMs, DEFAULT_SCREEN_PROXY_DEADLINES.headerMs),
+    bodyMs: positive(configured?.bodyMs, DEFAULT_SCREEN_PROXY_DEADLINES.bodyMs),
+    totalMs: positive(configured?.totalMs, DEFAULT_SCREEN_PROXY_DEADLINES.totalMs),
+  };
+}
+
+function superviseUpstreamDeadlines(
+  request: http.ClientRequest,
+  dest: URL,
+  deadlines: ScreenProxyDeadlines,
+  onTimeout: (phase: UpstreamDeadlinePhase) => void,
+) {
+  let active = true;
+  let expired: UpstreamDeadlinePhase | null = null;
+  let connectTimer: NodeJS.Timeout | undefined;
+  let headerTimer: NodeJS.Timeout | undefined;
+  let bodyTimer: NodeJS.Timeout | undefined;
+  const totalTimer = setTimeout(() => timeout("total"), deadlines.totalMs);
+
+  const clear = () => {
+    clearTimeout(totalTimer);
+    if (connectTimer) clearTimeout(connectTimer);
+    if (headerTimer) clearTimeout(headerTimer);
+    if (bodyTimer) clearTimeout(bodyTimer);
+  };
+  const timeout = (phase: UpstreamDeadlinePhase) => {
+    if (!active) return;
+    active = false;
+    expired = phase;
+    clear();
+    onTimeout(phase);
+  };
+  const connected = () => {
+    if (!active) return;
+    if (connectTimer) clearTimeout(connectTimer);
+    headerTimer = setTimeout(() => timeout("headers"), deadlines.headerMs);
+  };
+
+  request.once("socket", (socket) => {
+    connectTimer = setTimeout(() => timeout("connect"), deadlines.connectMs);
+    if (socket.connecting) {
+      socket.once(dest.protocol === "https:" ? "secureConnect" : "connect", connected);
+    } else {
+      connected();
+    }
+  });
+
+  return {
+    response() {
+      if (!active) return;
+      if (connectTimer) clearTimeout(connectTimer);
+      if (headerTimer) clearTimeout(headerTimer);
+      if (bodyTimer) clearTimeout(bodyTimer);
+      bodyTimer = setTimeout(() => timeout("body"), deadlines.bodyMs);
+    },
+    data() {
+      if (!active) return;
+      if (bodyTimer) clearTimeout(bodyTimer);
+      bodyTimer = setTimeout(() => timeout("body"), deadlines.bodyMs);
+    },
+    finish() {
+      if (!active) return;
+      active = false;
+      clear();
+    },
+    expired() {
+      return expired;
+    },
+    terminal() {
+      return !active;
+    },
+  };
+}
+
+function upstreamTimeoutMessage(phase: UpstreamDeadlinePhase): string {
+  if (phase === "connect") return "Screen upstream timed out while connecting";
+  if (phase === "headers") return "Screen upstream timed out waiting for headers";
+  if (phase === "body") return "Screen upstream timed out waiting for body data";
+  return "Screen upstream exceeded total deadline";
+}
+
+function endUpgradeFailure(
+  socket: import("node:stream").Duplex,
+  status: number,
+  reason: string,
+  message: string,
+): void {
+  if (socket.destroyed || !socket.writable) return;
+  socket.end(
+    `HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`,
+  );
+}
+
 function copyHeaders(
   source: http.IncomingHttpHeaders,
   skip: string[],
@@ -166,6 +282,7 @@ function proxyHttp(
   res: http.ServerResponse,
   dest: URL,
   auth: string | undefined,
+  deadlines: ScreenProxyDeadlines,
 ): void {
   const headers = copyHeaders(req.headers, [
     "host",
@@ -178,10 +295,17 @@ function proxyHttp(
   headers.host = dest.host;
   if (auth) headers.authorization = auth;
 
-  const upstream = requestFor(dest)(
-    dest,
-    { method: req.method, headers },
-    (upstreamRes) => {
+  let upstreamResponse: http.IncomingMessage | undefined;
+  let controller: ReturnType<typeof superviseUpstreamDeadlines>;
+  let upstream: http.ClientRequest;
+  try {
+    upstream = requestFor(dest)(dest, { method: req.method, headers }, (upstreamRes) => {
+      if (controller.terminal() || res.destroyed || res.writableEnded) {
+        upstreamRes.destroy();
+        return;
+      }
+      upstreamResponse = upstreamRes;
+      controller.response();
       const out = copyHeaders(upstreamRes.headers, [
         "connection",
         "keep-alive",
@@ -200,12 +324,44 @@ function proxyHttp(
         "cross-origin-resource-policy",
       ]);
       res.writeHead(upstreamRes.statusCode ?? 502, out);
+      upstreamRes.on("data", () => controller.data());
+      upstreamRes.once("end", () => controller.finish());
+      upstreamRes.once("aborted", () => {
+        controller.finish();
+        res.destroy();
+      });
+      upstreamRes.once("error", () => {
+        controller.finish();
+        res.destroy();
+      });
       upstreamRes.pipe(res);
-    },
-  );
+    });
+  } catch {
+    sendJson(res, 502, { error: "Screen is unreachable" });
+    return;
+  }
+  controller = superviseUpstreamDeadlines(upstream, dest, deadlines, (phase) => {
+    upstreamResponse?.destroy();
+    upstream.destroy();
+    if (!res.headersSent) {
+      sendJson(res, 504, { error: upstreamTimeoutMessage(phase) }, { Connection: "close" });
+    } else {
+      res.destroy(new Error(upstreamTimeoutMessage(phase)));
+    }
+  });
   upstream.on("error", () => {
+    if (controller.expired()) return;
+    controller.finish();
     if (!res.headersSent) sendJson(res, 502, { error: "Screen is unreachable" });
     else res.destroy();
+  });
+  res.once("close", () => {
+    const incomplete = !res.writableEnded;
+    controller.finish();
+    if (incomplete) {
+      upstreamResponse?.destroy();
+      upstream.destroy();
+    }
   });
   req.pipe(upstream);
 }
@@ -216,13 +372,47 @@ function proxyUpgrade(
   head: Buffer,
   dest: URL,
   auth: string | undefined,
+  deadlines: ScreenProxyDeadlines,
 ): void {
   const headers = copyHeaders(req.headers, ["host", "cookie", "authorization"]);
   headers.host = dest.host;
   if (auth) headers.authorization = auth;
 
-  const upstream = requestFor(dest)(dest, { method: "GET", headers });
-  upstream.on("upgrade", (upstreamRes, upstreamSocket, upstreamHead) => {
+  let responded = false;
+  let terminalFailureSent = false;
+  let upstreamResponse: http.IncomingMessage | undefined;
+  let upstreamSocket: import("node:stream").Duplex | undefined;
+  let upstream: http.ClientRequest;
+  try {
+    upstream = requestFor(dest)(dest, { method: "GET", headers });
+  } catch {
+    terminalFailureSent = true;
+    endUpgradeFailure(socket, 502, "Bad Gateway", "Screen upstream is unreachable");
+    return;
+  }
+  const controller = superviseUpstreamDeadlines(upstream, dest, deadlines, (phase) => {
+    upstreamResponse?.destroy();
+    upstreamSocket?.destroy();
+    upstream.destroy();
+    if (!responded && !socket.destroyed) {
+      const message = upstreamTimeoutMessage(phase);
+      socket.end(
+        `HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`,
+      );
+    } else {
+      socket.destroy();
+    }
+  });
+  upstream.on("upgrade", (upstreamRes, connectedSocket, upstreamHead) => {
+    if (controller.terminal() || socket.destroyed || !socket.writable) {
+      upstreamRes.destroy();
+      connectedSocket.destroy();
+      return;
+    }
+    responded = true;
+    controller.finish();
+    upstreamResponse = upstreamRes;
+    upstreamSocket = connectedSocket;
     const lines = [`HTTP/1.1 ${upstreamRes.statusCode ?? 101} ${upstreamRes.statusMessage ?? "Switching Protocols"}`];
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (key.toLowerCase() === "www-authenticate") continue;
@@ -231,15 +421,30 @@ function proxyUpgrade(
       for (const item of rendered) lines.push(`${key}: ${item}`);
     }
     socket.write(`${lines.join("\r\n")}\r\n\r\n`);
-    if (head.length) upstreamSocket.write(head);
+    if (head.length) connectedSocket.write(head);
     if (upstreamHead.length) socket.write(upstreamHead);
-    upstreamSocket.pipe(socket);
-    socket.pipe(upstreamSocket);
+    connectedSocket.pipe(socket);
+    socket.pipe(connectedSocket);
   });
   upstream.on("error", () => {
+    if (controller.expired()) return;
+    if (terminalFailureSent) return;
+    controller.finish();
+    if (!responded) {
+      terminalFailureSent = true;
+      endUpgradeFailure(socket, 502, "Bad Gateway", "Screen upstream is unreachable");
+      return;
+    }
     socket.destroy();
   });
   upstream.on("response", (upstreamRes) => {
+    if (controller.terminal() || socket.destroyed || !socket.writable) {
+      upstreamRes.destroy();
+      return;
+    }
+    responded = true;
+    upstreamResponse = upstreamRes;
+    controller.response();
     const lines = [`HTTP/1.1 ${upstreamRes.statusCode ?? 502} ${upstreamRes.statusMessage ?? "Error"}`];
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (key.toLowerCase() === "www-authenticate") continue;
@@ -248,7 +453,23 @@ function proxyUpgrade(
       for (const item of rendered) lines.push(`${key}: ${item}`);
     }
     socket.write(`${lines.join("\r\n")}\r\n\r\n`);
+    upstreamRes.on("data", () => controller.data());
+    upstreamRes.once("end", () => controller.finish());
+    upstreamRes.once("aborted", () => {
+      controller.finish();
+      socket.destroy();
+    });
+    upstreamRes.once("error", () => {
+      controller.finish();
+      socket.destroy();
+    });
     upstreamRes.pipe(socket);
+  });
+  socket.once("close", () => {
+    controller.finish();
+    upstreamResponse?.destroy();
+    upstreamSocket?.destroy();
+    upstream.destroy();
   });
   upstream.end();
 }
@@ -391,6 +612,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
   const salt = crypto.randomBytes(16);
   const key = crypto.scryptSync(options.password, salt, 32);
   const auth = kasmAuthorization(options);
+  const screenProxyDeadlines = normalizeScreenProxyDeadlines(options.screenProxyDeadlines);
   const computer: ComputerRuntime =
     options.computer ?? new NoopComputerRuntime(undefined, options.screenUpstream);
   const homeDir = path.resolve(options.homeDir ?? defaultHomeDir());
@@ -906,7 +1128,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
           return;
         }
         const dest = new URL(`${parsed.rest}${url.search}`, destBase);
-        proxyHttp(req, res, dest, auth);
+        proxyHttp(req, res, dest, auth, screenProxyDeadlines);
         return;
       }
 
@@ -940,7 +1162,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       return;
     }
     const dest = new URL(`${parsed.rest}${url.search}`, destBase);
-    proxyUpgrade(req, socket, head, dest, auth);
+    proxyUpgrade(req, socket, head, dest, auth, screenProxyDeadlines);
   });
 
   await new Promise<void>((resolve, reject) => {

@@ -6,9 +6,11 @@
     "strict": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
+    "allowJs": true,
+    "checkJs": false,
     "skipLibCheck": true,
     "types": ["node"],
     "rootDir": "."
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.mjs", "src/**/*.d.ts", "test/**/*.ts"]
 }
