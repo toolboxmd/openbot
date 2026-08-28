@@ -16,6 +16,17 @@ export const DISPLAY_BIN = "/usr/local/bin/openbot-display";
 export const PINCHTAB_CONTAINER_PORT_BASE = 9867;
 export const CDP_PORT_BASE = 9222;
 export const MAX_DOCKER_OUTPUT_BYTES = 64 * 1024;
+/** Local Docker metadata should settle promptly; five seconds includes ordinary daemon contention. */
+export const DOCKER_INSPECT_TIMEOUT_MS = 5_000;
+/**
+ * Display lifecycle work may wait 90 seconds for cookie ownership, 68 seconds for PinchTab ownership,
+ * 60 seconds for headed Chrome readiness, and bounded TERM/KILL cleanup. Five minutes covers that
+ * legitimate serialized work with contention margin without making an unresponsive Docker CLI unbounded.
+ */
+export const DOCKER_DISPLAY_TIMEOUT_MS = 300_000;
+export const DOCKER_TERM_GRACE_MS = 250;
+/** After SIGKILL, observe exact-group and child closure for one final bounded second. */
+export const DOCKER_KILL_REAP_TIMEOUT_MS = 1_000;
 
 export type DisplayHandle = {
   botId: string;
@@ -49,7 +60,15 @@ export type ComputerRuntime = {
   commands: string[][];
 };
 
-export type DockerFn = (args: string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+export type DockerCommandDeadline = {
+  timeoutMs: number;
+  failure: string;
+};
+
+export type DockerFn = (
+  args: string[],
+  deadline?: DockerCommandDeadline,
+) => Promise<{ code: number; stdout: string; stderr: string }>;
 
 function validateDockerResult(
   result: { code: number; stdout: string; stderr: string },
@@ -208,22 +227,116 @@ export async function pickScreenPorts(
   return ports;
 }
 
+function dockerCommandDeadline(args: string[]): DockerCommandDeadline {
+  if (args[0] === "inspect") {
+    return {
+      timeoutMs: DOCKER_INSPECT_TIMEOUT_MS,
+      failure: "docker inspect timed out after 5 seconds; verify Docker is responsive and retry",
+    };
+  }
+  const operation = args[2] === DISPLAY_BIN ? args[3] : undefined;
+  return {
+    timeoutMs: DOCKER_DISPLAY_TIMEOUT_MS,
+    failure: `docker Screen display ${operation ?? "lifecycle"} timed out after 300 seconds; verify Docker is responsive and retry`,
+  };
+}
+
 function defaultDocker(env: NodeJS.ProcessEnv): DockerFn {
-  return (args) =>
+  return (args, deadline = dockerCommandDeadline(args)) =>
     new Promise((resolve, reject) => {
-      const child = spawn("docker", args, { env, stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn("docker", args, {
+        detached: process.platform !== "win32",
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
       const out: Buffer[] = [];
       const err: Buffer[] = [];
       let outBytes = 0;
       let errBytes = 0;
       let settled = false;
-      const fail = (error: Error) => {
-        if (settled) return;
+      let childClosed = false;
+      let terminalError: Error | undefined;
+      let forceKillTimer: NodeJS.Timeout | undefined;
+      let reapTimer: NodeJS.Timeout | undefined;
+      let killReapTimer: NodeJS.Timeout | undefined;
+      const ownedPid = child.pid;
+      let ownedClosed = !ownedPid;
+      const terminateOwned = (signal: NodeJS.Signals) => {
+        if (!ownedPid) return;
+        try {
+          if (process.platform === "win32") child.kill(signal);
+          else process.kill(-ownedPid, signal);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+          child.kill(signal);
+        }
+      };
+      const ownedProcessAlive = () => {
+        if (!ownedPid) return false;
+        if (process.platform === "win32") {
+          return child.exitCode === null && child.signalCode === null;
+        }
+        try {
+          process.kill(-ownedPid, 0);
+          return true;
+        } catch (error) {
+          return (error as NodeJS.ErrnoException).code !== "ESRCH";
+        }
+      };
+      const deadlineTimer = setTimeout(() => {
+        fail(Object.assign(new Error(deadline.failure), {
+          status: 503,
+          code: "DOCKER_COMMAND_TIMEOUT",
+          recoverable: true,
+        }));
+      }, deadline.timeoutMs);
+      deadlineTimer.unref();
+      const clearTimers = () => {
+        clearTimeout(deadlineTimer);
+        if (forceKillTimer) clearTimeout(forceKillTimer);
+        if (reapTimer) clearInterval(reapTimer);
+        if (killReapTimer) clearTimeout(killReapTimer);
+      };
+      const observeOwnedClosure = () => {
+        if (!ownedClosed && !ownedProcessAlive()) {
+          ownedClosed = true;
+        }
+        return ownedClosed;
+      };
+      const finishFailureAfterClosure = () => {
+        const processClosed = observeOwnedClosure();
+        if (settled || !terminalError || !childClosed || !processClosed) return;
         settled = true;
-        child.kill("SIGKILL");
-        reject(error);
+        clearTimers();
+        reject(terminalError);
+      };
+      const finishFailureAfterKillReapBound = () => {
+        finishFailureAfterClosure();
+        if (settled || !terminalError) return;
+        settled = true;
+        clearTimers();
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.unref();
+        reject(terminalError);
+      };
+      const fail = (error: Error) => {
+        if (settled || terminalError) return;
+        terminalError = error;
+        clearTimeout(deadlineTimer);
+        if (ownedPid) {
+          terminateOwned("SIGTERM");
+          forceKillTimer = setTimeout(() => {
+            if (!observeOwnedClosure()) terminateOwned("SIGKILL");
+            killReapTimer = setTimeout(finishFailureAfterKillReapBound, DOCKER_KILL_REAP_TIMEOUT_MS);
+            finishFailureAfterClosure();
+          }, DOCKER_TERM_GRACE_MS);
+          reapTimer = setInterval(finishFailureAfterClosure, 10);
+        }
+        finishFailureAfterClosure();
       };
       child.stdout.on("data", (chunk: Buffer) => {
+        if (terminalError) return;
         outBytes += chunk.length;
         if (outBytes > MAX_DOCKER_OUTPUT_BYTES) {
           fail(new Error("docker stdout exceeded the bounded output contract"));
@@ -232,6 +345,7 @@ function defaultDocker(env: NodeJS.ProcessEnv): DockerFn {
         out.push(chunk);
       });
       child.stderr.on("data", (chunk: Buffer) => {
+        if (terminalError) return;
         errBytes += chunk.length;
         if (errBytes > MAX_DOCKER_OUTPUT_BYTES) {
           fail(new Error("docker stderr exceeded the bounded output contract"));
@@ -242,7 +356,13 @@ function defaultDocker(env: NodeJS.ProcessEnv): DockerFn {
       child.on("error", fail);
       child.on("close", (code) => {
         if (settled) return;
+        childClosed = true;
+        if (terminalError) {
+          finishFailureAfterClosure();
+          return;
+        }
         settled = true;
+        clearTimers();
         resolve({
           code: code ?? 1,
           stdout: Buffer.concat(out).toString("utf8"),
@@ -716,6 +836,6 @@ export class DockerComputerRuntime implements ComputerRuntime {
       throw new Error("Talk does not docker run a per-Bot Screen");
     }
     this.commands.push(args);
-    return validateDockerResult(await this.docker(args), args);
+    return validateDockerResult(await this.docker(args, dockerCommandDeadline(args)), args);
   }
 }
