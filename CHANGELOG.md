@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.13.0] - 2026-08-28
+
+### Added
+
+- Add keyboard-complete command palette
+
 ## [0.12.0] - 2026-08-28
 
 ### Added
