@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.10] - 2026-08-28
+
+### Changed
+
+- Reject invalid or aliased Screen and PinchTab endpoint maps
+
 ## [0.9.9] - 2026-08-28
 
 ### Changed

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -12,6 +13,8 @@ import {
   MAX_DOCKER_OUTPUT_BYTES,
   MemoryComputerRuntime,
   isForbiddenHostPort,
+  parsePinchTabPorts,
+  parseScreenPorts,
   pickScreenPorts,
 } from "../src/computer.ts";
 
@@ -31,6 +34,114 @@ describe("Computer displays",
       const ports = await pickScreenPorts(3, [6901, HOST_PORT_FLOOR]);
       assert.equal(ports.length, 3);
       assert.equal(ports.includes(6901), false);
+    });
+
+    test("present endpoint lists reject every invalid field without shifting display identity", () => {
+      const invalidLists = [
+        "",
+        "   ",
+        "16951,,16953",
+        "16951,not-a-port,16953",
+        "16951,16952.5,16953",
+        "16951,0x4238,16953",
+        "16951,0,16953",
+        "16951,65536,16953",
+        "16951,6901,16953",
+        "16951,16951",
+        "16951,16952,16953,16954,16955,16956,16957,16958,16959",
+      ];
+
+      for (const raw of invalidLists) {
+        assert.throws(() => parseScreenPorts(raw), /SCREEN_PORTS/u, raw || "<empty>");
+        assert.throws(() => parsePinchTabPorts(raw), /PINCHTAB_PORTS/u, raw || "<empty>");
+      }
+      assert.deepEqual(parseScreenPorts(undefined), []);
+      assert.deepEqual(parsePinchTabPorts(undefined), []);
+      assert.deepEqual(parseScreenPorts("16951, 16952,16953"), [16951, 16952, 16953]);
+      assert.deepEqual(parsePinchTabPorts("19867, 19868,19869"), [19867, 19868, 19869]);
+    });
+
+    test("invalid endpoint maps fail before runtime state or Docker side effects", async () => {
+      const root = await tempDir("openbot-endpoint-map-red-");
+      const cases: Array<{
+        name: string;
+        hostPorts: number[];
+        pinchTabHostPorts: number[];
+        error: RegExp;
+      }> = [
+        {
+          name: "duplicate-screen",
+          hostPorts: [16951, 16951],
+          pinchTabHostPorts: [19867, 19868],
+          error: /SCREEN_PORTS.*duplicate/iu,
+        },
+        {
+          name: "duplicate-pinchtab",
+          hostPorts: [16951, 16952],
+          pinchTabHostPorts: [19867, 19867],
+          error: /PINCHTAB_PORTS.*duplicate/iu,
+        },
+        {
+          name: "missing-pinchtab",
+          hostPorts: [16951, 16952],
+          pinchTabHostPorts: [19867],
+          error: /PINCHTAB_PORTS.*2.*required/iu,
+        },
+        {
+          name: "surplus-pinchtab",
+          hostPorts: [16951],
+          pinchTabHostPorts: [19867, 19868],
+          error: /PINCHTAB_PORTS.*1.*required/iu,
+        },
+        {
+          name: "same-display-overlap",
+          hostPorts: [16951, 16952],
+          pinchTabHostPorts: [16951, 19868],
+          error: /SCREEN_PORTS.*PINCHTAB_PORTS.*overlap.*16951/iu,
+        },
+        {
+          name: "cross-display-overlap",
+          hostPorts: [16951, 16952],
+          pinchTabHostPorts: [16952, 19868],
+          error: /SCREEN_PORTS.*PINCHTAB_PORTS.*overlap.*16952/iu,
+        },
+        {
+          name: "fractional-option",
+          hostPorts: [16951, 16952.5],
+          pinchTabHostPorts: [19867, 19868],
+          error: /SCREEN_PORTS.*field 2/iu,
+        },
+        {
+          name: "surplus-displays",
+          hostPorts: [16951, 16952, 16953, 16954, 16955, 16956, 16957, 16958, 16959],
+          pinchTabHostPorts: [19867, 19868, 19869, 19870, 19871, 19872, 19873, 19874, 19875],
+          error: /SCREEN_PORTS.*at most 8/iu,
+        },
+      ];
+
+      try {
+        for (const fixture of cases) {
+          let dockerCalls = 0;
+          const cookiesDir = join(root, fixture.name, "cookies");
+          assert.throws(
+            () => new DockerComputerRuntime({
+              hostPorts: fixture.hostPorts,
+              pinchTabHostPorts: fixture.pinchTabHostPorts,
+              cookiesDir,
+              docker: async () => {
+                dockerCalls += 1;
+                return { code: 0, stdout: "", stderr: "" };
+              },
+            }),
+            fixture.error,
+            fixture.name,
+          );
+          assert.equal(dockerCalls, 0, `${fixture.name} reached Docker`);
+          assert.equal(existsSync(cookiesDir), false, `${fixture.name} mutated runtime state`);
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
     });
 
     test("two Bots allocate two display upstreams and never docker run a second Screen", async () => {
@@ -221,24 +332,28 @@ describe("Computer displays",
 
     test("refuses a host port of 6901", async () => {
       const cookiesDir = join(await tempDir("openbot-forbidden-"), "cookies");
-      const computer = new DockerComputerRuntime({
-        hostPorts: [6901],
-        cookiesDir,
-        docker: async (args) => ({ code: 0, stdout: args[0] === "inspect" ? "true\n" : "", stderr: "" }),
-      });
-      await assert.rejects(() => computer.allocate("ada"), /6901/);
+      assert.throws(
+        () => new DockerComputerRuntime({
+          hostPorts: [6901],
+          cookiesDir,
+          docker: async (args) => ({ code: 0, stdout: args[0] === "inspect" ? "true\n" : "", stderr: "" }),
+        }),
+        /6901/,
+      );
     });
 
     test("refuses a PinchTab host port of 6901", async () => {
       const cookiesDir = join(await tempDir("openbot-pt-forbidden-"), "cookies");
-      const computer = new DockerComputerRuntime({
-        hostPorts: [16911],
-        pinchTabHostPorts: [6901],
-        pinchTabToken: "token",
-        cookiesDir,
-        docker: async () => ({ code: 0, stdout: "", stderr: "" }),
-      });
-      await assert.rejects(() => computer.allocate("ada"), /6901/);
+      assert.throws(
+        () => new DockerComputerRuntime({
+          hostPorts: [16911],
+          pinchTabHostPorts: [6901],
+          pinchTabToken: "token",
+          cookiesDir,
+          docker: async () => ({ code: 0, stdout: "", stderr: "" }),
+        }),
+        /6901/,
+      );
     });
 
     test("allocate fills PinchTab url when host ports are set", async () => {
