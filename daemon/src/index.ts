@@ -50,4 +50,20 @@ const box = await startBox({
   workspaceDir,
   computer,
 });
+
+let shutdownStarted = false;
+function shutdownFromSignal(): void {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  void box.close().then(
+    () => process.exit(0),
+    () => {
+      console.error("OpenBot shutdown failed during cleanup.");
+      process.exit(1);
+    },
+  );
+}
+
+process.on("SIGINT", shutdownFromSignal);
+process.on("SIGTERM", shutdownFromSignal);
 console.log(`OpenBot box listening on ${box.url}`);

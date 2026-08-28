@@ -46,6 +46,8 @@ const DEFAULT_SCREEN_PROXY_DEADLINES: ScreenProxyDeadlines = {
   bodyMs: 15_000,
   totalMs: 30_000,
 };
+const SCREEN_READINESS_MAX_BYTES = 128 * 1024;
+const SCREEN_READINESS_TIMEOUT_MS = 750;
 
 const MIME: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
@@ -520,29 +522,47 @@ async function servePwa(
   }
 }
 
+export type ScreenReadiness = {
+  reachable: boolean;
+  ready: boolean;
+};
+
+function validKasmReadinessResponse(
+  status: number | undefined,
+  contentType: string | undefined,
+  body: string,
+): boolean {
+  return status === 200
+    && /^text\/html(?:;|$)/iu.test(contentType ?? "")
+    && /<title[^>]*>\s*KasmVNC(?:\s|<|$)/iu.test(body);
+}
+
 /** node:http only. Do not fetch+AbortSignal against Kasm (undici can crash the host). */
-export function screenIsReachable(
+export function screenReadiness(
   upstream: string | undefined,
   auth: string | undefined,
-): Promise<boolean> {
-  if (!upstream) return Promise.resolve(false);
+): Promise<ScreenReadiness> {
+  if (!upstream) return Promise.resolve({ reachable: false, ready: false });
 
   let dest: URL;
   try {
     dest = new URL(upstream);
   } catch {
-    return Promise.resolve(false);
+    return Promise.resolve({ reachable: false, ready: false });
   }
   if (dest.protocol !== "http:" && dest.protocol !== "https:") {
-    return Promise.resolve(false);
+    return Promise.resolve({ reachable: false, ready: false });
   }
 
   return new Promise((resolve) => {
     let settled = false;
-    const done = (ok: boolean) => {
+    let reachable = false;
+    let deadline: NodeJS.Timeout | undefined;
+    const done = (result: ScreenReadiness) => {
       if (settled) return;
       settled = true;
-      resolve(ok);
+      if (deadline) clearTimeout(deadline);
+      resolve(result);
     };
 
     const headers: http.OutgoingHttpHeaders = {
@@ -556,10 +576,10 @@ export function screenIsReachable(
       req = requestFor(dest)(dest, {
         method: "GET",
         headers,
-        timeout: 750,
+        timeout: SCREEN_READINESS_TIMEOUT_MS,
       });
     } catch {
-      done(false);
+      done({ reachable: false, ready: false });
       return;
     }
 
@@ -571,41 +591,81 @@ export function screenIsReachable(
       }
     };
 
-    req.setTimeout(750, () => {
+    deadline = setTimeout(() => {
       kill();
-      done(false);
+      done({ reachable, ready: false });
+    }, SCREEN_READINESS_TIMEOUT_MS);
+    req.setTimeout(SCREEN_READINESS_TIMEOUT_MS, () => {
+      kill();
+      done({ reachable, ready: false });
     });
     req.on("response", (res) => {
-      res.resume();
-      kill();
-      done(true);
+      reachable = true;
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      res.on("data", (chunk: Buffer) => {
+        bytes += chunk.length;
+        if (bytes > SCREEN_READINESS_MAX_BYTES) {
+          res.destroy();
+          kill();
+          done({ reachable: true, ready: false });
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on("end", () => {
+        done({
+          reachable: true,
+          ready: validKasmReadinessResponse(
+            res.statusCode,
+            res.headers["content-type"],
+            Buffer.concat(chunks).toString("utf8"),
+          ),
+        });
+      });
+      res.on("error", () => done({ reachable: true, ready: false }));
     });
     req.on("timeout", () => {
       kill();
-      done(false);
+      done({ reachable, ready: false });
     });
     req.on("error", () => {
-      done(false);
+      done({ reachable, ready: false });
     });
     req.on("socket", (socket) => {
-      socket.setTimeout(750, () => {
+      socket.setTimeout(SCREEN_READINESS_TIMEOUT_MS, () => {
         kill();
-        done(false);
+        done({ reachable, ready: false });
       });
     });
     try {
       req.end();
     } catch {
       kill();
-      done(false);
+      done({ reachable: false, ready: false });
     }
   });
+}
+
+export async function screenIsReachable(
+  upstream: string | undefined,
+  auth: string | undefined,
+): Promise<boolean> {
+  return (await screenReadiness(upstream, auth)).ready;
 }
 
 function sendStoreError(res: http.ServerResponse, err: unknown): void {
   const status = typeof (err as { status?: unknown })?.status === "number" ? (err as { status: number }).status : 500;
   const message = err instanceof Error ? err.message : "box error";
-  sendJson(res, status, { error: message });
+  const payload: Record<string, unknown> = { error: message };
+  const code = (err as { code?: unknown })?.code;
+  const provisioningId = (err as { provisioningId?: unknown })?.provisioningId;
+  if (typeof code === "string" && code.length <= 128) payload.code = code;
+  if ((err as { recoverable?: unknown })?.recoverable === true) payload.recoverable = true;
+  if (typeof provisioningId === "string" && provisioningId.length <= 128) {
+    payload.provisioningId = provisioningId;
+  }
+  sendJson(res, status, payload);
 }
 
 export async function startBox(options: BoxOptions): Promise<RunningBox> {
@@ -621,11 +681,17 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
   fsSync.mkdirSync(workspaceDir, { recursive: true });
   const store = new BotStore(homeDir, {
     computer,
+    screenReady: async (upstream) => (await screenReadiness(upstream, auth)).ready,
     spawnAcp: options.spawnAcp,
     listHarnesses: options.listHarnesses,
     workspaceDir,
   });
-  await store.reattachDisplays();
+  try {
+    await store.reattachDisplays();
+  } catch (error) {
+    store.close();
+    throw error;
+  }
 
   function upstreamFor(botId: string | null): string | undefined {
     if (botId && computer.upstream(botId)) return computer.upstream(botId);
@@ -681,8 +747,54 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
     };
   }
 
+  type ConnectionState = {
+    activeResponses: number;
+    closeAfterResponses: boolean;
+    phase: "headers" | "http" | "upgrade";
+  };
+  let closing = false;
+  const connections = new Map<import("node:stream").Duplex, ConnectionState>();
   const server = http.createServer((req, res) => {
+    const state = connections.get(req.socket);
+    if (closing) {
+      if (!state || state.activeResponses === 0) req.socket.destroy();
+      return;
+    }
+    if (!state) {
+      req.socket.destroy();
+      return;
+    }
+    state.activeResponses += 1;
+    state.phase = "http";
+    let released = false;
+    function releaseResponse(): void {
+      if (released) return;
+      released = true;
+      const current = connections.get(req.socket);
+      if (!current) return;
+      current.activeResponses -= 1;
+      if (current.activeResponses > 0 || req.socket.destroyed) return;
+      if (closing || current.closeAfterResponses) {
+        req.socket.destroySoon();
+        return;
+      }
+      current.phase = "headers";
+    }
+    res.once("finish", releaseResponse);
+    res.once("close", releaseResponse);
     void handle(req, res);
+  });
+  server.on("connection", (socket) => {
+    if (closing) {
+      socket.destroy();
+      return;
+    }
+    connections.set(socket, {
+      activeResponses: 0,
+      closeAfterResponses: false,
+      phase: "headers",
+    });
+    socket.once("close", () => connections.delete(socket));
   });
 
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -1112,10 +1224,13 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
             expectedEpoch,
           );
           const bot = selectedBotId ? store.get(selectedBotId) : null;
+          const upstream = upstreamFor(selectedBotId);
+          const readiness = await screenReadiness(upstream, auth);
           sendJson(res, 200, {
             ...(bot ?? {}),
             path: selectedBotId ? `${SCREEN_PREFIX}/${selectedBotId}/` : `${SCREEN_PREFIX}/`,
-            ready: Boolean(upstreamFor(selectedBotId)),
+            reachable: Boolean(upstream) && readiness.reachable,
+            ready: Boolean(upstream) && readiness.ready,
             botId: selectedBotId,
             ...computerOwnership(selectedBotId),
             container: computer.containerName(),
@@ -1126,10 +1241,13 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
             : 500;
           const message = err instanceof Error ? err.message : "box error";
           const selectedBotId = botId || null;
+          const upstream = upstreamFor(selectedBotId);
+          const readiness = await screenReadiness(upstream, auth);
           sendJson(res, status, {
             error: message,
             path: selectedBotId ? `${SCREEN_PREFIX}/${selectedBotId}/` : `${SCREEN_PREFIX}/`,
-            ready: Boolean(upstreamFor(selectedBotId)),
+            reachable: Boolean(upstream) && readiness.reachable,
+            ready: Boolean(upstream) && readiness.ready,
             botId: selectedBotId,
             ...computerOwnership(selectedBotId),
             container: computer.containerName(),
@@ -1152,10 +1270,11 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         const botId = bot?.id ?? null;
         const upstream = upstreamFor(botId);
         const pathFor = botId ? `${SCREEN_PREFIX}/${botId}/` : `${SCREEN_PREFIX}/`;
-        const ready = await screenIsReachable(upstream, auth);
+        const readiness = await screenReadiness(upstream, auth);
         sendJson(res, 200, {
           path: upstream ? pathFor : pathFor,
-          ready: Boolean(upstream) && ready,
+          reachable: Boolean(upstream) && readiness.reachable,
+          ready: Boolean(upstream) && readiness.ready,
           botId,
           ...computerOwnership(botId),
           display: bot?.display ?? (upstream ? 1 : null),
@@ -1198,6 +1317,20 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
   }
 
   server.on("upgrade", (req, socket, head) => {
+    const state = connections.get(socket);
+    if (!state) {
+      socket.destroy();
+      return;
+    }
+    if (state.activeResponses > 0) {
+      state.closeAfterResponses = true;
+      return;
+    }
+    if (closing) {
+      socket.destroy();
+      return;
+    }
+    state.phase = "upgrade";
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
     if (!isScreenPath(url.pathname)) {
       socket.destroy();
@@ -1233,9 +1366,13 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
   let closeResult: Promise<void> | null = null;
   function close(): Promise<void> {
     if (closeResult) return closeResult;
+    closing = true;
     const serverClosed = new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
     });
+    for (const [socket, state] of connections) {
+      if (state.phase === "upgrade" || state.activeResponses === 0) socket.destroy();
+    }
     closeResult = (async () => {
       let ownershipFailure: unknown = null;
       let serverFailure: unknown = null;

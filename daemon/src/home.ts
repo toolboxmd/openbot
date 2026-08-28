@@ -16,8 +16,9 @@ import {
   type HostGrantDuration,
 } from "./harness-home.ts";
 
-export const HOME_SCHEMA_VERSION = 2;
+export const HOME_SCHEMA_VERSION = 3;
 export const HUMAN_MEMBER_ID = "you";
+const BOT_DISPLAY_MAX = 8;
 
 export type MessageReceipt = "sent" | "delivered" | "read";
 
@@ -47,6 +48,13 @@ export type StoredBot = {
   harness: HarnessId | null;
   configMode?: ConfigMode;
   createdAt: string;
+};
+
+export type StoredBotProvisioning = {
+  botId: string;
+  display: number | null;
+  workspaceOwned: boolean;
+  state: "preparing" | "cleanup-required";
 };
 
 export type StoredHostGrant = {
@@ -136,6 +144,71 @@ export class HomeStore {
       .prepare("SELECT id, name, color, shape, harness, config_mode, created_at FROM bots ORDER BY rowid")
       .all()
       .flatMap((row) => reviveBot(row as SqlRow));
+  }
+
+  listBotProvisionings(): StoredBotProvisioning[] {
+    return (this.db
+      .prepare(
+        "SELECT bot_id, display, workspace_owned, state FROM bot_provisioning ORDER BY created_at, bot_id",
+      )
+      .all() as SqlRow[]).map((row) => ({
+      botId: String(row.bot_id),
+      display: typeof row.display === "number" ? row.display : null,
+      workspaceOwned: row.workspace_owned === 1,
+      state: row.state === "cleanup-required" ? "cleanup-required" : "preparing",
+    }));
+  }
+
+  botDisplay(botId: string): number | undefined {
+    assertGeneratedBotId(botId);
+    const row = this.db.prepare("SELECT display FROM bots WHERE id = ?").get(botId) as SqlRow | undefined;
+    if (!row) return undefined;
+    if (!isBotDisplay(row.display)) throw invalidPersistedBotDisplayError();
+    return row.display;
+  }
+
+  beginBotProvisioning(botId: string): void {
+    assertGeneratedBotId(botId);
+    this.db
+      .prepare(
+        `INSERT INTO bot_provisioning
+         (bot_id, display, workspace_owned, state, cleanup_error, created_at)
+         VALUES (?, NULL, 1, 'preparing', NULL, ?)`,
+      )
+      .run(botId, new Date().toISOString());
+  }
+
+  setBotProvisioningDisplay(botId: string, display: number | null): void {
+    assertGeneratedBotId(botId);
+    if (display !== null && (!Number.isInteger(display) || display < 1 || display > 8)) {
+      throw new Error("Bot provisioning display is invalid");
+    }
+    const changed = this.db.prepare("UPDATE bot_provisioning SET display = ? WHERE bot_id = ?").run(display, botId);
+    if (changed.changes !== 1) throw new Error("Bot provisioning state is missing");
+  }
+
+  setBotProvisioningWorkspaceOwned(botId: string, owned: boolean): void {
+    assertGeneratedBotId(botId);
+    const changed = this.db
+      .prepare("UPDATE bot_provisioning SET workspace_owned = ? WHERE bot_id = ?")
+      .run(owned ? 1 : 0, botId);
+    if (changed.changes !== 1) throw new Error("Bot provisioning state is missing");
+  }
+
+  markBotProvisioningCleanupRequired(botId: string, detail: string): void {
+    assertGeneratedBotId(botId);
+    const bounded = Buffer.from(detail, "utf8").subarray(0, 1_024).toString("utf8");
+    const changed = this.db
+      .prepare(
+        "UPDATE bot_provisioning SET state = 'cleanup-required', cleanup_error = ? WHERE bot_id = ?",
+      )
+      .run(bounded, botId);
+    if (changed.changes !== 1) throw new Error("Bot provisioning state is missing");
+  }
+
+  clearBotProvisioning(botId: string): void {
+    assertGeneratedBotId(botId);
+    this.db.prepare("DELETE FROM bot_provisioning WHERE bot_id = ?").run(botId);
   }
 
   listChannels(): StoredChannel[] {
@@ -234,39 +307,27 @@ export class HomeStore {
 
   createBot(bot: StoredBot, channelId: string): StoredChannel {
     assertGeneratedBotId(bot.id);
-    const channel: StoredChannel = {
-      id: channelId,
-      kind: "direct",
-      title: null,
-      createdAt: bot.createdAt,
-      members: [
-        { kind: "user", id: HUMAN_MEMBER_ID },
-        { kind: "bot", id: bot.id },
-      ],
-      messages: [],
-    };
+    let channel: StoredChannel | undefined;
     this.transaction(() => {
-      this.db
-        .prepare(
-          "INSERT INTO bots (id, name, color, shape, harness, config_mode, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .run(bot.id, bot.name, bot.color, bot.shape, bot.harness, bot.configMode ?? "isolated", bot.createdAt);
-      this.db
-        .prepare("INSERT INTO channels (id, kind, title, created_at) VALUES (?, ?, ?, ?)")
-        .run(channel.id, channel.kind, channel.title, channel.createdAt);
-      const insertMember = this.db.prepare(
-        "INSERT INTO channel_members (channel_id, member_kind, member_id, position) VALUES (?, ?, ?, ?)",
-      );
-      channel.members.forEach((member, index) => {
-        insertMember.run(channel.id, member.kind, member.id, index);
-      });
-      this.db
-        .prepare(
-          "INSERT INTO bot_channel_state (bot_id, channel_id, harness_id, session_id) VALUES (?, ?, ?, NULL)",
-        )
-        .run(bot.id, channel.id, bot.harness);
+      channel = this.insertBot(bot, channelId, this.nextBotDisplay());
     });
-    return channel;
+    return channel!;
+  }
+
+  commitProvisionedBot(bot: StoredBot, channelId: string): StoredChannel {
+    assertGeneratedBotId(bot.id);
+    let channel: StoredChannel | undefined;
+    this.transaction(() => {
+      const provisioning = this.db
+        .prepare("SELECT bot_id, display FROM bot_provisioning WHERE bot_id = ?")
+        .get(bot.id) as SqlRow | undefined;
+      if (!provisioning) throw new Error("Bot provisioning state is missing");
+      if (!isBotDisplay(provisioning.display)) throw new Error("Bot provisioning display is not committed");
+      channel = this.insertBot(bot, channelId, provisioning.display);
+      const cleared = this.db.prepare("DELETE FROM bot_provisioning WHERE bot_id = ?").run(bot.id);
+      if (cleared.changes !== 1) throw new Error("Bot provisioning state was not committed");
+    });
+    return channel!;
   }
 
   setConfigMode(botId: string, configMode: ConfigMode): void {
@@ -461,8 +522,11 @@ export class HomeStore {
           shape TEXT NOT NULL,
           harness TEXT,
           config_mode TEXT NOT NULL DEFAULT 'isolated',
+          display INTEGER NOT NULL CHECK (display BETWEEN 1 AND 8),
           created_at TEXT NOT NULL
         );
+
+        CREATE UNIQUE INDEX bots_display_unique ON bots(display);
 
         CREATE TABLE channels (
           id TEXT PRIMARY KEY,
@@ -528,6 +592,15 @@ export class HomeStore {
           PRIMARY KEY (bot_id, channel_id)
         );
 
+        CREATE TABLE bot_provisioning (
+          bot_id TEXT PRIMARY KEY,
+          display INTEGER CHECK (display BETWEEN 1 AND 8),
+          workspace_owned INTEGER NOT NULL DEFAULT 1 CHECK (workspace_owned IN (0, 1)),
+          state TEXT NOT NULL CHECK (state IN ('preparing', 'cleanup-required')),
+          cleanup_error TEXT,
+          created_at TEXT NOT NULL
+        );
+
         CREATE TABLE host_grants (
           id TEXT PRIMARY KEY,
           path TEXT NOT NULL,
@@ -550,13 +623,34 @@ export class HomeStore {
           );
         `);
       }
+      if (version === 1 || version === 2) {
+        this.db.exec(`
+          ALTER TABLE bots ADD COLUMN display INTEGER CHECK (display BETWEEN 1 AND 8);
+
+          CREATE TABLE bot_provisioning (
+            bot_id TEXT PRIMARY KEY,
+            display INTEGER CHECK (display BETWEEN 1 AND 8),
+            workspace_owned INTEGER NOT NULL DEFAULT 1 CHECK (workspace_owned IN (0, 1)),
+            state TEXT NOT NULL CHECK (state IN ('preparing', 'cleanup-required')),
+            cleanup_error TEXT,
+            created_at TEXT NOT NULL
+          );
+        `);
+        const persistedBots = this.db.prepare("SELECT id FROM bots ORDER BY rowid").all() as SqlRow[];
+        const setDisplay = this.db.prepare("UPDATE bots SET display = ? WHERE id = ?");
+        persistedBots.forEach((row, index) => setDisplay.run(index + 1, String(row.id)));
+        this.db.exec("CREATE UNIQUE INDEX bots_display_unique ON bots(display);");
+      }
       this.db.exec(`PRAGMA user_version = ${HOME_SCHEMA_VERSION};`);
     });
   }
 
   private assertPersistedBotIds(): void {
-    const rows = this.db.prepare("SELECT id FROM bots").all() as SqlRow[];
+    const rows = this.db.prepare("SELECT id, display FROM bots").all() as SqlRow[];
     if (rows.some((row) => !isGeneratedBotId(row.id))) throw invalidPersistedBotIdError();
+    if (rows.some((row) => !isBotDisplay(row.display))) throw invalidPersistedBotDisplayError();
+    const provisioning = this.db.prepare("SELECT bot_id FROM bot_provisioning").all() as SqlRow[];
+    if (provisioning.some((row) => !isGeneratedBotId(row.bot_id))) throw invalidPersistedBotIdError();
   }
 
   private reviveChannel(row: SqlRow): StoredChannel | null {
@@ -608,6 +702,62 @@ export class HomeStore {
     return [message];
   }
 
+  private nextBotDisplay(): number {
+    const used = new Set(
+      (this.db.prepare("SELECT display FROM bots").all() as SqlRow[])
+        .map((row) => row.display)
+        .filter(isBotDisplay),
+    );
+    const display = Array.from({ length: BOT_DISPLAY_MAX }, (_, index) => index + 1)
+      .find((candidate) => !used.has(candidate));
+    if (!display) throw Object.assign(new Error("Computer is out of displays"), { status: 409 });
+    return display;
+  }
+
+  private insertBot(bot: StoredBot, channelId: string, display: number): StoredChannel {
+    if (!isBotDisplay(display)) throw new Error("Bot display is invalid");
+    const channel: StoredChannel = {
+      id: channelId,
+      kind: "direct",
+      title: null,
+      createdAt: bot.createdAt,
+      members: [
+        { kind: "user", id: HUMAN_MEMBER_ID },
+        { kind: "bot", id: bot.id },
+      ],
+      messages: [],
+    };
+    this.db
+      .prepare(
+        "INSERT INTO bots (id, name, color, shape, harness, config_mode, display, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        bot.id,
+        bot.name,
+        bot.color,
+        bot.shape,
+        bot.harness,
+        bot.configMode ?? "isolated",
+        display,
+        bot.createdAt,
+      );
+    this.db
+      .prepare("INSERT INTO channels (id, kind, title, created_at) VALUES (?, ?, ?, ?)")
+      .run(channel.id, channel.kind, channel.title, channel.createdAt);
+    const insertMember = this.db.prepare(
+      "INSERT INTO channel_members (channel_id, member_kind, member_id, position) VALUES (?, ?, ?, ?)",
+    );
+    channel.members.forEach((member, index) => {
+      insertMember.run(channel.id, member.kind, member.id, index);
+    });
+    this.db
+      .prepare(
+        "INSERT INTO bot_channel_state (bot_id, channel_id, harness_id, session_id) VALUES (?, ?, ?, NULL)",
+      )
+      .run(bot.id, channel.id, bot.harness);
+    return channel;
+  }
+
   private transaction<T>(action: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -654,6 +804,16 @@ function reviveBot(row: SqlRow): StoredBot[] {
 function invalidPersistedBotIdError(): Error {
   return new Error(
     "Corrupt Home: invalid persisted Bot ID; repair or remove the Bot row before restarting OpenBot",
+  );
+}
+
+function isBotDisplay(value: unknown): value is number {
+  return Number.isInteger(value) && Number(value) >= 1 && Number(value) <= BOT_DISPLAY_MAX;
+}
+
+function invalidPersistedBotDisplayError(): Error {
+  return new Error(
+    "Corrupt Home: invalid persisted Bot display; repair or remove the Bot row before restarting OpenBot",
   );
 }
 

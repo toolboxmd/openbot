@@ -4,7 +4,7 @@ set -euo pipefail
 umask 077
 
 # Extra Kasm displays inside the one Computer container.
-# usage: openbot-display start <n> | stop <n> | seed <n> | cookies-in <n> | cookies-out <n> | cookies-clear <n> | pinchtab <n>
+# usage: openbot-display start <n> | stop <n> | discard <n> | seed <n> | cookies-in <n> | cookies-out <n> | cookies-clear <n> | pinchtab <n>
 
 CMD="${1:-start}"
 N="${2:-}"
@@ -19,9 +19,17 @@ PINCHTAB_CONNECT_TIMEOUT_SEC="${OPENBOT_PINCHTAB_CONNECT_TIMEOUT_SEC:-1}"
 PINCHTAB_BODY_TIMEOUT_SEC="${OPENBOT_PINCHTAB_BODY_TIMEOUT_SEC:-2}"
 PINCHTAB_REQUEST_TIMEOUT_SEC="${OPENBOT_PINCHTAB_REQUEST_TIMEOUT_SEC:-3}"
 PINCHTAB_START_TIMEOUT_SEC="${OPENBOT_PINCHTAB_START_TIMEOUT_SEC:-60}"
+X_LOCK_DIR="${OPENBOT_X_LOCK_DIR:-/tmp}"
+X_SOCKET_DIR="${OPENBOT_X_SOCKET_DIR:-/tmp/.X11-unix}"
 
 case "$CMD" in
   start)
+    if ! [[ "$N" =~ ^[2-8]$ ]]; then
+      echo "openbot-display: display must be 2-8" >&2
+      exit 1
+    fi
+    ;;
+  discard)
     if ! [[ "$N" =~ ^[2-8]$ ]]; then
       echo "openbot-display: display must be 2-8" >&2
       exit 1
@@ -34,7 +42,7 @@ case "$CMD" in
     fi
     ;;
   *)
-    echo "usage: openbot-display start <n> | stop <n> | seed <n> | cookies-in <n> | cookies-out <n> | cookies-clear <n> | pinchtab <n>" >&2
+    echo "usage: openbot-display start <n> | stop <n> | discard <n> | seed <n> | cookies-in <n> | cookies-out <n> | cookies-clear <n> | pinchtab <n>" >&2
     exit 1
     ;;
 esac
@@ -85,6 +93,14 @@ pinchtab_lock_dir() {
   echo "$(pinchtab_dir "$1")/startup.lock"
 }
 
+x_lock_file() {
+  echo "${X_LOCK_DIR}/.X${1}-lock"
+}
+
+x_socket_file() {
+  echo "${X_SOCKET_DIR}/X${1}"
+}
+
 process_start_id() {
   local pid="$1"
   if [ -r "/proc/${pid}/stat" ]; then
@@ -123,8 +139,9 @@ display_process_command() {
 display_owner_matches() {
   local n="$1"
   local pid="$2"
-  local socket="/tmp/.X11-unix/X${n}"
+  local socket
   local command
+  socket="$(x_socket_file "$n")"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   [ -S "$socket" ] || return 1
@@ -353,7 +370,7 @@ cookie_files() {
 # - imports remove old profile cookie artifacts first and publish the snapshot epoch marker last.
 # - exports preserve the epoch and publish a complete new snapshot last, so the last committed export wins.
 # - clear publishes a new empty epoch before removing profile artifacts; old epoch markers can never export.
-# - one COOKIE_JAR/.sync.lock serializes import, export, clear, Screen start, and Screen stop.
+# - one COOKIE_JAR/.sync.lock serializes import, export, clear, Screen start/stop, and unpublished discard.
 # - snapshot directories are mode 0700 and files are mode 0600; legacy root files are migration input only.
 cookie_snapshot_root() {
   echo "$COOKIE_JAR/snapshots"
@@ -1213,6 +1230,175 @@ stop_chrome() {
   return 1
 }
 
+display_state_directory_safe() {
+  local path="$1"
+  if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
+    echo "openbot-display: unpublished display state must use a real directory: ${path}" >&2
+    return 1
+  fi
+}
+
+discard_directories_safe() {
+  local n="$1"
+  display_state_directory_safe "$HOME_DIR" || return 1
+  display_state_directory_safe "$HOME_DIR/.config" || return 1
+  display_state_directory_safe "$(profile_dir "$n")" || return 1
+  display_state_directory_safe "$(config_dir "$n")" || return 1
+  display_state_directory_safe "$(pinchtab_dir "$n")" || return 1
+  display_state_directory_safe "$HOME_DIR/.vnc" || return 1
+}
+
+discard_x_state_safe() {
+  local n="$1"
+  local x_lock
+  local x_socket
+  local x_pid=""
+  x_lock="$(x_lock_file "$n")"
+  x_socket="$(x_socket_file "$n")"
+  if [ -L "$x_lock" ] || [ -L "$x_socket" ]; then
+    echo "openbot-display: refusing symlinked X state for unpublished display :${n}" >&2
+    return 1
+  fi
+  if [ -e "$x_lock" ] && [ ! -f "$x_lock" ]; then
+    echo "openbot-display: X lock for unpublished display :${n} is not a regular file" >&2
+    return 1
+  fi
+  if [ -e "$x_socket" ] && [ ! -S "$x_socket" ]; then
+    echo "openbot-display: X socket path for unpublished display :${n} is not a Unix socket" >&2
+    return 1
+  fi
+  if [ -S "$x_socket" ]; then
+    if [ ! -f "$x_lock" ]; then
+      echo "openbot-display: unpublished display :${n} has an X socket without an ownership lock" >&2
+      return 1
+    fi
+    x_pid="$(awk 'NR == 1 { print $1 }' "$x_lock" 2>/dev/null || true)"
+    if ! [[ "$x_pid" =~ ^[0-9]+$ ]] || ! display_owner_matches "$n" "$x_pid"; then
+      echo "openbot-display: X socket for unpublished display :${n} lacks coherent verified ownership; refusing cleanup" >&2
+      return 1
+    fi
+  elif [ -f "$x_lock" ]; then
+    x_pid="$(awk 'NR == 1 { print $1 }' "$x_lock" 2>/dev/null || true)"
+    if [[ "$x_pid" =~ ^[0-9]+$ ]] && kill -0 "$x_pid" 2>/dev/null; then
+      echo "openbot-display: X lock for unpublished display :${n} names foreign live ownership; refusing cleanup" >&2
+      return 1
+    fi
+  fi
+}
+
+discard_pinchtab() {
+  local n="$1"
+  local state owner port supervisor_pid supervisor_start child_pid child_start result
+  state="$(pinchtab_dir "$n")"
+  port="$(pinchtab_port "$n")"
+  if [ ! -e "$state" ] && [ ! -L "$state" ]; then
+    if pinchtab_port_in_use "$port"; then
+      echo "openbot-display: PinchTab port ${port} is occupied without owned unpublished state" >&2
+      return 1
+    fi
+    return 0
+  fi
+  display_state_directory_safe "$state" || return 1
+  if ! acquire_pinchtab_lock "$n"; then
+    echo "openbot-display: timed out waiting for unpublished PinchTab cleanup on :${n}" >&2
+    return 1
+  fi
+  result=0
+  owner="$(pinchtab_owner_file "$n")"
+  if [ -e "$owner" ] || [ -L "$owner" ]; then
+    if [ -L "$owner" ] || [ ! -f "$owner" ]; then
+      echo "openbot-display: refusing unsafe PinchTab owner state on unpublished display :${n}" >&2
+      result=1
+    else
+      supervisor_pid="$(owner_field "$owner" supervisorPid)"
+      supervisor_start="$(owner_field "$owner" supervisorStart)"
+      child_pid="$(owner_field "$owner" childPid)"
+      child_start="$(owner_field "$owner" childStart)"
+      if { [[ "$supervisor_pid" =~ ^[0-9]+$ ]] && kill -0 "$supervisor_pid" 2>/dev/null; } \
+        || { [[ "$child_pid" =~ ^[0-9]+$ ]] && kill -0 "$child_pid" 2>/dev/null; }; then
+        if pinchtab_owner_valid "$n" "$port"; then
+          if ! pinchtab_stop_locked "$n"; then result=1; fi
+        else
+          echo "openbot-display: PinchTab owner state on unpublished display :${n} names foreign live ownership" >&2
+          result=1
+        fi
+      elif ! rm -f -- "$owner"; then
+        echo "openbot-display: failed to remove stale PinchTab owner state on unpublished display :${n}" >&2
+        result=1
+      fi
+    fi
+  fi
+  if pinchtab_port_in_use "$port"; then
+    echo "openbot-display: PinchTab port ${port} remains occupied after unpublished cleanup" >&2
+    result=1
+  fi
+  release_pinchtab_lock "$n"
+  return "$result"
+}
+
+discard_x_state() {
+  local n="$1"
+  local x_lock
+  local x_socket
+  local x_pid=""
+  local i
+  x_lock="$(x_lock_file "$n")"
+  x_socket="$(x_socket_file "$n")"
+  discard_x_state_safe "$n" || return 1
+  if [ -f "$x_lock" ]; then
+    x_pid="$(awk 'NR == 1 { print $1 }' "$x_lock" 2>/dev/null || true)"
+  fi
+  if display_owner_matches "$n" "$x_pid"; then
+    if ! su -s /bin/bash "$USER_NAME" -c "vncserver -kill :${n}" >/dev/null 2>&1; then
+      echo "openbot-display: failed to stop owned VNC for unpublished display :${n}" >&2
+      return 1
+    fi
+    for i in $(seq 1 20); do
+      if ! display_owner_matches "$n" "$x_pid"; then break; fi
+      sleep 0.1
+    done
+    if display_owner_matches "$n" "$x_pid"; then
+      echo "openbot-display: owned VNC survived cleanup for unpublished display :${n}" >&2
+      return 1
+    fi
+  fi
+  discard_x_state_safe "$n" || return 1
+  if ! rm -f -- "$x_lock" "$x_socket"; then
+    echo "openbot-display: failed to remove X state for unpublished display :${n}" >&2
+    return 1
+  fi
+}
+
+remove_discarded_directory() {
+  local path="$1"
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then return 0; fi
+  display_state_directory_safe "$HOME_DIR" || return 1
+  case "$path" in
+    "$HOME_DIR/.config/"*) display_state_directory_safe "$HOME_DIR/.config" || return 1 ;;
+  esac
+  display_state_directory_safe "$path" || return 1
+  if ! rm -rf -- "$path"; then
+    echo "openbot-display: failed to remove unpublished display state: ${path}" >&2
+    return 1
+  fi
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    echo "openbot-display: unpublished display state survived cleanup: ${path}" >&2
+    return 1
+  fi
+}
+
+discard_display() {
+  local n="$1"
+  discard_directories_safe "$n" || return 1
+  discard_x_state_safe "$n" || return 1
+  discard_pinchtab "$n" || return 1
+  stop_chrome "$n" || return 1
+  discard_x_state "$n" || return 1
+  remove_discarded_directory "$(profile_dir "$n")" || return 1
+  remove_discarded_directory "$(config_dir "$n")" || return 1
+  remove_discarded_directory "$(pinchtab_dir "$n")" || return 1
+}
+
 stop_display() {
   local n="$1"
   local result=0
@@ -1246,7 +1432,7 @@ stop_display() {
   fi
   if [[ "$n" =~ ^[2-8]$ ]]; then
     su -s /bin/bash "$USER_NAME" -c "vncserver -kill :${n}" 2>/dev/null || true
-    if ! rm -f "/tmp/.X${n}-lock" "/tmp/.X11-unix/X${n}"; then
+    if ! rm -f "$(x_lock_file "$n")" "$(x_socket_file "$n")"; then
       echo "openbot-display: failed to remove X state for display :${n}" >&2
       result=1
     fi
@@ -1257,8 +1443,10 @@ stop_display() {
 start_display() {
   local n="$1"
   local ws_port=$((6900 + n))
-  local x_lock="/tmp/.X${n}-lock"
-  local x_socket="/tmp/.X11-unix/X${n}"
+  local x_lock
+  local x_socket
+  x_lock="$(x_lock_file "$n")"
+  x_socket="$(x_socket_file "$n")"
   if [ -e "$x_lock" ]; then
     local x_pid
     x_pid="$(awk 'NR == 1 { print $1 }' "$x_lock" 2>/dev/null || true)"
@@ -1292,6 +1480,9 @@ case "$CMD" in
   stop)
     with_cookie_lock stop_display "$N"
     ;;
+  discard)
+    with_cookie_lock discard_display "$N"
+    ;;
   seed)
     seed_display "$N"
     ;;
@@ -1311,7 +1502,7 @@ case "$CMD" in
     pinchtab_supervise "$N"
     ;;
   *)
-    echo "usage: openbot-display start <n> | stop <n> | seed <n> | cookies-in <n> | cookies-out <n> | cookies-clear <n> | pinchtab <n>" >&2
+    echo "usage: openbot-display start <n> | stop <n> | discard <n> | seed <n> | cookies-in <n> | cookies-out <n> | cookies-clear <n> | pinchtab <n>" >&2
     exit 1
     ;;
 esac
