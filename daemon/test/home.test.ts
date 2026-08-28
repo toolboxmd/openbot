@@ -599,10 +599,12 @@ describe("BotStore sqlite is the only Transcript", () => {
       bothPrepared = resolve;
     });
     const reservedIds: string[] = [];
+    const requestedDisplays: Array<number | undefined> = [];
     class GatedComputer extends MemoryComputerRuntime {
-      override reserve(botId: string) {
+      override reserve(botId: string, requestedDisplay?: number) {
         reservedIds.push(botId);
-        return super.reserve(botId);
+        requestedDisplays.push(requestedDisplay);
+        return super.reserve(botId, requestedDisplay);
       }
 
       override async prepare(botId: string) {
@@ -619,6 +621,7 @@ describe("BotStore sqlite is the only Transcript", () => {
     await bothAtPreparation;
     assert.deepEqual(store.list(), [], "reserved Bots became usable before commit");
     assert.equal(reservedIds.length, 2);
+    assert.deepEqual(requestedDisplays.sort(), [1, 2]);
     assert.equal(computer.display(reservedIds[0]!), undefined);
     assert.equal(computer.display(reservedIds[1]!), undefined);
 
@@ -968,7 +971,7 @@ describe("BotStore sqlite is the only Transcript", () => {
     store.close();
   });
 
-  test("persisted display prepare failure uses committed release instead of provisioning discard", async () => {
+  test("persisted display attachment failure settles unavailable and uses committed release instead of discard", async () => {
     const homeDir = await tempHome();
     const seeded = new BotStore(homeDir, {
       computer: new MemoryComputerRuntime({ cookiesDir: join(homeDir, "cookies-seed") }),
@@ -992,7 +995,14 @@ describe("BotStore sqlite is the only Transcript", () => {
     });
     const restarted = new BotStore(homeDir, { computer });
     try {
-      await assert.rejects(restarted.reattachDisplays(), /controlled persisted prepare failure/i);
+      await restarted.reattachDisplays();
+      assert.deepEqual(
+        restarted.list().map((bot) => [bot.name, bot.display, bot.screenState, bot.screenError?.stage]),
+        [
+          ["Ada", 1, "unavailable", "readiness"],
+          ["Bob", 2, "unavailable", "prepare"],
+        ],
+      );
       assert.deepEqual(
         dockerCalls.filter((args) => args.includes(DISPLAY_BIN)),
         [
@@ -1000,6 +1010,7 @@ describe("BotStore sqlite is the only Transcript", () => {
           ["exec", COMPUTER_CONTAINER, DISPLAY_BIN, "stop", "2"],
         ],
       );
+      assert.equal(dockerCalls.some((args) => args.includes("discard")), false);
     } finally {
       restarted.close();
     }

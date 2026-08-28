@@ -4,9 +4,10 @@ import fsSync from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import path from "node:path";
-import { BotStore, type BotStoreDeps } from "./bots.ts";
+import { BotStore, type BotScreenRuntimeState, type BotStoreDeps } from "./bots.ts";
 import { defaultHomeDir, defaultWorkspaceDir } from "./home.ts";
 import { NoopComputerRuntime, type ComputerRuntime } from "./computer.ts";
+import { isGeneratedBotId } from "./harness-home.ts";
 import { KasmWriteOwnership, kasmUpdateWrite } from "./kasm.ts";
 
 export type BoxOptions = {
@@ -48,6 +49,23 @@ const DEFAULT_SCREEN_PROXY_DEADLINES: ScreenProxyDeadlines = {
 };
 const SCREEN_READINESS_MAX_BYTES = 128 * 1024;
 const SCREEN_READINESS_TIMEOUT_MS = 750;
+
+function sameScreenRuntime(
+  left: BotScreenRuntimeState | null,
+  right: BotScreenRuntimeState | null,
+): boolean {
+  if (!left || !right) return left === right;
+  return left.id === right.id
+    && left.computerOwnership === right.computerOwnership
+    && left.display === right.display
+    && left.screenState === right.screenState
+    && left.screenAttempt === right.screenAttempt
+    && left.screenError?.stage === right.screenError?.stage
+    && left.screenError?.code === right.screenError?.code
+    && left.screenError?.message === right.screenError?.message
+    && left.screenCleanupError?.code === right.screenCleanupError?.code
+    && left.screenCleanupError?.message === right.screenCleanupError?.message;
+}
 
 const MIME: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
@@ -112,6 +130,16 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
+async function readJsonObjectBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readBody(req);
+  if (!raw) throw new Error("request body must be a JSON object");
+  const body: unknown = JSON.parse(raw);
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new Error("request body must be a JSON object");
+  }
+  return body as Record<string, unknown>;
+}
+
 function sendJson(
   res: http.ServerResponse,
   status: number,
@@ -139,7 +167,7 @@ function isScreenPath(pathname: string): boolean {
 function parseScreenPath(
   pathname: string,
   isBotId: (id: string) => boolean,
-): { botId: string | null; rest: string } {
+): { botId: string | null; rest: string; unknownBotId?: string } {
   if (pathname === SCREEN_PREFIX || pathname === `${SCREEN_PREFIX}/`) {
     return { botId: null, rest: "/" };
   }
@@ -152,6 +180,9 @@ function parseScreenPath(
   if (first === "websockify") return { botId: null, rest: `/${rest}` };
   // Kasm 1.5 serves hashed UI under /assets. Only a real Bot id is a display prefix.
   if (isBotId(first)) return { botId: first, rest: tail || "/" };
+  if (isGeneratedBotId(first.toLowerCase())) {
+    return { botId: null, rest: "/", unknownBotId: first };
+  }
   return { botId: null, rest: `/${rest}` };
 }
 
@@ -687,20 +718,20 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
     workspaceDir,
   });
   try {
-    await store.reattachDisplays();
+    await store.recoverBotProvisionings();
   } catch (error) {
     store.close();
     throw error;
   }
 
-  function upstreamFor(botId: string | null): string | undefined {
-    if (botId && computer.upstream(botId)) return computer.upstream(botId);
+  function runtimeUpstreamFor(botId: string | null): string | undefined {
+    if (botId) return computer.display(botId)?.upstream;
     return computer.computerUpstream() ?? options.screenUpstream;
   }
 
   async function applyKasmWrite(botId: string | null, write: boolean): Promise<void> {
     if (!options.kasmUser || options.kasmPassword === undefined) return;
-    const upstream = upstreamFor(botId);
+    const upstream = runtimeUpstreamFor(botId);
     if (!upstream) throw new Error("Kasm write endpoint is unavailable");
     await kasmUpdateWrite({
       upstream,
@@ -715,22 +746,67 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
     update: (target, write) =>
       applyKasmWrite(target === ROOT_COMPUTER_TARGET ? null : target, write),
     publish: (target, state) => {
-      if (target === ROOT_COMPUTER_TARGET || !store.get(target)) return;
-      store.setComputerOwnership(target, state.authority);
+      if (target === ROOT_COMPUTER_TARGET || !store.screenRuntime(target)) return;
+      store.publishComputerOwnership(target, state.authority);
     },
   });
-  const existingBotIds = store.list().map((bot) => bot.id);
+  async function registerScreen(botId: string): Promise<"view-only"> {
+    const state = await writeOwnership.register(botId);
+    if (state.authority !== "view-only") {
+      throw Object.assign(new Error("Screen ownership registration was not confirmed view-only"), {
+        status: 503,
+        code: "SCREEN_OWNERSHIP_FAILED",
+      });
+    }
+    return state.authority;
+  }
+  function forgetReleasedScreen(botId: string): void {
+    writeOwnership.forgetReleased(botId);
+  }
+  const existingScreens = store.listScreenRuntimes();
+  const attachedBotIds = existingScreens
+    .filter((screen) => screen.screenState === "ready" && computer.display(screen.id) !== undefined)
+    .map((screen) => screen.id);
   await writeOwnership.reconcile(
-    existingBotIds.length > 0 ? existingBotIds : [ROOT_COMPUTER_TARGET],
+    existingScreens.length > 0 ? attachedBotIds : [ROOT_COMPUTER_TARGET],
   );
+
+  function rootRuntimeScreen() {
+    const rootUpstream = runtimeUpstreamFor(null);
+    if (!rootUpstream) return null;
+    return store.listScreenRuntimes().find(
+      (screen) => computer.display(screen.id)?.upstream === rootUpstream,
+    ) ?? null;
+  }
 
   function ownershipTarget(botId: string | null): string {
     if (botId) return botId;
-    const rootUpstream = upstreamFor(null);
-    const firstDisplay = rootUpstream
-      ? store.list().find((bot) => upstreamFor(bot.id) === rootUpstream)
-      : undefined;
-    return firstDisplay?.id ?? ROOT_COMPUTER_TARGET;
+    return rootRuntimeScreen()?.id ?? ROOT_COMPUTER_TARGET;
+  }
+
+  function upstreamFor(botId: string | null): string | undefined {
+    const runtimeUpstream = runtimeUpstreamFor(botId);
+    if (!runtimeUpstream) return undefined;
+    if (botId) {
+      const screen = store.screenRuntime(botId);
+      if (
+        screen?.screenState !== "ready"
+        || writeOwnership.state(botId).authority === "unknown"
+      ) return undefined;
+      return runtimeUpstream;
+    }
+    const rootScreen = rootRuntimeScreen();
+    if (rootScreen) {
+      if (
+        rootScreen.screenState !== "ready"
+        || writeOwnership.state(rootScreen.id).authority === "unknown"
+      ) return undefined;
+      return runtimeUpstream;
+    }
+    if (store.listScreenRuntimes().length > 0) return undefined;
+    return writeOwnership.state(ROOT_COMPUTER_TARGET).authority === "unknown"
+      ? undefined
+      : runtimeUpstream;
   }
 
   function computerOwnership(botId: string | null) {
@@ -745,6 +821,51 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       viewOnly: known ? !write : null,
       zoom: write,
     };
+  }
+
+  function computerSnapshot(botId: string | null) {
+    return {
+      screen: botId ? store.screenRuntime(botId) : rootRuntimeScreen(),
+      upstream: upstreamFor(botId),
+      ownership: computerOwnership(botId),
+    };
+  }
+
+  function computerStatePayload(
+    botId: string | null,
+    snapshot: ReturnType<typeof computerSnapshot>,
+    readiness: ScreenReadiness,
+    exposeUpstream: boolean,
+  ) {
+    const upstream = exposeUpstream ? snapshot.upstream : undefined;
+    const screen = snapshot.screen;
+    const pathFor = botId ? `${SCREEN_PREFIX}/${botId}/` : `${SCREEN_PREFIX}/`;
+    return {
+      path: upstream ? pathFor : null,
+      reachable: Boolean(upstream) && readiness.reachable,
+      ready: Boolean(upstream) && readiness.ready,
+      botId,
+      screenState: screen?.screenState ?? (upstream ? "ready" : "unavailable"),
+      screenAttempt: screen?.screenAttempt ?? null,
+      screenError: screen?.screenError ?? null,
+      screenCleanupError: screen?.screenCleanupError ?? null,
+      ...snapshot.ownership,
+      display: screen?.display ?? (upstream ? 1 : null),
+      container: computer.containerName(),
+      cookieJar: computer.cookieJar(),
+    };
+  }
+
+  async function computerState(botId: string | null) {
+    const before = computerSnapshot(botId);
+    const readiness = await screenReadiness(before.upstream, auth);
+    const after = computerSnapshot(botId);
+    const stable = before.upstream === after.upstream
+      && sameScreenRuntime(before.screen, after.screen)
+      && before.ownership.ownership === after.ownership.ownership
+      && before.ownership.ownershipError === after.ownership.ownershipError
+      && before.ownership.ownershipEpoch === after.ownership.ownershipEpoch;
+    return computerStatePayload(botId, after, readiness, stable);
   }
 
   type ConnectionState = {
@@ -1185,6 +1306,53 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
         }
       }
 
+      if (url.pathname === "/api/computer/retry" && method === "POST") {
+        if (!hasSession(req, key)) {
+          sendJson(res, 401, { error: "unauthenticated" });
+          return;
+        }
+        let body: Record<string, unknown>;
+        try {
+          body = await readJsonObjectBody(req);
+        } catch {
+          sendJson(res, 400, { error: "invalid json" });
+          return;
+        }
+        if (typeof body.botId !== "string" || body.botId.length === 0 || body.botId.length > 128) {
+          sendJson(res, 400, { error: "invalid Bot id" });
+          return;
+        }
+        if (
+          typeof body.screenAttempt !== "string"
+          || body.screenAttempt.length === 0
+          || body.screenAttempt.length > 128
+        ) {
+          sendJson(res, 400, { error: "invalid Screen attempt" });
+          return;
+        }
+        try {
+          store.retryScreen(
+            body.botId,
+            body.screenAttempt,
+            registerScreen,
+            forgetReleasedScreen,
+          );
+          sendJson(
+            res,
+            202,
+            computerStatePayload(
+              body.botId,
+              computerSnapshot(body.botId),
+              { reachable: false, ready: false },
+              false,
+            ),
+          );
+        } catch (err) {
+          sendStoreError(res, err);
+        }
+        return;
+      }
+
       if (url.pathname === "/api/computer/zoom" && method === "POST") {
         if (!hasSession(req, key)) {
           sendJson(res, 401, { error: "unauthenticated" });
@@ -1213,44 +1381,49 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
           expectedEpoch = body.ownershipEpoch;
         }
         try {
-          if (botId && !store.get(botId)) {
+          if (botId && !store.screenRuntime(botId)) {
             sendJson(res, 404, { error: "Bot not found" });
             return;
           }
           const selectedBotId = botId || null;
+          const selectedScreen = selectedBotId ? store.screenRuntime(selectedBotId) : null;
+          if (selectedScreen && selectedScreen.screenState !== "ready") {
+            const state = await computerState(selectedBotId);
+            if (zoom) {
+              sendJson(res, 409, {
+                error: "Screen is not ready.",
+                code: selectedScreen.screenState === "cleanup-required"
+                  ? "SCREEN_CLEANUP_REQUIRED"
+                  : selectedScreen.screenState === "unassigned"
+                  ? "SCREEN_UNASSIGNED"
+                  : selectedScreen.screenState === "attaching"
+                  ? "SCREEN_ATTACHING"
+                  : "SCREEN_UNAVAILABLE",
+                ...state,
+              });
+            } else {
+              sendJson(res, 200, state);
+            }
+            return;
+          }
           await writeOwnership.transition(
             ownershipTarget(selectedBotId),
             zoom,
             expectedEpoch,
           );
-          const bot = selectedBotId ? store.get(selectedBotId) : null;
-          const upstream = upstreamFor(selectedBotId);
-          const readiness = await screenReadiness(upstream, auth);
-          sendJson(res, 200, {
-            ...(bot ?? {}),
-            path: selectedBotId ? `${SCREEN_PREFIX}/${selectedBotId}/` : `${SCREEN_PREFIX}/`,
-            reachable: Boolean(upstream) && readiness.reachable,
-            ready: Boolean(upstream) && readiness.ready,
-            botId: selectedBotId,
-            ...computerOwnership(selectedBotId),
-            container: computer.containerName(),
-          });
+          sendJson(res, 200, await computerState(selectedBotId));
         } catch (err) {
           const status = typeof (err as { status?: unknown })?.status === "number"
             ? (err as { status: number }).status
             : 500;
           const message = err instanceof Error ? err.message : "box error";
           const selectedBotId = botId || null;
-          const upstream = upstreamFor(selectedBotId);
-          const readiness = await screenReadiness(upstream, auth);
+          const state = await computerState(selectedBotId);
+          const code = (err as { code?: unknown })?.code;
           sendJson(res, status, {
             error: message,
-            path: selectedBotId ? `${SCREEN_PREFIX}/${selectedBotId}/` : `${SCREEN_PREFIX}/`,
-            reachable: Boolean(upstream) && readiness.reachable,
-            ready: Boolean(upstream) && readiness.ready,
-            botId: selectedBotId,
-            ...computerOwnership(selectedBotId),
-            container: computer.containerName(),
+            ...(typeof code === "string" ? { code } : {}),
+            ...state,
           });
         }
         return;
@@ -1262,25 +1435,13 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
           return;
         }
         const requested = url.searchParams.get("botId");
-        const bot = requested ? store.get(requested) : null;
-        if (requested && !bot) {
+        const screen = requested ? store.screenRuntime(requested) : null;
+        if (requested && !screen) {
           sendJson(res, 404, { error: "Bot not found" });
           return;
         }
-        const botId = bot?.id ?? null;
-        const upstream = upstreamFor(botId);
-        const pathFor = botId ? `${SCREEN_PREFIX}/${botId}/` : `${SCREEN_PREFIX}/`;
-        const readiness = await screenReadiness(upstream, auth);
-        sendJson(res, 200, {
-          path: upstream ? pathFor : pathFor,
-          reachable: Boolean(upstream) && readiness.reachable,
-          ready: Boolean(upstream) && readiness.ready,
-          botId,
-          ...computerOwnership(botId),
-          display: bot?.display ?? (upstream ? 1 : null),
-          container: computer.containerName(),
-          cookieJar: computer.cookieJar(),
-        });
+        const botId = screen?.id ?? null;
+        sendJson(res, 200, await computerState(botId));
         return;
       }
 
@@ -1294,7 +1455,11 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
           sendJson(res, 401, { error: "unauthenticated" });
           return;
         }
-        const parsed = parseScreenPath(url.pathname, (id) => store.get(id) != null);
+        const parsed = parseScreenPath(url.pathname, (id) => store.screenRuntime(id) != null);
+        if (parsed.unknownBotId) {
+          sendJson(res, 404, { error: "Bot not found" });
+          return;
+        }
         const destBase = upstreamFor(parsed.botId);
         if (!destBase) {
           sendJson(res, 503, { error: "Computer is not up" });
@@ -1341,7 +1506,12 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       socket.destroy();
       return;
     }
-    const parsed = parseScreenPath(url.pathname, (id) => store.get(id) != null);
+    const parsed = parseScreenPath(url.pathname, (id) => store.screenRuntime(id) != null);
+    if (parsed.unknownBotId) {
+      socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
     const destBase = upstreamFor(parsed.botId);
     if (!destBase) {
       socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
@@ -1363,10 +1533,12 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
   }
 
   const hostname = host === "0.0.0.0" ? "127.0.0.1" : host;
+  void store.reattachDisplays(registerScreen, forgetReleasedScreen).catch(() => undefined);
   let closeResult: Promise<void> | null = null;
   function close(): Promise<void> {
     if (closeResult) return closeResult;
     closing = true;
+    const attachmentsStopped = store.stopScreenAttachments();
     const serverClosed = new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
     });
@@ -1374,9 +1546,15 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       if (state.phase === "upgrade" || state.activeResponses === 0) socket.destroy();
     }
     closeResult = (async () => {
+      let attachmentFailure: unknown = null;
       let ownershipFailure: unknown = null;
       let serverFailure: unknown = null;
       let storeFailure: unknown = null;
+      try {
+        await attachmentsStopped;
+      } catch (error) {
+        attachmentFailure = error;
+      }
       try {
         await writeOwnership.shutdown();
       } catch (error) {
@@ -1392,7 +1570,7 @@ export async function startBox(options: BoxOptions): Promise<RunningBox> {
       } catch (error) {
         storeFailure = error;
       }
-      const failures = [ownershipFailure, serverFailure, storeFailure]
+      const failures = [attachmentFailure, ownershipFailure, serverFailure, storeFailure]
         .filter((error): error is NonNullable<unknown> => error !== null);
       if (failures.length === 1) throw failures[0];
       if (failures.length > 1) {

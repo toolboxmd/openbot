@@ -16,7 +16,7 @@ import {
   type HostGrantDuration,
 } from "./harness-home.ts";
 
-export const HOME_SCHEMA_VERSION = 3;
+export const HOME_SCHEMA_VERSION = 4;
 export const HUMAN_MEMBER_ID = "you";
 const BOT_DISPLAY_MAX = 8;
 
@@ -159,12 +159,47 @@ export class HomeStore {
     }));
   }
 
-  botDisplay(botId: string): number | undefined {
+  botDisplay(botId: string): number | null | undefined {
     assertGeneratedBotId(botId);
     const row = this.db.prepare("SELECT display FROM bots WHERE id = ?").get(botId) as SqlRow | undefined;
     if (!row) return undefined;
+    if (row.display === null) return null;
     if (!isBotDisplay(row.display)) throw invalidPersistedBotDisplayError();
     return row.display;
+  }
+
+  botIdForDisplay(display: number): string | null {
+    if (!isBotDisplay(display)) throw new Error("Bot display is invalid");
+    const row = this.db.prepare("SELECT id FROM bots WHERE display = ?").get(display) as SqlRow | undefined;
+    return typeof row?.id === "string" ? row.id : null;
+  }
+
+  availableBotDisplays(): number[] {
+    const used = new Set(
+      (this.db.prepare("SELECT display FROM bots WHERE display IS NOT NULL").all() as SqlRow[])
+        .map((row) => row.display)
+        .filter(isBotDisplay),
+    );
+    return Array.from({ length: BOT_DISPLAY_MAX }, (_, index) => index + 1)
+      .filter((display) => !used.has(display));
+  }
+
+  claimBotDisplay(botId: string, display: number): void {
+    assertGeneratedBotId(botId);
+    if (!isBotDisplay(display)) throw new Error("Bot display is invalid");
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT display FROM bots WHERE id = ?").get(botId) as SqlRow | undefined;
+      if (!row) throw Object.assign(new Error("Bot not found"), { status: 404 });
+      if (row.display !== null) {
+        throw Object.assign(new Error("Bot already has a Screen display assignment"), { status: 409 });
+      }
+      const changed = this.db
+        .prepare("UPDATE bots SET display = ? WHERE id = ? AND display IS NULL")
+        .run(display, botId);
+      if (changed.changes !== 1) {
+        throw Object.assign(new Error("Bot Screen display assignment changed"), { status: 409 });
+      }
+    });
   }
 
   beginBotProvisioning(botId: string): void {
@@ -185,6 +220,28 @@ export class HomeStore {
     }
     const changed = this.db.prepare("UPDATE bot_provisioning SET display = ? WHERE bot_id = ?").run(display, botId);
     if (changed.changes !== 1) throw new Error("Bot provisioning state is missing");
+  }
+
+  claimBotProvisioningDisplay(botId: string): number {
+    assertGeneratedBotId(botId);
+    let claimedDisplay: number | undefined;
+    this.transaction(() => {
+      const provisioning = this.db
+        .prepare("SELECT display FROM bot_provisioning WHERE bot_id = ?")
+        .get(botId) as SqlRow | undefined;
+      if (!provisioning) throw new Error("Bot provisioning state is missing");
+      if (isBotDisplay(provisioning.display)) {
+        claimedDisplay = provisioning.display;
+        return;
+      }
+      if (provisioning.display !== null) throw new Error("Bot provisioning display is invalid");
+      claimedDisplay = this.nextBotDisplay();
+      const changed = this.db
+        .prepare("UPDATE bot_provisioning SET display = ? WHERE bot_id = ? AND display IS NULL")
+        .run(claimedDisplay, botId);
+      if (changed.changes !== 1) throw new Error("Bot provisioning display changed");
+    });
+    return claimedDisplay!;
   }
 
   setBotProvisioningWorkspaceOwned(botId: string, owned: boolean): void {
@@ -511,6 +568,10 @@ export class HomeStore {
       throw newerSchemaError(version);
     }
     if (version === HOME_SCHEMA_VERSION) return;
+    if (version === 3) {
+      this.migrateVersionThree();
+      return;
+    }
 
     this.transaction(() => {
       if (version === 0) {
@@ -522,7 +583,7 @@ export class HomeStore {
           shape TEXT NOT NULL,
           harness TEXT,
           config_mode TEXT NOT NULL DEFAULT 'isolated',
-          display INTEGER NOT NULL CHECK (display BETWEEN 1 AND 8),
+          display INTEGER CHECK (display BETWEEN 1 AND 8),
           created_at TEXT NOT NULL
         );
 
@@ -638,17 +699,61 @@ export class HomeStore {
         `);
         const persistedBots = this.db.prepare("SELECT id FROM bots ORDER BY rowid").all() as SqlRow[];
         const setDisplay = this.db.prepare("UPDATE bots SET display = ? WHERE id = ?");
-        persistedBots.forEach((row, index) => setDisplay.run(index + 1, String(row.id)));
+        persistedBots.slice(0, BOT_DISPLAY_MAX).forEach((row, index) => {
+          setDisplay.run(index + 1, String(row.id));
+        });
         this.db.exec("CREATE UNIQUE INDEX bots_display_unique ON bots(display);");
       }
       this.db.exec(`PRAGMA user_version = ${HOME_SCHEMA_VERSION};`);
     });
   }
 
+  private migrateVersionThree(): void {
+    this.db.exec("PRAGMA foreign_keys = OFF;");
+    try {
+      const foreignKeys = this.db.prepare("PRAGMA foreign_keys").get() as { foreign_keys?: unknown } | undefined;
+      if (foreignKeys?.foreign_keys !== 0) {
+        throw new Error("Home schema migration could not suspend foreign-key enforcement");
+      }
+      this.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE bots_v4_migration (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            color TEXT NOT NULL,
+            shape TEXT NOT NULL,
+            harness TEXT,
+            config_mode TEXT NOT NULL DEFAULT 'isolated',
+            display INTEGER CHECK (display BETWEEN 1 AND 8),
+            created_at TEXT NOT NULL
+          );
+
+          INSERT INTO bots_v4_migration
+            (id, name, color, shape, harness, config_mode, display, created_at)
+          SELECT id, name, color, shape, harness, config_mode, display, created_at
+          FROM bots;
+
+          DROP TABLE bots;
+          ALTER TABLE bots_v4_migration RENAME TO bots;
+          CREATE UNIQUE INDEX bots_display_unique ON bots(display);
+        `);
+        const violations = this.db.prepare("PRAGMA foreign_key_check").all();
+        if (violations.length > 0) {
+          throw new Error("Home schema migration would break persisted relationships");
+        }
+        this.db.exec(`PRAGMA user_version = ${HOME_SCHEMA_VERSION};`);
+      });
+    } finally {
+      this.db.exec("PRAGMA foreign_keys = ON;");
+    }
+  }
+
   private assertPersistedBotIds(): void {
     const rows = this.db.prepare("SELECT id, display FROM bots").all() as SqlRow[];
     if (rows.some((row) => !isGeneratedBotId(row.id))) throw invalidPersistedBotIdError();
-    if (rows.some((row) => !isBotDisplay(row.display))) throw invalidPersistedBotDisplayError();
+    if (rows.some((row) => row.display !== null && !isBotDisplay(row.display))) {
+      throw invalidPersistedBotDisplayError();
+    }
     const provisioning = this.db.prepare("SELECT bot_id FROM bot_provisioning").all() as SqlRow[];
     if (provisioning.some((row) => !isGeneratedBotId(row.bot_id))) throw invalidPersistedBotIdError();
   }
@@ -704,7 +809,11 @@ export class HomeStore {
 
   private nextBotDisplay(): number {
     const used = new Set(
-      (this.db.prepare("SELECT display FROM bots").all() as SqlRow[])
+      (this.db.prepare(`
+        SELECT display FROM bots WHERE display IS NOT NULL
+        UNION ALL
+        SELECT display FROM bot_provisioning WHERE display IS NOT NULL
+      `).all() as SqlRow[])
         .map((row) => row.display)
         .filter(isBotDisplay),
     );

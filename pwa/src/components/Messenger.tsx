@@ -228,6 +228,47 @@ function HoverActions({
   );
 }
 
+export function ComputerPreview({
+  expanded,
+  onOpen,
+  children,
+}: {
+  expanded: boolean;
+  onOpen: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      data-testid={expanded ? "computer-expanded" : "computer-preview"}
+      className={cn(
+        "overflow-hidden bg-black",
+        expanded
+          ? "fixed inset-0 z-50"
+          : "group relative isolate h-40 rounded-2xl sm:h-auto sm:aspect-video",
+      )}
+    >
+      {children}
+      {expanded ? null : (
+        <button
+          type="button"
+          data-testid="open-computer-preview"
+          aria-label="Open Computer"
+          onClick={onOpen}
+          className="absolute inset-0 z-30 flex cursor-pointer items-center justify-center bg-transparent"
+        >
+          <span className="pointer-events-none absolute right-2 top-2 inline-flex size-7 items-center justify-center rounded-full bg-black/60 text-white shadow">
+            <Maximize2 className="size-3.5" />
+          </span>
+          <span className="pointer-events-none inline-flex items-center gap-2 rounded-full bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground shadow-lg opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+            <Maximize2 className="size-4" />
+            Open
+          </span>
+        </button>
+      )}
+    </div>
+  );
+}
+
 export function Messenger() {
   const [draft, setDraft] = useState("");
   const [nameDraft, setNameDraft] = useState("");
@@ -577,7 +618,10 @@ export function Messenger() {
   }
 
   return (
-    <div data-testid="messenger" className="flex h-full min-h-0 bg-background">
+    <div
+      data-testid="messenger"
+      className="flex h-full min-h-0 w-full max-w-full overflow-x-hidden bg-background sm:overflow-x-visible"
+    >
       <aside className="flex w-64 shrink-0 flex-col bg-sidebar text-sidebar-foreground">
         <div className="flex items-center gap-3 px-4 py-4">
           <Eyes size={32} className="aspect-square shrink-0" />
@@ -740,7 +784,7 @@ export function Messenger() {
         </div>
       </aside>
       <Separator orientation="vertical" />
-      <section className="flex min-w-0 flex-1 flex-col">
+      <section className="flex min-w-0 flex-1 flex-col overflow-x-auto sm:overflow-x-visible">
         <header className="flex h-14 items-center justify-between gap-3 px-6">
           <h1 className="truncate text-sm font-medium">
             {activeGroup ? groupDisplayTitle(activeGroup) : (active?.name ?? "Thread")}
@@ -980,7 +1024,7 @@ export function Messenger() {
         </form>
       </section>
       <Separator orientation="vertical" />
-      <aside className="flex w-72 shrink-0 flex-col bg-sidebar text-sidebar-foreground">
+      <aside className="flex w-32 shrink-0 flex-col bg-sidebar text-sidebar-foreground sm:w-72">
         <div className="flex h-14 items-center justify-between gap-2 px-4">
           <div className="flex min-w-0 items-center gap-2">
             <Monitor className="size-3.5 text-muted-foreground" />
@@ -1001,37 +1045,14 @@ export function Messenger() {
         </div>
         <Separator />
         <div className="p-3">
-          <div className={cn(!computerOpen && "relative aspect-video")}>
-            <div
-              data-testid={computerOpen ? "computer-expanded" : "computer-preview"}
-              className={cn(
-                "overflow-hidden bg-black",
-                computerOpen ? "fixed inset-0 z-50" : "group relative isolate aspect-video rounded-2xl",
-              )}
-            >
+          <div className={cn(!computerOpen && "relative h-40 sm:h-auto sm:aspect-video")}>
+            <ComputerPreview expanded={computerOpen} onOpen={openComputer}>
               <ComputerScreen
                 botId={activeId}
                 expanded={computerOpen}
                 onClose={() => setComputerOpen(false)}
               />
-              {computerOpen ? null : (
-                <button
-                  type="button"
-                  data-testid="open-computer-preview"
-                  aria-label="Open Computer"
-                  onClick={openComputer}
-                  className="absolute inset-0 z-30 flex cursor-pointer items-center justify-center bg-transparent"
-                >
-                  <span className="pointer-events-none absolute right-2 top-2 inline-flex size-7 items-center justify-center rounded-full bg-black/60 text-white shadow">
-                    <Maximize2 className="size-3.5" />
-                  </span>
-                  <span className="pointer-events-none inline-flex items-center gap-2 rounded-full bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground shadow-lg opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
-                    <Maximize2 className="size-4" />
-                    Open
-                  </span>
-                </button>
-              )}
-            </div>
+            </ComputerPreview>
           </div>
         </div>
       </aside>

@@ -1,7 +1,7 @@
 {
   "name": "openbot",
   "private": true,
-  "version": "0.9.11",
+  "version": "0.9.12",
   "type": "module",
   "description": "Self-hosted Grok Bot. Named Bots on one Computer.",
   "scripts": {

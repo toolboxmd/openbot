@@ -20,6 +20,19 @@ export async function unlock(password: string): Promise<{ ok: true } | { ok: fal
 
 export type EyesMode = "idle" | "think" | "work" | "write" | "needs-you" | "sleep";
 
+export type ScreenState = "attaching" | "ready" | "unavailable" | "unassigned" | "cleanup-required";
+
+export type ScreenError = {
+  stage: "reserve" | "prepare" | "readiness" | "commit" | "ownership";
+  code: string;
+  message: string;
+};
+
+export type ScreenCleanupError = {
+  code: "SCREEN_CLEANUP_FAILED";
+  message: string;
+};
+
 export type Bot = {
   id: string;
   name: string;
@@ -30,6 +43,10 @@ export type Bot = {
   zoom?: boolean;
   computerOwnership?: "view-only" | "write" | "unknown";
   display?: number | null;
+  screenState: ScreenState;
+  screenAttempt: string;
+  screenError: ScreenError | null;
+  screenCleanupError: ScreenCleanupError | null;
   permission: {
     title: string;
     description?: string;
@@ -250,9 +267,14 @@ export async function putThisBotAgents(botId: string, text: string): Promise<str
 }
 
 export type Computer = {
-  path: string;
+  path: string | null;
   ready: boolean;
+  reachable?: boolean;
   botId?: string | null;
+  screenState: ScreenState;
+  screenAttempt: string | null;
+  screenError: ScreenError | null;
+  screenCleanupError: ScreenCleanupError | null;
   ownership?: "view-only" | "write" | "unknown";
   ownershipError?: string | null;
   ownershipEpoch?: string;
@@ -262,6 +284,14 @@ export type Computer = {
   display?: number | null;
   container?: string;
 };
+
+export function screenCanRetry(computer: Computer): boolean {
+  return Boolean(
+    computer.botId
+      && computer.screenAttempt
+      && (computer.screenState === "unavailable" || computer.screenState === "unassigned"),
+  );
+}
 
 export type ComputerZoomOptions = {
   keepalive?: boolean;
@@ -304,6 +334,9 @@ export function computerCanWrite(
 ): boolean {
   return Boolean(
     expanded
+      && computer?.screenState === "ready"
+      && computer.ready === true
+      && typeof computer.path === "string"
       && computer?.ownership === "write"
       && computer.write === true
       && (computer.botId ?? null) === botId,
@@ -482,7 +515,11 @@ async function fetchComputer(botId?: string | null): Promise<Computer> {
   if (!res.ok) {
     throw new Error("session expired");
   }
-  return (await res.json()) as Computer;
+  const computer = (await res.json()) as Computer;
+  if ((computer.botId ?? null) !== (botId ?? null)) {
+    throw new Error("Computer response did not match the selected Bot.");
+  }
+  return computer;
 }
 
 export async function getComputer(botId?: string | null): Promise<Computer> {
@@ -490,6 +527,18 @@ export async function getComputer(botId?: string | null): Promise<Computer> {
   const computer = await fetchComputer(botId);
   computerOwnershipAuthority.observe(computer, observation);
   return computer;
+}
+
+export async function retryComputer(botId: string, screenAttempt: string): Promise<Computer> {
+  const res = await fetch("/api/computer/retry", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ botId, screenAttempt }),
+  });
+  const body = (await res.json().catch(() => ({}))) as Partial<Computer> & { error?: string };
+  if (!res.ok) throw new Error(body.error ?? "Could not retry Screen.");
+  return body as Computer;
 }
 
 async function requestComputerZoom(
@@ -523,7 +572,7 @@ async function requestComputerZoom(
     if (zoom && observation) computerOwnershipAuthority.observe(body, observation);
     else releaseResult = body;
     if (!res.ok) {
-      const computer = typeof body.path === "string" && typeof body.ready === "boolean"
+      const computer = (typeof body.path === "string" || body.path === null) && typeof body.ready === "boolean"
         ? (body as Computer)
         : null;
       throw new ComputerOwnershipTransitionError(
@@ -549,6 +598,12 @@ async function prepareComputerOwnershipGrant(botId: string | null): Promise<stri
     );
   }
   const computer = await fetchComputer(botId);
+  if (computer.screenState !== "ready" || computer.ready !== true || computer.path === null) {
+    throw new ComputerOwnershipTransitionError(
+      "Screen is not ready. Chat is still available.",
+      computer,
+    );
+  }
   const token = computerOwnershipAuthority.finishGrantPreflight(
     computer,
     preparation.observation,

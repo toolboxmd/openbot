@@ -72,9 +72,19 @@ export class KasmWriteOwnership {
   register(target: string): Promise<KasmWriteOwnershipState> {
     return this.serialize(async () => {
       const current = this.states.get(target);
-      if (current) return current;
+      if (current && current.authority !== "unknown") return current;
       return this.revoke(target);
     });
+  }
+
+  forgetReleased(target: string): void {
+    if (this.owner === target) {
+      throw Object.assign(
+        new Error(`Cannot forget ${target} while it is the current Computer write owner`),
+        { status: 503 },
+      );
+    }
+    this.states.delete(target);
   }
 
   transition(

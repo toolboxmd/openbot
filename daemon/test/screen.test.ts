@@ -121,6 +121,27 @@ async function waitForPidExit(pid: number, timeoutMs = 2_000): Promise<void> {
   throw new Error(`fixture process ${pid} survived cleanup`);
 }
 
+async function waitForComputerScreenState(
+  url: string,
+  cookie: string,
+  botId: string,
+  expected: string,
+): Promise<Record<string, unknown>> {
+  // Test-only contention margin for background persisted Screen recovery.
+  const deadline = Date.now() + 5_000;
+  let observed: Record<string, unknown> = {};
+  while (Date.now() < deadline) {
+    const response = await fetch(`${url}/api/computer?botId=${encodeURIComponent(botId)}`, {
+      headers: { cookie },
+    });
+    assert.equal(response.status, 200);
+    observed = (await response.json()) as Record<string, unknown>;
+    if (observed.screenState === expected) return observed;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Screen did not settle as ${expected}: ${JSON.stringify(observed)}`);
+}
+
 describe("Computer Screen HTTP", () => {
   let box: RunningBox;
   let stub: http.Server;
@@ -718,24 +739,28 @@ describe("Computer Screen readiness semantics", () => {
       assert.equal(list.status, 200);
       const body = (await list.json()) as { bots?: Array<{ id: string; display?: number }> };
       assert.deepEqual(body.bots?.map((bot) => ({ id: bot.id, display: bot.display })), [{ id: botId, display: 1 }]);
-      assert.equal(restartComputer.display(botId)?.display, 1);
-      assert.equal(restartComputer.upstream(botId), `http://127.0.0.1:${kasm.port}`);
-
-      const computer = await fetch(
-        `${restartedBox.url}/api/computer?botId=${encodeURIComponent(botId)}`,
-        { headers: { cookie } },
+      const state = await waitForComputerScreenState(
+        restartedBox.url,
+        cookie,
+        botId,
+        "unavailable",
       );
-      assert.equal(computer.status, 200);
-      const state = (await computer.json()) as {
-        display?: number;
-        path?: string;
-        reachable?: boolean;
-        ready?: boolean;
-      };
       assert.equal(state.display, 1);
-      assert.equal(state.path, `/screen/${botId}/`);
+      assert.equal(state.path, null);
       assert.equal(state.reachable, false);
       assert.equal(state.ready, false);
+      assert.equal(state.ownership, "unknown");
+      assert.deepEqual(state.screenError, {
+        stage: "readiness",
+        code: "SCREEN_NOT_READY",
+        message: "Screen application did not become ready.",
+      });
+      assert.equal(restartComputer.display(botId), undefined);
+      assert.equal(restartComputer.upstream(botId), `http://127.0.0.1:${kasm.port}`);
+      assert.equal(
+        (await fetch(`${restartedBox.url}/screen/${botId}/`, { headers: { cookie } })).status,
+        503,
+      );
     } finally {
       await restartedBox.close();
     }

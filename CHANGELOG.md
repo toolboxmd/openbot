@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.12] - 2026-08-28
+
+### Changed
+
+- Keep Talk available while persisted Screens recover, including truthful, reachable retry controls at phone widths and documented unavailable or unassigned recovery states
+
 ## [0.9.11] - 2026-08-28
 
 ### Changed
