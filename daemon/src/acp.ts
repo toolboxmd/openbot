@@ -137,6 +137,12 @@ function isJsonRpcEnvelope(message: Record<string, unknown>): boolean {
   return !hasError || isJsonRpcError(message.error);
 }
 
+function isResponseShaped(value: unknown): value is Record<string, unknown> {
+  return isObjectRecord(value)
+    && !hasOwn(value, "method")
+    && (hasOwn(value, "id") || hasOwn(value, "result") || hasOwn(value, "error"));
+}
+
 function hasValidAcpMethodRole(message: Record<string, unknown>): boolean {
   if (
     message.method === "session/request_permission"
@@ -186,15 +192,19 @@ type CallbackTask = {
   invoke: (() => AcpHandlerResult) | null;
   invocation: CallbackInvocation;
   options: CallbackFailureOptions;
+  dispatchBatch?: IncomingBatch;
+  running: boolean;
   resolve: () => void;
   settled: boolean;
 };
 
 type CallbackChain = {
   active: boolean;
-  running: boolean;
+  running: number;
   waiting: number;
   queue: CallbackTask[];
+  activeTasks: Set<CallbackTask>;
+  resumingBatchCallbacks: boolean;
   tail: Promise<void>;
   detached: Promise<void>;
   detach: () => void;
@@ -204,6 +214,7 @@ type CallbackChain = {
 type CallbackContext = {
   chain: CallbackChain;
   invocation: CallbackInvocation;
+  task: CallbackTask;
 };
 
 function callbackTransportError(options: CallbackFailureOptions = {}): Error {
@@ -285,6 +296,28 @@ type Pending = {
   settlementQueued?: boolean;
 };
 
+type BatchResponseSlot = {
+  index: number;
+  response: Record<string, unknown> | null;
+  commitFlushedState?: () => void;
+  applicationCallback?: () => AcpHandlerResult;
+  responseCallbackContext?: CallbackContext;
+  resolve?: () => void;
+  rejectWrite?: (error: Error) => void;
+};
+
+type IncomingBatch = {
+  responseSlots: BatchResponseSlot[];
+  pendingSettlements: Array<{
+    id: RpcId;
+    pending: Pending;
+    error: Error | null;
+    result: unknown;
+  }>;
+  dispatchComplete: boolean;
+  flushStarted: boolean;
+};
+
 type SessionAttachment = {
   requestId: RpcId;
   method: "session/new" | "session/load" | "session/resume";
@@ -294,6 +327,10 @@ type SessionAttachment = {
 type ActiveServerRequest = {
   kind: "permission" | "elicitation";
   generation: number;
+  batchResponse?: {
+    batch: IncomingBatch;
+    slot: BatchResponseSlot;
+  };
 };
 
 export type PermissionPrompt = {
@@ -560,9 +597,11 @@ export class AcpClient {
     const detached = new Promise<void>((resolve) => { detach = resolve; });
     return {
       active: true,
-      running: false,
+      running: 0,
       waiting: 0,
       queue: [],
+      activeTasks: new Set(),
+      resumingBatchCallbacks: false,
       tail: Promise.resolve(),
       detached,
       detach,
@@ -598,8 +637,16 @@ export class AcpClient {
       task.settled = true;
       task.resolve();
     }
-    chain.running = false;
+    if (task.running) {
+      task.running = false;
+      chain.activeTasks.delete(task);
+      chain.running -= 1;
+    }
     if (!chain.active || this.transportError || this.closed) return;
+    if (task.dispatchBatch && chain.running > 0) {
+      this.resumeBatchCallbacks(task.dispatchBatch);
+    }
+    if (chain.running > 0) return;
     const next = chain.queue.shift();
     if (next) this.runCallbackTask(chain, next);
   }
@@ -609,7 +656,9 @@ export class AcpClient {
       this.finishCallbackTask(chain, task);
       return;
     }
-    chain.running = true;
+    task.running = true;
+    chain.running += 1;
+    chain.activeTasks.add(task);
     const invoke = task.invoke;
     task.invoke = null;
     task.invocation.active = true;
@@ -618,6 +667,7 @@ export class AcpClient {
       result = this.callbackContext.run({
         chain,
         invocation: task.invocation,
+        task,
       }, () => invoke?.());
     } catch {
       chain.fail?.(task.options);
@@ -629,6 +679,7 @@ export class AcpClient {
       return;
     }
     chain.waiting += 1;
+    if (task.dispatchBatch) this.resumeBatchCallbacks(task.dispatchBatch);
     void Promise.resolve(result).then(
       () => {
         chain.waiting -= 1;
@@ -651,6 +702,7 @@ export class AcpClient {
       responseFlushed?: boolean;
       transportClosed?: boolean;
     } = {},
+    dispatchBatch?: IncomingBatch,
   ): Promise<void> {
     if (!callback) return Promise.resolve();
     if (options.cleanup) {
@@ -671,12 +723,14 @@ export class AcpClient {
       invoke: () => callback(...args),
       invocation: { active: false },
       options,
+      ...(dispatchBatch ? { dispatchBatch } : {}),
+      running: false,
       resolve: resolveTask,
       settled: false,
     };
     const work = Promise.race([taskDone, chain.detached]).then(() => undefined);
-    chain.tail = work;
-    if (chain.running) {
+    chain.tail = Promise.all([chain.tail, work]).then(() => undefined);
+    if (chain.running > 0) {
       chain.queue.push(task);
     } else {
       this.runCallbackTask(chain, task);
@@ -684,21 +738,76 @@ export class AcpClient {
     return work;
   }
 
+  private resumeBatchCallbacks(batch: IncomingBatch): void {
+    const chain = this.callbackChain;
+    if (
+      !batch.dispatchComplete
+      || !chain.active
+      || this.transportError
+      || this.closed
+      || chain.resumingBatchCallbacks
+      || ![...chain.activeTasks].some((task) => (
+        task.dispatchBatch === batch && task.invocation.active
+      ))
+    ) {
+      return;
+    }
+    chain.resumingBatchCallbacks = true;
+    try {
+      while (
+        chain.active
+        && !this.transportError
+        && !this.closed
+        && [...chain.activeTasks].some((task) => (
+          task.dispatchBatch === batch && task.invocation.active
+        ))
+        && chain.queue[0]?.dispatchBatch === batch
+      ) {
+        const next = chain.queue.shift();
+        if (next) this.runCallbackTask(chain, next);
+      }
+    } finally {
+      chain.resumingBatchCallbacks = false;
+    }
+  }
+
   private callbacksBeforeSettlement(): Promise<void> {
     const chain = this.callbackChain;
     return Promise.race([chain.tail, chain.detached]).then(() => undefined);
+  }
+
+  private activeCallbackTask(context: CallbackContext | undefined): CallbackTask | null {
+    if (
+      context?.chain !== this.callbackChain
+      || !context.chain.active
+      || !context.invocation.active
+      || !context.task.running
+      || !context.chain.activeTasks.has(context.task)
+    ) {
+      return null;
+    }
+    return context.task;
+  }
+
+  private markResponseFlushed(contexts: readonly CallbackContext[]): void {
+    for (const context of contexts) {
+      const task = this.activeCallbackTask(context);
+      if (task) task.options.responseFlushed = true;
+    }
   }
 
   private sendConfirmed(
     obj: unknown,
     commitFlushedState?: () => void,
     applicationCallback?: () => AcpHandlerResult,
+    responseCallbackContexts?: readonly CallbackContext[],
   ): Promise<void> {
     if (this.transportError) return Promise.reject(this.transportError);
     if (this.closed || this.child.stdin.destroyed) {
       return Promise.reject(new Error("ACP transport is closed"));
     }
     const responseCallbackContext = this.callbackContext.getStore();
+    const flushedCallbackContexts = responseCallbackContexts ?? [];
     return new Promise((resolve, reject) => {
       let settled = false;
       const rejectWrite = (error: Error) => {
@@ -721,6 +830,7 @@ export class AcpClient {
             this.failTransport(transportFailureError());
             return;
           }
+          this.markResponseFlushed(flushedCallbackContexts);
           const responseFlushCallback = applicationCallback ? Symbol() : null;
           if (responseFlushCallback) this.pendingResponseFlushCallbacks.add(responseFlushCallback);
           try {
@@ -747,11 +857,7 @@ export class AcpClient {
                 });
               }
             : undefined;
-          const responseFromActiveCallback = (
-            responseCallbackContext?.chain === this.callbackChain
-            && responseCallbackContext.chain.active
-            && responseCallbackContext.invocation.active
-          );
+          const responseFromActiveCallback = this.activeCallbackTask(responseCallbackContext) !== null;
           const callbackWork = responseFromActiveCallback && commitApplicationCallback
             ? this.invokeResponseCallbackInline(commitApplicationCallback)
             : this.invokeCallback(
@@ -1035,13 +1141,17 @@ export class AcpClient {
   }
 
   private chargeActiveTurnItem(): boolean {
+    return this.chargeActiveTurnItems(1);
+  }
+
+  private chargeActiveTurnItems(count: number): boolean {
     const ledger = this.activeTurnLedger;
     if (!ledger) return true;
-    if (ledger.items >= MAX_ACTIVE_TURN_ITEMS) {
+    if (count > MAX_ACTIVE_TURN_ITEMS - ledger.items) {
       this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
       return false;
     }
-    ledger.items += 1;
+    ledger.items += count;
     return true;
   }
 
@@ -1092,11 +1202,14 @@ export class AcpClient {
     return true;
   }
 
-  private hasActivePromptMessageWindow(): boolean {
+  private hasActivePromptMessageWindow(batch?: IncomingBatch): boolean {
     if (this.cancelledPromptDrain) return true;
     if (this.promptId === null || this.activeGen !== this.generation) return false;
     const pending = this.pending.get(this.promptId);
-    return pending !== undefined && !pending.settlementQueued;
+    return pending !== undefined && (
+      !pending.settlementQueued
+      || (batch !== undefined && !batch.dispatchComplete)
+    );
   }
 
   private claimServerRequest(
@@ -1123,7 +1236,10 @@ export class AcpClient {
       this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
       return false;
     }
-    this.activeServerRequests.set(rpcId, { kind, generation: this.activeGen });
+    this.activeServerRequests.set(rpcId, {
+      kind,
+      generation: this.activeGen,
+    });
     return true;
   }
 
@@ -1136,6 +1252,30 @@ export class AcpClient {
     if (active?.kind === kind && active.generation === generation) {
       this.activeServerRequests.delete(rpcId);
     }
+  }
+
+  private sendServerResponse(
+    rpcId: RpcId,
+    response: Record<string, unknown>,
+    commitFlushedState?: () => void,
+    applicationCallback?: () => AcpHandlerResult,
+  ): Promise<void> {
+    const batchResponse = this.activeServerRequests.get(rpcId)?.batchResponse;
+    const responseCallbackContext = this.callbackContext.getStore();
+    return batchResponse
+      ? this.completeBatchResponse(
+          batchResponse.batch,
+          batchResponse.slot,
+          response,
+          commitFlushedState,
+          applicationCallback,
+        )
+      : this.sendConfirmed(
+          response,
+          commitFlushedState,
+          applicationCallback,
+          responseCallbackContext ? [responseCallbackContext] : [],
+        );
   }
 
   private hasPendingPermission(generation: number): boolean {
@@ -1184,7 +1324,7 @@ export class AcpClient {
     const pending = this.pendingPermissions.get(rpcId);
     if (!pending || pending.responding) return;
     pending.responding = true;
-    void this.sendConfirmed({
+    void this.sendServerResponse(rpcId, {
       jsonrpc: "2.0",
       id: rpcId,
       result: { outcome: { outcome: "cancelled" } },
@@ -1207,7 +1347,8 @@ export class AcpClient {
       this.pendingComputerHelp.delete(rpcId);
       this.rememberTerminalElicitation(rpcId);
       if (respond && !this.transportError && !this.closed && !this.child.stdin.destroyed) {
-        void this.sendConfirmed(
+        void this.sendServerResponse(
+          rpcId,
           { jsonrpc: "2.0", id: rpcId, result: { action: "cancel" } },
           () => this.releaseServerRequest(rpcId, "elicitation", pending.generation),
         ).catch(() => undefined);
@@ -1283,7 +1424,7 @@ export class AcpClient {
       if (this.elicitationOverflowClosing) return;
       this.elicitationOverflowClosing = true;
     }
-    void this.sendConfirmed(response, () => {
+    void this.sendServerResponse(rpcId, response, () => {
       this.releaseServerRequest(rpcId, "elicitation", generation);
     }).then(
       () => { if (closeAfterResponse) this.close(); },
@@ -1291,7 +1432,7 @@ export class AcpClient {
     );
   }
 
-  private finishStreamingMessage(): Promise<void> {
+  private finishStreamingMessage(batch?: IncomingBatch): Promise<void> {
     if (!this.streaming) return Promise.resolve();
     this.streaming = false;
     const text = this.messageText;
@@ -1301,7 +1442,7 @@ export class AcpClient {
       callbackWork = this.invokeCallback((this.activeHandlers ?? this.handlers).onAssistant, [text, {
         done: true,
         ...(this.openMessageId ? { messageId: this.openMessageId } : {}),
-      }]);
+      }], {}, batch);
     }
     this.nonTextBoundary = false;
     return callbackWork;
@@ -1421,6 +1562,13 @@ export class AcpClient {
     this.stderrBuffer = Buffer.alloc(0);
   }
 
+  private malformedResponseClaimsPendingRequest(response: Record<string, unknown>): boolean {
+    return isRpcId(response.id) && (
+      this.pending.has(response.id)
+      || this.cancelledPromptDrain?.promptId === response.id
+    );
+  }
+
   private onLine(line: string): void {
     const trimmed = line.trim();
     if (!trimmed) return;
@@ -1431,15 +1579,187 @@ export class AcpClient {
       this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
       return;
     }
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    if (Array.isArray(parsed)) {
+      if (parsed.length === 0) {
+        this.send({
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32600, message: "Invalid Request" },
+        });
+        return;
+      }
+      if (!this.chargeActiveTurnItems(parsed.length)) return;
+      const batch: IncomingBatch = {
+        responseSlots: [],
+        pendingSettlements: [],
+        dispatchComplete: false,
+        flushStarted: false,
+      };
+      for (let index = 0; index < parsed.length; index += 1) {
+        const entry = parsed[index];
+        if (
+          isObjectRecord(entry)
+          && (hasOwn(entry, "result") || hasOwn(entry, "error"))
+          && !isJsonRpcEnvelope(entry)
+          && this.malformedResponseClaimsPendingRequest(entry)
+        ) {
+          this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+        } else if (isResponseShaped(entry)) {
+          if (isJsonRpcEnvelope(entry)) {
+            this.dispatchMessage(entry, batch, index);
+          }
+        } else if (
+          !isObjectRecord(entry)
+          || !isJsonRpcEnvelope(entry)
+          || !hasValidAcpMethodRole(entry)
+        ) {
+          const slot = this.batchResponseSlot(batch, index);
+          void this.completeBatchResponse(batch, slot, {
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: -32600, message: "Invalid Request" },
+          }).catch(() => undefined);
+        } else {
+          this.dispatchMessage(entry, batch, index);
+        }
+        if (this.transportError || this.closed) return;
+      }
+      batch.dispatchComplete = true;
+      this.resumeBatchCallbacks(batch);
+      if (this.transportError || this.closed) return;
+      for (const settlement of batch.pendingSettlements) {
+        this.settlePendingResponse(
+          settlement.id,
+          settlement.pending,
+          settlement.error,
+          settlement.result,
+        );
+      }
+      this.flushBatchResponses(batch);
+      return;
+    }
+    if (!isObjectRecord(parsed)) {
       this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
       return;
     }
-    const msg = parsed as Record<string, unknown>;
+    const msg = parsed;
     if (!isJsonRpcEnvelope(msg) || !hasValidAcpMethodRole(msg)) {
       this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
       return;
     }
+    this.dispatchMessage(msg);
+  }
+
+  private batchResponseSlot(batch: IncomingBatch, index: number): BatchResponseSlot {
+    const slot: BatchResponseSlot = { index, response: null };
+    batch.responseSlots.push(slot);
+    return slot;
+  }
+
+  private completeBatchResponse(
+    batch: IncomingBatch,
+    slot: BatchResponseSlot,
+    response: Record<string, unknown>,
+    commitFlushedState?: () => void,
+    applicationCallback?: () => AcpHandlerResult,
+  ): Promise<void> {
+    if (slot.response !== null) {
+      const error = new Error(ACP_PROTOCOL_ERROR_MESSAGE);
+      this.failTransport(error);
+      return Promise.reject(error);
+    }
+    slot.response = response;
+    slot.commitFlushedState = commitFlushedState;
+    slot.applicationCallback = applicationCallback;
+    slot.responseCallbackContext = this.callbackContext.getStore();
+    const responseFlushed = new Promise<void>((resolve, reject) => {
+      const rejectWrite = (error: Error) => {
+        this.pendingWriteRejectors.delete(rejectWrite);
+        reject(error);
+      };
+      slot.resolve = () => {
+        this.pendingWriteRejectors.delete(rejectWrite);
+        resolve();
+      };
+      slot.rejectWrite = rejectWrite;
+      this.pendingWriteRejectors.add(rejectWrite);
+    });
+    this.resumeBatchCallbacks(batch);
+    this.flushBatchResponses(batch);
+    return responseFlushed;
+  }
+
+  private flushBatchResponses(batch: IncomingBatch): void {
+    if (
+      batch.flushStarted
+      || !batch.dispatchComplete
+      || batch.responseSlots.length === 0
+      || batch.responseSlots.some((slot) => slot.response === null)
+      || this.transportError
+      || this.closed
+    ) {
+      return;
+    }
+    batch.flushStarted = true;
+    const slots = [...batch.responseSlots].sort((left, right) => left.index - right.index);
+    const callbacks = slots.flatMap((slot) => (
+      slot.applicationCallback ? [slot.applicationCallback] : []
+    ));
+    const responseCallbackContexts = slots.flatMap((slot) => (
+      slot.responseCallbackContext ? [slot.responseCallbackContext] : []
+    ));
+    const activeResponseContext = responseCallbackContexts.find((context) => (
+      this.activeCallbackTask(context) !== null
+    ));
+    const startWrite = () => this.sendConfirmed(
+      slots.map((slot) => slot.response),
+      () => {
+        for (const slot of slots) slot.commitFlushedState?.();
+      },
+      callbacks.length > 0
+        ? async () => {
+            for (const callback of callbacks) await callback();
+          }
+        : undefined,
+      responseCallbackContexts,
+    );
+    const write = activeResponseContext
+      ? this.callbackContext.run(activeResponseContext, startWrite)
+      : startWrite();
+    void write.then(
+      () => {
+        for (const slot of slots) slot.resolve?.();
+      },
+      (error: Error) => {
+        for (const slot of slots) slot.rejectWrite?.(error);
+      },
+    );
+  }
+
+  private settlePendingResponse(
+    id: RpcId,
+    pending: Pending,
+    error: Error | null,
+    result: unknown,
+  ): void {
+    const callbackWork = id === this.promptId
+      ? this.callbacksBeforeSettlement()
+      : Promise.resolve();
+    queueMicrotask(() => {
+      void callbackWork.then(() => {
+        if (this.pending.get(id) !== pending) return;
+        this.pending.delete(id);
+        if (error) pending.reject(error);
+        else pending.resolve(result);
+      });
+    });
+  }
+
+  private dispatchMessage(
+    msg: Record<string, unknown>,
+    batch?: IncomingBatch,
+    batchIndex = 0,
+  ): void {
     if (
       (msg.method === "session/update" || msg.method === "session/request_permission")
       && (msg.params as Record<string, unknown>).sessionId !== this.inboundSessionId()
@@ -1452,15 +1772,17 @@ export class AcpClient {
       const p = this.pending.get(id);
       if (!p) {
         const drain = this.cancelledPromptDrain;
-        if (
-          !drain
-          || drain.promptId !== id
-          || (hasOwn(msg, "result") && !isPromptResponse(msg.result))
-        ) {
-          this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+        if (drain?.promptId === id) {
+          if (hasOwn(msg, "result") && isPromptResponse(msg.result)) {
+            this.finishCancelledPromptDrain(id);
+          } else {
+            this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+          }
           return;
         }
-        this.finishCancelledPromptDrain(id);
+        if (!batch) {
+          this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+        }
         return;
       }
       if (p.settlementQueued) {
@@ -1473,22 +1795,16 @@ export class AcpClient {
         ? sanitizedRpcError(msg.error as { code: number; message: string })
         : null;
       const result = msg.result;
-      const callbackWork = id === this.promptId
-        ? this.callbacksBeforeSettlement()
-        : Promise.resolve();
-      queueMicrotask(() => {
-        void callbackWork.then(() => {
-          if (this.pending.get(id) !== p) return;
-          this.pending.delete(id);
-          if (error) p.reject(error);
-          else p.resolve(result);
-        });
-      });
+      if (batch) {
+        batch.pendingSettlements.push({ id, pending: p, error, result });
+      } else {
+        this.settlePendingResponse(id, p, error, result);
+      }
       return;
     }
     if (
       (msg.method === "session/request_permission" || msg.method === "elicitation/create")
-      && !this.hasActivePromptMessageWindow()
+      && !this.hasActivePromptMessageWindow(batch)
     ) {
       this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
       return;
@@ -1498,6 +1814,12 @@ export class AcpClient {
       const rpcId = msg.id as RpcId;
       const requestParams = msg.params as Record<string, unknown>;
       if (!this.claimServerRequest(rpcId, "permission", requestParams)) return;
+      if (batch) {
+        const active = this.activeServerRequests.get(rpcId);
+        if (active) {
+          active.batchResponse = { batch, slot: this.batchResponseSlot(batch, batchIndex) };
+        }
+      }
       this.pendingPermissions.set(rpcId, { generation: this.activeGen, responding: false });
       if (this.activeGen !== this.generation) {
         this.cancelPermission(rpcId);
@@ -1529,7 +1851,7 @@ export class AcpClient {
         rawInput: params.toolCall?.rawInput ?? null,
         toolKind: params.toolCall?.kind,
         meta: params._meta,
-      }]);
+      }], {}, batch);
       return;
     }
     if (msg.method === "elicitation/create") {
@@ -1541,6 +1863,12 @@ export class AcpClient {
         return;
       }
       if (!this.claimServerRequest(rpcId, "elicitation", requestParams)) return;
+      if (batch) {
+        const active = this.activeServerRequests.get(rpcId);
+        if (active) {
+          active.batchResponse = { batch, slot: this.batchResponseSlot(batch, batchIndex) };
+        }
+      }
       if (
         this.terminalElicitationLimitReached
         || this.terminalElicitations.size >= TERMINAL_ELICITATION_LIMIT
@@ -1578,32 +1906,41 @@ export class AcpClient {
         handlers,
         responding: false,
       });
-      void this.invokeCallback(handlers.onComputerHelp, [computerHelp]);
+      void this.invokeCallback(handlers.onComputerHelp, [computerHelp], {}, batch);
       return;
     }
     if (msg.method === "session/update") {
       const params = msg.params as { update: Record<string, unknown> };
       if (this.sessionAttachment?.method === "session/load") return;
-      if (!this.hasActivePromptMessageWindow()) {
+      if (!this.hasActivePromptMessageWindow(batch)) {
         const kind = String(params.update.sessionUpdate ?? params.update.session_update ?? "");
         if (kind === "agent_message" || kind === "agent_message_chunk") {
           this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
         }
         return;
       }
-      this.handleUpdate(params.update);
+      this.handleUpdate(params.update, batch);
       return;
     }
     if (typeof msg.method === "string" && msg.id !== undefined) {
-      this.send({
+      const response = {
         jsonrpc: "2.0",
         id: msg.id,
         error: { code: -32601, message: "Method not found" },
-      });
+      };
+      if (batch) {
+        const slot = this.batchResponseSlot(batch, batchIndex);
+        void this.completeBatchResponse(batch, slot, response).catch(() => undefined);
+      } else {
+        this.send(response);
+      }
     }
   }
 
-  private handleUpdate(update: Record<string, unknown> | undefined): void {
+  private handleUpdate(
+    update: Record<string, unknown> | undefined,
+    batch?: IncomingBatch,
+  ): void {
     if (!update) return;
     if (this.activeGen !== this.generation) return;
     const kind = String(update.sessionUpdate ?? update.session_update ?? "");
@@ -1625,7 +1962,7 @@ export class AcpClient {
         && this.streaming
         && this.nonTextBoundary;
       if (this.streaming && (startsIdentifiedMessage || startsAnonymousMessage)) {
-        void this.finishStreamingMessage();
+        void this.finishStreamingMessage(batch);
       }
       const start = !this.streaming;
       if (start) {
@@ -1655,7 +1992,7 @@ export class AcpClient {
           ? this.openMessageId === messageId
           : this.openMessageId === null && !this.nonTextBoundary
       );
-      if (this.streaming && !completesOpenStream) void this.finishStreamingMessage();
+      if (this.streaming && !completesOpenStream) void this.finishStreamingMessage(batch);
       this.streaming = false;
       this.nonTextBoundary = false;
       this.messageText = piece;
@@ -1665,7 +2002,7 @@ export class AcpClient {
         start: true,
         done: true,
         ...(messageId !== undefined ? { messageId } : {}),
-      }]);
+      }], {}, batch);
       return;
     }
     if (kind === "tool_call" || kind === "agent_thought_chunk") {
@@ -1674,7 +2011,7 @@ export class AcpClient {
     }
     if (kind === "state_update") {
       if (update.state === "idle") {
-        void this.finishStreamingMessage();
+        void this.finishStreamingMessage(batch);
         this.gotIdle = true;
         for (const resolve of this.idleResolvers) resolve();
         this.idleResolvers = [];
@@ -1913,7 +2250,7 @@ export class AcpClient {
     }
     pending.responding = true;
     try {
-      await this.sendConfirmed({
+      await this.sendServerResponse(rpcId, {
         jsonrpc: "2.0",
         id: rpcId,
         result: { outcome: { outcome: "selected", optionId } },
@@ -1951,7 +2288,7 @@ export class AcpClient {
         ? { action: "decline" }
         : { action: "cancel" };
     try {
-      await this.sendConfirmed({ jsonrpc: "2.0", id: rpcId, result: response }, () => {
+      await this.sendServerResponse(rpcId, { jsonrpc: "2.0", id: rpcId, result: response }, () => {
         this.pendingComputerHelp.delete(rpcId);
         this.rememberTerminalElicitation(rpcId);
         this.releaseServerRequest(rpcId, "elicitation", pending.generation);

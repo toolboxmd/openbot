@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.7] - 2026-08-28
+
+### Changed
+
+- Support ACP v1 batch transport
+
 ## [0.10.6] - 2026-08-28
 
 ### Changed

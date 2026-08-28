@@ -46,6 +46,32 @@ const input = readline.createInterface({ input: process.stdin });
 input.once("line", () => process.stdout.write(process.argv[1] + "\n"));
 `;
 
+const EMPTY_BATCH_ACP = String.raw`
+const readline = require("node:readline");
+const input = readline.createInterface({ input: process.stdin });
+let initializeId = null;
+input.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    initializeId = message.id;
+    process.stdout.write("[]\n");
+    return;
+  }
+  if (
+    message.jsonrpc === "2.0"
+    && message.id === null
+    && message.error?.code === -32600
+    && message.error?.message === "Invalid Request"
+  ) {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: initializeId,
+      result: { authMethods: [] }
+    }) + "\n");
+  }
+});
+`;
+
 const PROMPT_LINE_ACP = String.raw`
 const readline = require("node:readline");
 const input = readline.createInterface({ input: process.stdin });
@@ -785,12 +811,20 @@ describe("AcpClient input validation", () => {
     }
   });
 
-  test("rejects primitives, arrays, and invalid JSON-RPC ids and envelopes", async (t) => {
+  test("answers an empty batch with Invalid Request and keeps the connection usable", async () => {
+    const acp = client(EMPTY_BATCH_ACP);
+    try {
+      assert.deepEqual(await within(acp.initialize()), { authMethods: [] });
+    } finally {
+      acp.close();
+    }
+  });
+
+  test("rejects primitives and invalid JSON-RPC ids and envelopes", async (t) => {
     const cases = [
       ["boolean", "true"],
       ["number", "42"],
       ["string", JSON.stringify("not an envelope")],
-      ["array", "[]"],
       ["null response id", JSON.stringify({ jsonrpc: "2.0", id: null, result: {} })],
       ["fractional response id", JSON.stringify({ jsonrpc: "2.0", id: 1.5, result: {} })],
       ["object request id", JSON.stringify({
