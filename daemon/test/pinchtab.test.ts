@@ -1,25 +1,33 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join, relative } from "node:path";
+import { delimiter, dirname, join, relative, resolve } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { after, describe, test } from "node:test";
 import type { AcpHandlers } from "../src/acp.ts";
 import { BotStore, type AcpSession } from "../src/bots.ts";
-import { MemoryComputerRuntime, NoopComputerRuntime } from "../src/computer.ts";
+import {
+  assertPrivateDirectoryTarget,
+  DockerComputerRuntime,
+  MemoryComputerRuntime,
+  NoopComputerRuntime,
+} from "../src/computer.ts";
 import { spawnSpec } from "../src/harness.ts";
 import type { SpawnSpec } from "../src/harness.ts";
 import {
@@ -44,6 +52,7 @@ import {
 
 const here = dirname(fileURLToPath(import.meta.url));
 const displaySh = join(here, "../../screen/display.sh");
+const entrypointSh = join(here, "../../screen/entrypoint.sh");
 const xstartup = join(here, "../../screen/xstartup");
 const wrapper = join(here, "../src/pinchtab-mcp.mjs");
 
@@ -711,6 +720,16 @@ if (process.env.OPENBOT_BRIDGE_PID_LOG) fs.writeFileSync(process.env.OPENBOT_BRI
 const index = process.argv.indexOf("--port");
 const port = Number(process.argv[index + 1]);
 const server = http.createServer((req, res) => {
+  const authorized = req.headers.authorization === "Bearer " + (process.env.PINCHTAB_TOKEN ?? "");
+  if (process.env.OPENBOT_AUTH_RESULT_FILE) {
+    const endpoint = req.url === "/health" ? "health" : req.url === "/ensure-browser" ? "ensure-browser" : "other";
+    fs.appendFileSync(process.env.OPENBOT_AUTH_RESULT_FILE, endpoint + ":" + (authorized ? "ok" : "bad") + "\\n");
+  }
+  if (!authorized) {
+    res.writeHead(401);
+    res.end();
+    return;
+  }
   if (req.url === "/health" || req.url === "/ensure-browser") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ status: req.url === "/health" ? "ok" : "browser_ready" }));
@@ -824,8 +843,25 @@ async function writeCurlFixture(dir: string): Promise<{ file: string; real: stri
   assert.ok(real, "curl is required for the display lifecycle fixture");
   const file = join(dir, "curl");
   const body = `#!/bin/sh
+endpoint=""
+for arg in "$@"; do
+  case "$arg" in
+    */health) endpoint="health" ;;
+    */ensure-browser) endpoint="ensure-browser" ;;
+  esac
+done
+if [ -n "\${OPENBOT_CURL_HOLD_DIR:-}" ] && [ -n "$endpoint" ]; then
+  mkdir -p "$OPENBOT_CURL_HOLD_DIR"
+  printf '%s\\n' "$$" > "$OPENBOT_CURL_HOLD_DIR/$endpoint.pid"
+  while [ ! -e "$OPENBOT_CURL_HOLD_DIR/$endpoint.release" ]; do sleep 0.02; done
+fi
 {
-  for arg in "$@"; do printf '<%s>' "$arg"; done
+  for arg in "$@"; do
+    case "$arg" in
+      Authorization:*|@*/authorization.header) printf '<authorization>' ;;
+      *) printf '<%s>' "$arg" ;;
+    esac
+  done
   printf '\\n'
 } >> "$OPENBOT_CURL_LOG"
 if [ "\${OPENBOT_CURL_FAIL:-}" = "1" ]; then
@@ -833,6 +869,25 @@ if [ "\${OPENBOT_CURL_FAIL:-}" = "1" ]; then
   exit 28
 fi
 exec "$OPENBOT_REAL_CURL" "$@"
+`;
+  await writeFile(file, body, { encoding: "utf8", mode: 0o755 });
+  chmodSync(file, 0o755);
+  return { file, real };
+}
+
+async function writeBlockingCpFixture(dir: string): Promise<{ file: string; real: string }> {
+  const real = spawnSync("which", ["cp"], { encoding: "utf8" }).stdout.trim();
+  assert.ok(real, "cp is required for the cookie synchronization fixture");
+  const file = join(dir, "cp");
+  const body = `#!/bin/bash
+src="\${1:-}"
+if [ -n "\${OPENBOT_CP_HOLD_MATCH:-}" ] \
+  && [[ "$src" == *"$OPENBOT_CP_HOLD_MATCH"* ]] \
+  && [ ! -e "$OPENBOT_CP_RELEASE_FILE" ]; then
+  : > "$OPENBOT_CP_HELD_FILE"
+  while [ ! -e "$OPENBOT_CP_RELEASE_FILE" ]; do sleep 0.02; done
+fi
+exec "$OPENBOT_REAL_CP" "$@"
 `;
   await writeFile(file, body, { encoding: "utf8", mode: 0o755 });
   chmodSync(file, 0o755);
@@ -873,6 +928,51 @@ function processStartId(pid: number): string {
   return spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" })
     .stdout.replace(/^[\t ]*/u, "")
     .replace(/\r?\n$/u, "");
+}
+
+function modeOf(path: string): number {
+  return statSync(path).mode & 0o777;
+}
+
+function currentCookieSnapshot(jar: string): string {
+  const target = readlinkSync(join(jar, "current"));
+  return resolve(jar, target);
+}
+
+function cookieManifest(snapshot: string): Record<string, string> {
+  return Object.fromEntries(
+    readFileSync(join(snapshot, "manifest"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => {
+        const separator = line.indexOf("=");
+        return [line.slice(0, separator), line.slice(separator + 1)];
+      }),
+  );
+}
+
+function collectChild(child: ReturnType<typeof spawn>): Promise<{
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+}> {
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.on("data", (chunk) => (stdout += chunk.toString()));
+  child.stderr?.on("data", (chunk) => (stderr += chunk.toString()));
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (status, signal) => resolve({ status, signal, stdout, stderr }));
+  });
+}
+
+function processCommand(pid: number): string {
+  const cmdline = `/proc/${pid}/cmdline`;
+  if (existsSync(cmdline)) {
+    return readFileSync(cmdline).toString("utf8").replaceAll("\0", " ");
+  }
+  return spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim();
 }
 
 function rpc(child: { stdin: { write: (s: string) => void } | null }, id: number, method: string, params: unknown = {}): void {
@@ -1085,6 +1185,8 @@ describe("session/new mcpServers attach only when Screen and bridge are Up", () 
       assert.equal(servers[0]?.name, "pinchtab");
       assert.ok(servers[0]?.command.includes("node"));
       assert.ok(servers[0]?.args.some((arg) => arg.endsWith("pinchtab-mcp.mjs")));
+      assert.equal(servers[0]?.args.includes("--token"), false);
+      assert.equal(servers[0]?.args.includes("bridge-token"), false);
       assert.equal("startup_timeout_sec" in (servers[0] ?? {}), false);
       assert.equal("required" in (servers[0] ?? {}), false);
       assert.equal((servers[0]?._meta as { startup_timeout_sec?: number })?.startup_timeout_sec, 30);
@@ -1175,6 +1277,68 @@ describe("session/new mcpServers attach only when Screen and bridge are Up", () 
 });
 
 describe("PinchTab MCP allowlist proxy", () => {
+  test("production wrapper argv stays credential-free while authenticated focus succeeds", async () => {
+    const token = `wrapper-argv-${randomBytes(16).toString("hex")}`;
+    const authenticated: boolean[] = [];
+    const server = http.createServer((req, res) => {
+      authenticated.push(req.headers.authorization === `Bearer ${token}`);
+      if (req.url === "/tabs") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ tabs: [{ id: "tab-argv", type: "page" }] }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("wrapper argv fixture failed to bind");
+    const url = `http://127.0.0.1:${address.port}`;
+    const bin = await writeFakePinchTab(await tempDir("openbot-pt-wrapper-argv-"));
+    const computer = new MemoryComputerRuntime({
+      pinchTabUpstreams: [url],
+      pinchTabToken: token,
+    });
+    await computer.allocate("ada");
+    const [spec] = await pinchTabMcpServers(computer, "ada", {
+      ...process.env,
+      OPENBOT_PINCHTAB: bin,
+    });
+    assert.ok(spec, "healthy PinchTab did not produce an MCP wrapper spec");
+    const child = spawn(spec.command, spec.args, {
+      env: {
+        ...process.env,
+        ...Object.fromEntries(spec.env.map((row) => [row.name, row.value])),
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    try {
+      await waitUntil(() => processAlive(child.pid), 2_000);
+      const argv = processCommand(child.pid ?? 0);
+      assert.equal(argv.includes(token), false, "wrapper argv exposed its credential");
+      assert.equal(argv.includes("--token"), false, "wrapper argv retained the token flag");
+
+      rpc(child, 1, "initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "argv-proof" },
+      });
+      await readRpc(child, 1);
+      rpc(child, 2, "tools/call", { name: "pinchtab_click", arguments: { selector: "body" } });
+      const called = await readRpc(child, 2);
+      assert.equal(called.error, undefined);
+      assert.ok(authenticated.length >= 4, "wrapper did not exercise readiness and focus receivers");
+      assert.equal(authenticated.every(Boolean), true, "a receiver observed missing or incorrect authorization");
+    } finally {
+      child.kill("SIGTERM");
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   test("tools/list is allowlisted with screenshot last; blocked tools/call is rejected", async () => {
     const bin = await writeFakePinchTab(await tempDir("openbot-pt-proxy-"));
     const child = spawn(process.execPath, [wrapper], {
@@ -3108,6 +3272,90 @@ describe("PinchTab MCP allowlist proxy", () => {
 });
 
 describe("PinchTab display lifecycle", () => {
+  test("health and ensure-browser keep credentials out of live argv, traces, and logs", async () => {
+    const root = await tempDir("openbot-pt-private-probes-");
+    const home = join(root, "home");
+    const binDir = join(root, "bin");
+    const holdDir = join(root, "curl-hold");
+    const authResults = join(root, "auth-results");
+    const curlLog = join(root, "curl.log");
+    const token = `probe-argv-${randomBytes(16).toString("hex")}`;
+    mkdirSync(home, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    const pinchtab = await writeSupervisedBridgeFixture(binDir);
+    const setsid = await writeSetsidFixture(binDir);
+    const curl = await writeCurlFixture(binDir);
+    const port = await unusedLoopbackPort();
+    const stateDir = join(home, ".pinchtab-d1");
+    const ownerPath = join(stateDir, "bridge-owner.json");
+    const env = {
+      ...process.env,
+      CHROME_USER_DATA_DIR: join(root, "profile"),
+      COOKIE_JAR: join(root, "cookies"),
+      OPENBOT_AUTH_RESULT_FILE: authResults,
+      OPENBOT_CDP_PORT_BASE: String(port + 100),
+      OPENBOT_CURL_HOLD_DIR: holdDir,
+      OPENBOT_CURL_LOG: curlLog,
+      OPENBOT_PINCHTAB_BIN: pinchtab,
+      OPENBOT_PINCHTAB_PORT_BASE: String(port - 1),
+      OPENBOT_REAL_CURL: curl.real,
+      OPENBOT_SCREEN_HOME: home,
+      OPENBOT_SETSID_BIN: setsid,
+      PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+      PINCHTAB_TOKEN: token,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
+    const child = spawn("bash", ["-x", displaySh, "pinchtab", "1"], {
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk.toString()));
+    child.stderr.on("data", (chunk) => (stderr += chunk.toString()));
+    let owner: { supervisorPid?: number; childPid?: number } = {};
+    try {
+      const healthPidFile = join(holdDir, "health.pid");
+      await waitUntil(() => existsSync(healthPidFile), 5_000);
+      const healthPid = Number(readFileSync(healthPidFile, "utf8"));
+      const healthArgv = processCommand(healthPid);
+      assert.equal(healthArgv.includes(token), false, "health probe argv exposed its credential");
+      assert.equal(healthArgv.includes("Bearer "), false, "health probe argv exposed an authorization value");
+      writeFileSync(join(holdDir, "health.release"), "release");
+
+      const ensurePidFile = join(holdDir, "ensure-browser.pid");
+      await waitUntil(() => existsSync(ensurePidFile), 5_000);
+      const ensurePid = Number(readFileSync(ensurePidFile, "utf8"));
+      const ensureArgv = processCommand(ensurePid);
+      assert.equal(ensureArgv.includes(token), false, "ensure-browser argv exposed its credential");
+      assert.equal(ensureArgv.includes("Bearer "), false, "ensure-browser argv exposed an authorization value");
+      writeFileSync(join(holdDir, "ensure-browser.release"), "release");
+
+      const code = await new Promise<number>((resolve) => child.on("close", (status) => resolve(status ?? 1)));
+      assert.equal(code, 0, "credential-safe probe fixture did not become ready");
+      assert.equal(stdout.includes(token), false, "probe stdout exposed its credential");
+      assert.equal(stderr.includes(token), false, "probe trace or stderr exposed its credential");
+      assert.equal(readFileSync(curlLog, "utf8").includes(token), false, "probe log exposed its credential");
+      assert.deepEqual(readFileSync(authResults, "utf8").trim().split("\n"), [
+        "health:ok",
+        "ensure-browser:ok",
+      ]);
+
+      owner = JSON.parse(readFileSync(ownerPath, "utf8")) as typeof owner;
+      assert.equal(modeOf(stateDir), 0o700);
+      assert.equal(modeOf(join(stateDir, "config.json")), 0o600);
+      assert.equal(modeOf(join(stateDir, "authorization.header")), 0o600);
+      assert.equal(modeOf(join(stateDir, "bridge.log")), 0o600);
+      assert.equal(readFileSync(join(stateDir, "bridge.log"), "utf8").includes(token), false);
+      assert.equal(modeOf(ownerPath), 0o600);
+    } finally {
+      if (processAlive(child.pid)) child.kill("SIGKILL");
+      if (processAlive(owner.supervisorPid)) process.kill(owner.supervisorPid as number, "SIGKILL");
+      if (processAlive(owner.childPid)) process.kill(owner.childPid as number, "SIGKILL");
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
   test("display CLI validates every command before path or arithmetic expansion", async () => {
     const root = await tempDir("openbot-display-validation-");
     const binDir = join(root, "bin");
@@ -3138,6 +3386,7 @@ describe("PinchTab display lifecycle", () => {
         ["seed", "9", /display must be 1-8/u],
         ["cookies-in", "9", /display must be 1-8/u],
         ["cookies-out", "9", /display must be 1-8/u],
+        ["cookies-clear", "9", /display must be 1-8/u],
         ["pinchtab", "9", /display must be 1-8/u],
         ["pinchtab-supervise", "9", /display must be 1-8/u],
       ] as const;
@@ -3272,7 +3521,7 @@ describe("PinchTab display lifecycle", () => {
     }
   });
 
-  test("display stop fails when Chrome still owns the exact profile after final KILL", async () => {
+  test("display stop preserves the prior cookie generation when Chrome survives final KILL", async () => {
     const root = await tempDir("openbot-display-stop-chrome-live-");
     const home = join(root, "home");
     const jar = join(root, "cookies");
@@ -3281,7 +3530,8 @@ describe("PinchTab display lifecycle", () => {
     const profileCookies = join(home, ".config", "google-chrome", "Default");
     mkdirSync(profileCookies, { recursive: true });
     mkdirSync(binDir, { recursive: true });
-    writeFileSync(join(profileCookies, "Cookies"), "chrome-cleanup-cookie");
+    mkdirSync(join(jar, "Network"), { recursive: true });
+    writeFileSync(join(jar, "Network", "Cookies"), "recoverable-prior");
     writeFileSync(
       join(binDir, "pkill"),
       '#!/bin/sh\nprintf "%s\\n" "$*" >> "$OPENBOT_CHROME_KILL_LOG"\nexit 0\n',
@@ -3291,30 +3541,36 @@ describe("PinchTab display lifecycle", () => {
     writeFileSync(join(binDir, "sleep"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     writeFileSync(join(binDir, "curl"), "#!/bin/sh\nexit 7\n", { mode: 0o755 });
 
+    const env = {
+      ...process.env,
+      COOKIE_JAR: jar,
+      OPENBOT_CHROME_KILL_LOG: killLog,
+      OPENBOT_PINCHTAB_PORT_BASE: "29866",
+      OPENBOT_SCREEN_HOME: home,
+      PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
     try {
+      const imported = spawnSync("bash", [displaySh, "cookies-in", "1"], { encoding: "utf8", env });
+      assert.equal(imported.status, 0, imported.stderr);
+      const prior = currentCookieSnapshot(jar);
+      writeFileSync(join(profileCookies, "Cookies"), "chrome-cleanup-cookie");
       const result = spawnSync("bash", [displaySh, "stop", "1"], {
         encoding: "utf8",
-        env: {
-          ...process.env,
-          COOKIE_JAR: jar,
-          OPENBOT_CHROME_KILL_LOG: killLog,
-          OPENBOT_PINCHTAB_PORT_BASE: "29866",
-          OPENBOT_SCREEN_HOME: home,
-          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
-          VNC_USER: process.env.USER ?? "openbot",
-        },
+        env,
         timeout: 3_000,
       });
 
       assert.equal(result.signal, null, result.stdout + result.stderr);
       assert.equal(result.status, 1, result.stdout + result.stderr);
       assert.match(result.stderr, /Chrome.*(?:profile|remain|failed to stop)/iu);
+      assert.match(result.stderr, /cookie export not committed.*prior generation .* preserved/iu);
+      assert.doesNotMatch(result.stdout, /cookie export committed generation/u);
       assert.match(readFileSync(killLog, "utf8"), /-9/u);
-      assert.equal(
-        readFileSync(join(jar, "Network", "Cookies"), "utf8"),
-        "chrome-cleanup-cookie",
-        "cookie cleanup was skipped after Chrome stop failure",
-      );
+      assert.equal(currentCookieSnapshot(jar), prior, "unsafe profile data replaced the recoverable prior jar");
+      assert.equal(readFileSync(join(prior, "Network", "Cookies"), "utf8"), "recoverable-prior");
+      assert.equal(modeOf(prior), 0o700);
+      assert.equal(modeOf(join(prior, "manifest")), 0o600);
     } finally {
       rmSync(root, { force: true, recursive: true });
     }
@@ -3354,6 +3610,8 @@ describe("PinchTab display lifecycle", () => {
     let owner: { supervisorPid?: number; childPid?: number } = {};
     let launchedSupervisors: number[] = [];
     try {
+      const imported = spawnSync("bash", [displaySh, "cookies-in", "1"], { encoding: "utf8", env });
+      assert.equal(imported.status, 0, imported.stderr);
       const rogue = spawnSync("bash", [displaySh, "pinchtab-supervise", "1"], {
         encoding: "utf8",
         env,
@@ -3406,7 +3664,7 @@ describe("PinchTab display lifecycle", () => {
       const bridgeCalls = readFileSync(curlLog, "utf8")
         .trim()
         .split("\n")
-        .filter((line) => line.includes("Authorization: Bearer"));
+        .filter((line) => line.includes("<authorization>"));
       for (const endpoint of ["/health", "/ensure-browser"]) {
         const call = bridgeCalls.find((line) => line.includes(endpoint));
         assert.ok(call, `missing curl call for ${endpoint}`);
@@ -3491,6 +3749,8 @@ describe("PinchTab display lifecycle", () => {
     let owner: { supervisorPid?: number; childPid?: number } = {};
     const started = Date.now();
     try {
+      const imported = spawnSync("bash", [displaySh, "cookies-in", "1"], { encoding: "utf8", env });
+      assert.equal(imported.status, 0, imported.stderr);
       const result = spawnSync("bash", [displaySh, "pinchtab", "1"], {
         encoding: "utf8",
         env,
@@ -3735,7 +3995,8 @@ describe("PinchTab display lifecycle", () => {
     assert.notEqual(display, 0, "no unused test display id was available");
     const profile = join(home, `.config`, `google-chrome-d${display}`, "Default", "Network");
     mkdirSync(profile, { recursive: true });
-    writeFileSync(join(profile, "Cookies"), "cleanup-cookie");
+    mkdirSync(join(jar, "Network"), { recursive: true });
+    writeFileSync(join(jar, "Network", "Cookies"), "prior-cookie");
     writeFileSync(
       join(binDir, "pkill"),
       '#!/bin/sh\nprintf "chrome:%s\\n" "$*" >> "$OPENBOT_CLEANUP_LOG"\nexit 1\n',
@@ -3747,24 +4008,29 @@ describe("PinchTab display lifecycle", () => {
       '#!/bin/sh\nprintf "vnc:%s\\n" "$*" >> "$OPENBOT_CLEANUP_LOG"\nexit 0\n',
       { mode: 0o755 },
     );
+    const env = {
+      ...process.env,
+      COOKIE_JAR: jar,
+      OPENBOT_CLEANUP_LOG: cleanupLog,
+      OPENBOT_PINCHTAB_PORT_BASE: String(foreign.port - display),
+      OPENBOT_SCREEN_HOME: home,
+      PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
     try {
+      const imported = spawnSync("bash", [displaySh, "cookies-in", String(display)], { encoding: "utf8", env });
+      assert.equal(imported.status, 0, imported.stderr);
+      writeFileSync(join(profile, "Cookies"), "cleanup-cookie");
       const result = spawnSync("bash", [displaySh, "stop", String(display)], {
         encoding: "utf8",
-        env: {
-          ...process.env,
-          COOKIE_JAR: jar,
-          OPENBOT_CLEANUP_LOG: cleanupLog,
-          OPENBOT_PINCHTAB_PORT_BASE: String(foreign.port - display),
-          OPENBOT_SCREEN_HOME: home,
-          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
-          VNC_USER: process.env.USER ?? "openbot",
-        },
+        env,
         timeout: 10_000,
       });
 
       assert.notEqual(result.status, 0, result.stdout + result.stderr);
       assert.match(result.stderr, /port.*occupied|unowned|foreign|refusing to kill/i);
-      assert.equal(readFileSync(join(jar, "Network", "Cookies"), "utf8"), "cleanup-cookie");
+      assert.match(result.stdout, /cookie export committed generation/u);
+      assert.equal(readFileSync(join(currentCookieSnapshot(jar), "Network", "Cookies"), "utf8"), "cleanup-cookie");
       assert.match(readFileSync(cleanupLog, "utf8"), /chrome:/u);
       assert.match(readFileSync(cleanupLog, "utf8"), /vnc:/u);
       assert.equal(existsSync(xLock), false, "X lock cleanup was skipped");
@@ -3943,6 +4209,556 @@ describe("PinchTab display lifecycle", () => {
 });
 
 describe("Computer cookie jar copy", () => {
+  test("legacy state becomes one private committed snapshot and the last export wins", async () => {
+    const root = await tempDir("openbot-cookie-snapshot-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    const profile = join(home, ".config", "google-chrome");
+    mkdirSync(join(profile, "Default", "Network"), { recursive: true, mode: 0o777 });
+    mkdirSync(join(jar, "Network"), { recursive: true, mode: 0o777 });
+    writeFileSync(join(jar, "Network", "Cookies"), "legacy-network", { mode: 0o666 });
+    writeFileSync(join(jar, "Local State"), "legacy-local-state", { mode: 0o666 });
+    const env = {
+      ...process.env,
+      COOKIE_JAR: jar,
+      OPENBOT_SCREEN_HOME: home,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
+    try {
+      const imported = spawnSync("bash", [displaySh, "cookies-in", "1"], { encoding: "utf8", env });
+      assert.equal(imported.status, 0, imported.stderr);
+      assert.equal(existsSync(join(jar, "current")), true, "cookie store has no committed pointer");
+      const initial = currentCookieSnapshot(jar);
+      assert.equal(readFileSync(join(profile, "Default", "Network", "Cookies"), "utf8"), "legacy-network");
+      assert.equal(readFileSync(join(profile, "Local State"), "utf8"), "legacy-local-state");
+      assert.equal(modeOf(profile), 0o700);
+      assert.equal(modeOf(join(profile, "Default")), 0o700);
+      assert.equal(modeOf(join(profile, "Default", "Network")), 0o700);
+      assert.equal(modeOf(join(profile, "Default", "Network", "Cookies")), 0o600);
+      assert.equal(modeOf(join(profile, "Local State")), 0o600);
+      assert.equal(modeOf(join(profile, ".openbot-cookie-epoch")), 0o600);
+      assert.equal(modeOf(jar), 0o700);
+      assert.equal(modeOf(join(jar, "snapshots")), 0o700);
+      assert.equal(modeOf(initial), 0o700);
+      assert.equal(modeOf(join(initial, "manifest")), 0o600);
+      assert.equal(modeOf(join(initial, "Network", "Cookies")), 0o600);
+      assert.equal(modeOf(join(initial, "Local State")), 0o600);
+      assert.equal(existsSync(join(jar, "Network", "Cookies")), false, "legacy root remained authoritative");
+
+      writeFileSync(join(profile, "Default", "Network", "Cookies"), "latest-network");
+      writeFileSync(join(profile, "Local State"), "latest-local-state");
+      const exported = spawnSync("bash", [displaySh, "cookies-out", "1"], { encoding: "utf8", env });
+      assert.equal(exported.status, 0, exported.stderr);
+      assert.match(exported.stdout, /cookie export committed generation/u);
+      const latest = currentCookieSnapshot(jar);
+      assert.notEqual(latest, initial, "export did not publish a new generation");
+      assert.equal(readFileSync(join(latest, "Network", "Cookies"), "utf8"), "latest-network");
+      assert.equal(readFileSync(join(latest, "Local State"), "utf8"), "latest-local-state");
+      assert.equal(modeOf(latest), 0o700);
+      assert.equal(modeOf(join(latest, "manifest")), 0o600);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("clear publishes a new epoch and stale profiles cannot resurrect the prior jar", async () => {
+    const root = await tempDir("openbot-cookie-clear-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    const profile1 = join(home, ".config", "google-chrome");
+    const profile2 = join(home, ".config", "google-chrome-d2");
+    mkdirSync(join(jar, "Network"), { recursive: true });
+    writeFileSync(join(jar, "Network", "Cookies"), "clear-source");
+    writeFileSync(join(jar, "Local State"), "clear-local-state");
+    const env = {
+      ...process.env,
+      COOKIE_JAR: jar,
+      OPENBOT_SCREEN_HOME: home,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
+    try {
+      for (const display of ["1", "2"]) {
+        const imported = spawnSync("bash", [displaySh, "cookies-in", display], { encoding: "utf8", env });
+        assert.equal(imported.status, 0, imported.stderr);
+      }
+      const prior = currentCookieSnapshot(jar);
+      const priorEpoch = Number(cookieManifest(prior).epoch);
+      writeFileSync(join(profile1, "Default", "Network", "Cookies"), "stale-one");
+      writeFileSync(join(profile2, "Default", "Network", "Cookies"), "stale-two");
+
+      const cleared = spawnSync("bash", [displaySh, "cookies-clear", "1"], { encoding: "utf8", env });
+      assert.equal(cleared.status, 0, cleared.stderr);
+      assert.match(cleared.stdout, /cookie clear committed generation/u);
+      const empty = currentCookieSnapshot(jar);
+      const emptyManifest = cookieManifest(empty);
+      assert.notEqual(empty, prior, "clear did not publish a new generation");
+      assert.equal(Number(emptyManifest.epoch), priorEpoch + 1);
+      assert.equal(emptyManifest.state, "committed");
+      assert.equal(modeOf(empty), 0o700);
+      assert.equal(modeOf(join(empty, "manifest")), 0o600);
+      assert.equal(existsSync(join(empty, "Network", "Cookies")), false);
+      assert.equal(existsSync(prior), false, "clear retained an obsolete snapshot");
+      assert.equal(existsSync(join(jar, "previous")), false, "clear retained a recovery pointer");
+      for (const profile of [profile1, profile2]) {
+        assert.equal(existsSync(join(profile, "Default", "Network", "Cookies")), false);
+        assert.equal(existsSync(join(profile, "Local State")), false);
+        assert.equal(existsSync(join(profile, ".openbot-cookie-epoch")), false);
+      }
+
+      mkdirSync(join(profile2, "Default", "Network"), { recursive: true });
+      writeFileSync(join(profile2, "Default", "Network", "Cookies"), "stale-resurrection");
+      writeFileSync(join(profile2, ".openbot-cookie-epoch"), `${priorEpoch}\n`);
+      const resurrect = spawnSync("bash", [displaySh, "cookies-out", "2"], { encoding: "utf8", env });
+      assert.equal(resurrect.status, 1, resurrect.stdout + resurrect.stderr);
+      assert.match(resurrect.stderr, /invalidated.*import/iu);
+      assert.equal(currentCookieSnapshot(jar), empty, "stale profile replaced the clear generation");
+      assert.equal(existsSync(join(empty, "Network", "Cookies")), false);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("invalid committed metadata fails closed without deleting the recoverable snapshot", async () => {
+    const root = await tempDir("openbot-cookie-invalid-current-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    mkdirSync(join(jar, "Network"), { recursive: true });
+    writeFileSync(join(jar, "Network", "Cookies"), "recoverable-invalid");
+    const env = {
+      ...process.env,
+      COOKIE_JAR: jar,
+      OPENBOT_SCREEN_HOME: home,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
+    try {
+      const imported = spawnSync("bash", [displaySh, "cookies-in", "1"], { encoding: "utf8", env });
+      assert.equal(imported.status, 0, imported.stderr);
+      const snapshot = currentCookieSnapshot(jar);
+      const manifest = join(snapshot, "manifest");
+      chmodSync(manifest, 0o644);
+
+      const rejected = spawnSync("bash", [displaySh, "cookies-in", "2"], { encoding: "utf8", env });
+      assert.equal(rejected.status, 1, rejected.stdout + rejected.stderr);
+      assert.match(rejected.stderr, /committed cookie snapshot is invalid/iu);
+      assert.equal(currentCookieSnapshot(jar), snapshot);
+      assert.equal(existsSync(manifest), true);
+      assert.equal(readFileSync(join(snapshot, "Network", "Cookies"), "utf8"), "recoverable-invalid");
+
+      chmodSync(manifest, 0o600);
+      const recovered = spawnSync("bash", [displaySh, "cookies-in", "2"], { encoding: "utf8", env });
+      assert.equal(recovered.status, 0, recovered.stderr);
+      assert.equal(currentCookieSnapshot(jar), snapshot);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("cookie synchronization rejects symlinked state roots without touching their targets", async () => {
+    const root = await tempDir("openbot-cookie-root-symlink-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    const outside = join(root, "outside");
+    mkdirSync(jar, { recursive: true });
+    mkdirSync(outside, { recursive: true, mode: 0o777 });
+    chmodSync(outside, 0o777);
+    symlinkSync(outside, join(jar, "snapshots"), "dir");
+    try {
+      const result = spawnSync("bash", [displaySh, "cookies-in", "1"], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          COOKIE_JAR: jar,
+          OPENBOT_SCREEN_HOME: home,
+          VNC_USER: process.env.USER ?? "openbot",
+        },
+      });
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.match(result.stderr, /private directory must not be a symlink/iu);
+      assert.equal(modeOf(outside), 0o777, "symlink target permissions changed");
+      assert.deepEqual(readdirSync(outside), [], "symlink target was used as cookie state");
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("stale lock recovery unlinks a lock symlink without traversing its target", async () => {
+    const root = await tempDir("openbot-cookie-lock-symlink-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    const outside = join(root, "outside-lock");
+    mkdirSync(join(jar, "Network"), { recursive: true });
+    writeFileSync(join(jar, "Network", "Cookies"), "lock-symlink-source");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "pid"), "outside-pid");
+    writeFileSync(join(outside, "start"), "outside-start");
+    const env = {
+      ...process.env,
+      COOKIE_JAR: jar,
+      OPENBOT_SCREEN_HOME: home,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
+    try {
+      const imported = spawnSync("bash", [displaySh, "cookies-in", "1"], { encoding: "utf8", env });
+      assert.equal(imported.status, 0, imported.stderr);
+      symlinkSync(outside, join(jar, ".sync.lock"), "dir");
+
+      const recovered = spawnSync("bash", [displaySh, "cookies-in", "2"], {
+        encoding: "utf8",
+        env,
+        timeout: 5_000,
+      });
+      assert.equal(recovered.status, 0, recovered.stdout + recovered.stderr);
+      assert.match(recovered.stderr, /removing stale cookie synchronization lock/iu);
+      assert.equal(readFileSync(join(outside, "pid"), "utf8"), "outside-pid");
+      assert.equal(readFileSync(join(outside, "start"), "utf8"), "outside-start");
+      assert.equal(existsSync(join(jar, ".sync.lock")), false);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("clear invalidates the jar without traversing a symlinked stale profile", async () => {
+    const root = await tempDir("openbot-cookie-profile-symlink-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    const outside = join(root, "outside-profile");
+    mkdirSync(join(jar, "Network"), { recursive: true });
+    writeFileSync(join(jar, "Network", "Cookies"), "profile-symlink-source");
+    mkdirSync(join(home, ".config"), { recursive: true });
+    mkdirSync(join(outside, "Default", "Network"), { recursive: true });
+    writeFileSync(join(outside, "Default", "Network", "Cookies"), "outside-sentinel");
+    const env = {
+      ...process.env,
+      COOKIE_JAR: jar,
+      OPENBOT_SCREEN_HOME: home,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
+    try {
+      const imported = spawnSync("bash", [displaySh, "cookies-in", "1"], { encoding: "utf8", env });
+      assert.equal(imported.status, 0, imported.stderr);
+      symlinkSync(outside, join(home, ".config", "google-chrome-d2"), "dir");
+
+      const cleared = spawnSync("bash", [displaySh, "cookies-clear", "1"], { encoding: "utf8", env });
+      assert.equal(cleared.status, 1, cleared.stdout + cleared.stderr);
+      assert.match(cleared.stderr, /cookie profile path must be a real directory/iu);
+      assert.doesNotMatch(cleared.stdout, /cookie clear committed generation/u);
+      assert.equal(
+        readFileSync(join(outside, "Default", "Network", "Cookies"), "utf8"),
+        "outside-sentinel",
+      );
+      const snapshot = currentCookieSnapshot(jar);
+      assert.equal(existsSync(join(snapshot, "Network", "Cookies")), false);
+      assert.equal(cookieManifest(snapshot).state, "committed");
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("concurrent exports serialize so the last requested writer commits last", async () => {
+    const root = await tempDir("openbot-cookie-concurrent-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    const binDir = join(root, "bin");
+    const held = join(root, "cp-held");
+    const release = join(root, "cp-release");
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(join(jar, "Network"), { recursive: true });
+    writeFileSync(join(jar, "Network", "Cookies"), "concurrent-source");
+    const cp = await writeBlockingCpFixture(binDir);
+    const env = {
+      ...process.env,
+      COOKIE_JAR: jar,
+      OPENBOT_CP_HELD_FILE: held,
+      OPENBOT_CP_HOLD_MATCH: "google-chrome/Default/Network/Cookies",
+      OPENBOT_CP_RELEASE_FILE: release,
+      OPENBOT_REAL_CP: cp.real,
+      OPENBOT_SCREEN_HOME: home,
+      PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
+    let first: ReturnType<typeof spawn> | undefined;
+    let second: ReturnType<typeof spawn> | undefined;
+    try {
+      for (const display of ["1", "2"]) {
+        const imported = spawnSync("bash", [displaySh, "cookies-in", display], { encoding: "utf8", env });
+        assert.equal(imported.status, 0, imported.stderr);
+      }
+      const profile1 = join(home, ".config", "google-chrome", "Default", "Network", "Cookies");
+      const profile2 = join(home, ".config", "google-chrome-d2", "Default", "Network", "Cookies");
+      writeFileSync(profile1, "writer-one");
+      writeFileSync(profile2, "writer-two");
+      const initial = currentCookieSnapshot(jar);
+
+      first = spawn("bash", [displaySh, "cookies-out", "1"], { env, stdio: ["ignore", "pipe", "pipe"] });
+      const firstResult = collectChild(first);
+      await waitUntil(() => existsSync(held), 4_000);
+      assert.equal(currentCookieSnapshot(jar), initial, "partial first export became authoritative");
+      assert.equal(modeOf(join(jar, ".sync.lock")), 0o700);
+      assert.equal(modeOf(join(jar, ".sync.lock", "pid")), 0o600);
+      assert.equal(modeOf(join(jar, ".sync.lock", "start")), 0o600);
+
+      second = spawn("bash", [displaySh, "cookies-out", "2"], { env, stdio: ["ignore", "pipe", "pipe"] });
+      let secondClosed = false;
+      second.once("close", () => (secondClosed = true));
+      const secondResult = collectChild(second);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        assert.equal(secondClosed, false, "second writer bypassed the shared synchronization lock");
+        assert.equal(currentCookieSnapshot(jar), initial, "a waiting writer changed the committed pointer");
+      } finally {
+        writeFileSync(release, "release");
+      }
+
+      const [one, two] = await Promise.all([firstResult, secondResult]);
+      assert.equal(one.status, 0, one.stderr);
+      assert.equal(two.status, 0, two.stderr);
+      assert.match(one.stdout, /cookie export committed generation/u);
+      assert.match(two.stdout, /cookie export committed generation/u);
+      const final = currentCookieSnapshot(jar);
+      assert.equal(readFileSync(join(final, "Network", "Cookies"), "utf8"), "writer-two");
+      assert.equal(modeOf(final), 0o700);
+      assert.equal(modeOf(join(final, "Network", "Cookies")), 0o600);
+    } finally {
+      if (!existsSync(release)) writeFileSync(release, "release");
+      if (processAlive(first?.pid)) first?.kill("SIGKILL");
+      if (processAlive(second?.pid)) second?.kill("SIGKILL");
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("forced TERM to KILL cannot claim or publish an incomplete final export", async () => {
+    const root = await tempDir("openbot-cookie-forced-kill-");
+    const home = join(root, "home");
+    const jar = join(root, "cookies");
+    const binDir = join(root, "bin");
+    const held = join(root, "cp-held");
+    const release = join(root, "cp-release");
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(join(jar, "Network"), { recursive: true });
+    writeFileSync(join(jar, "Network", "Cookies"), "recoverable-prior");
+    const cp = await writeBlockingCpFixture(binDir);
+    const pinchtabPort = await unusedLoopbackPort();
+    const env = {
+      ...process.env,
+      COOKIE_JAR: jar,
+      OPENBOT_CP_HELD_FILE: held,
+      OPENBOT_CP_HOLD_MATCH: "google-chrome/Default/Network/Cookies",
+      OPENBOT_CP_RELEASE_FILE: release,
+      OPENBOT_PINCHTAB_PORT_BASE: String(pinchtabPort - 1),
+      OPENBOT_REAL_CP: cp.real,
+      OPENBOT_SCREEN_HOME: home,
+      PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+      VNC_USER: process.env.USER ?? "openbot",
+    };
+    let child: ReturnType<typeof spawn> | undefined;
+    try {
+      const imported = spawnSync("bash", [displaySh, "cookies-in", "1"], { encoding: "utf8", env });
+      assert.equal(imported.status, 0, imported.stderr);
+      const prior = currentCookieSnapshot(jar);
+      const priorManifest = cookieManifest(prior);
+      writeFileSync(join(home, ".config", "google-chrome", "Default", "Network", "Cookies"), "uncommitted-new");
+
+      child = spawn(
+        "bash",
+        ["-c", 'trap "" TERM; exec bash "$@"', "forced-cookie-export", displaySh, "stop", "1"],
+        { detached: true, env, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      const resultPromise = collectChild(child);
+      await waitUntil(() => existsSync(held), 4_000);
+      assert.ok(child.pid, "forced export fixture has no pid");
+      process.kill(-(child.pid as number), "SIGTERM");
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(processAlive(child.pid), true, "fixture did not exercise TERM to KILL escalation");
+      process.kill(-(child.pid as number), "SIGKILL");
+      const result = await resultPromise;
+      assert.equal(result.status, null);
+      assert.equal(result.signal, "SIGKILL");
+      assert.doesNotMatch(result.stdout + result.stderr, /cookie export committed generation/u);
+      assert.equal(currentCookieSnapshot(jar), prior, "forced shutdown changed the committed identity");
+      assert.deepEqual(cookieManifest(prior), priorManifest);
+      assert.equal(modeOf(jar), 0o700);
+      assert.equal(modeOf(prior), 0o700);
+      assert.equal(modeOf(join(prior, "manifest")), 0o600);
+      assert.equal(readFileSync(join(prior, "Network", "Cookies"), "utf8"), "recoverable-prior");
+      assert.ok(readdirSync(jar).some((name) => name.startsWith(".staging.")), "fixture never interrupted staging");
+
+      writeFileSync(release, "release");
+      const recovered = spawnSync("bash", [displaySh, "cookies-in", "2"], { encoding: "utf8", env, timeout: 5_000 });
+      assert.equal(recovered.status, 0, recovered.stdout + recovered.stderr);
+      assert.equal(readdirSync(jar).some((name) => name.startsWith(".staging.")), false);
+      assert.equal(existsSync(join(jar, ".sync.lock")), false);
+      assert.equal(currentCookieSnapshot(jar), prior);
+    } finally {
+      if (!existsSync(release)) writeFileSync(release, "release");
+      if (child?.pid && processAlive(child.pid)) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+      }
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("Computer runtimes create cookie jars privately under a permissive umask", async () => {
+    const root = await tempDir("openbot-private-cookie-roots-");
+    const previousUmask = process.umask(0);
+    try {
+      const paths = [join(root, "memory"), join(root, "noop"), join(root, "docker")];
+      new MemoryComputerRuntime({ cookiesDir: paths[0] });
+      new NoopComputerRuntime(paths[1]);
+      new DockerComputerRuntime({ cookiesDir: paths[2] });
+      for (const path of paths) assert.equal(modeOf(path), 0o700);
+    } finally {
+      process.umask(previousUmask);
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("Computer runtimes reject filesystem-root cookie targets before changing their mode", () => {
+    const filesystemRoot = resolve(process.cwd(), "/");
+    const originalMode = modeOf(filesystemRoot);
+    assert.throws(() => assertPrivateDirectoryTarget(filesystemRoot), /filesystem root/iu);
+    assert.throws(() => new MemoryComputerRuntime({ cookiesDir: filesystemRoot }), /filesystem root/iu);
+    assert.throws(() => new NoopComputerRuntime(filesystemRoot), /filesystem root/iu);
+    assert.throws(() => new DockerComputerRuntime({ cookiesDir: filesystemRoot }), /filesystem root/iu);
+    assert.equal(modeOf(filesystemRoot), originalMode);
+  });
+
+  test("container token setup uses a private parent and file without trace disclosure", async () => {
+    const root = await tempDir("openbot-private-token-file-");
+    const tokenFile = join(root, "secrets", "pinchtab.token");
+    const token = `token-file-${randomBytes(16).toString("hex")}`;
+    try {
+      const result = spawnSync("bash", ["-x", entrypointSh, "prepare-pinchtab-token"], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENBOT_PINCHTAB_TOKEN_FILE: tokenFile,
+          PINCHTAB_TOKEN: token,
+        },
+      });
+      assert.equal(result.status, 0, "private token setup failed");
+      assert.equal(result.stdout.includes(token), false, "token setup stdout disclosed the credential");
+      assert.equal(result.stderr.includes(token), false, "token setup trace disclosed the credential");
+      assert.equal(modeOf(dirname(tokenFile)), 0o700);
+      assert.equal(modeOf(tokenFile), 0o600);
+      if (process.getuid && process.getgid) {
+        assert.equal(statSync(dirname(tokenFile)).uid, process.getuid());
+        assert.equal(statSync(dirname(tokenFile)).gid, process.getgid());
+        assert.equal(statSync(tokenFile).uid, process.getuid());
+        assert.equal(statSync(tokenFile).gid, process.getgid());
+      }
+      assert.equal(readFileSync(tokenFile, "utf8") === token, true, "token file content changed");
+
+      const outside = join(root, "outside-token");
+      writeFileSync(outside, "outside-sentinel");
+      rmSync(tokenFile);
+      symlinkSync(outside, tokenFile);
+      const rejected = spawnSync("bash", [entrypointSh, "prepare-pinchtab-token"], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENBOT_PINCHTAB_TOKEN_FILE: tokenFile,
+          PINCHTAB_TOKEN: token,
+        },
+      });
+      assert.equal(rejected.status, 1, rejected.stdout + rejected.stderr);
+      assert.equal(rejected.stdout.includes(token), false);
+      assert.equal(rejected.stderr.includes(token), false);
+      assert.equal(readFileSync(outside, "utf8"), "outside-sentinel");
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("container token setup rejects a filesystem-root parent before any mutation", async () => {
+    const root = await tempDir("openbot-token-root-guard-");
+    const binDir = join(root, "bin");
+    const mutationLog = join(root, "mutation.log");
+    const safeTmp = join(root, "safe-token.tmp");
+    const token = `root-guard-${randomBytes(16).toString("hex")}`;
+    mkdirSync(binDir, { recursive: true });
+    for (const command of ["mkdir", "chmod", "chown", "mv"]) {
+      writeFileSync(
+        join(binDir, command),
+        `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(command)} >> "$OPENBOT_MUTATION_LOG"\nexit 0\n`,
+        { mode: 0o755 },
+      );
+    }
+    writeFileSync(join(binDir, "mktemp"), '#!/bin/sh\nprintf \'%s\\n\' "$OPENBOT_SAFE_TMP"\n', { mode: 0o755 });
+    try {
+      const result = spawnSync("bash", [entrypointSh, "prepare-pinchtab-token"], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENBOT_MUTATION_LOG: mutationLog,
+          OPENBOT_PINCHTAB_TOKEN_FILE: "/pinchtab.token",
+          OPENBOT_SAFE_TMP: safeTmp,
+          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+          PINCHTAB_TOKEN: token,
+        },
+      });
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.match(result.stderr, /filesystem root/iu);
+      assert.equal(result.stdout.includes(token), false);
+      assert.equal(result.stderr.includes(token), false);
+      assert.equal(existsSync(mutationLog), false, "root rejection ran a mutating command");
+      assert.equal(existsSync(safeTmp), false, "root rejection staged credential content");
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("container cleanup runs one serialized Screen stop before terminating VNC", () => {
+    const body = readFileSync(entrypointSh, "utf8");
+    const cleanup = body.slice(body.indexOf("cleanup()"));
+    assert.match(cleanup, /CLEANUP_STARTED.*return "\$CLEANUP_RESULT"/su);
+    assert.match(cleanup, /trap - TERM INT EXIT/u);
+    assert.ok(
+      cleanup.indexOf("openbot-display stop 1") < cleanup.indexOf('kill "$VNC_PID"'),
+      "container termination preceded serialized cookie export",
+    );
+    assert.match(cleanup, /trap signal_cleanup TERM INT/u);
+    assert.match(cleanup, /trap exit_cleanup EXIT/u);
+    assert.doesNotMatch(cleanup, /trap cleanup TERM INT EXIT/u);
+  });
+
+  test("display token fallback rejects a symlinked parent without touching its target", async () => {
+    const root = await tempDir("openbot-pinchtab-token-parent-");
+    const home = join(root, "home");
+    const outside = join(root, "outside-secrets");
+    const link = join(root, "secrets-link");
+    const tokenFile = join(link, "pinchtab.token");
+    const token = `fallback-${randomBytes(16).toString("hex")}`;
+    mkdirSync(home, { recursive: true });
+    mkdirSync(outside, { recursive: true, mode: 0o777 });
+    chmodSync(outside, 0o777);
+    writeFileSync(join(outside, "pinchtab.token"), token, { mode: 0o644 });
+    symlinkSync(outside, link, "dir");
+    try {
+      const result = spawnSync("bash", [displaySh, "pinchtab", "1"], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENBOT_PINCHTAB_TOKEN_FILE: tokenFile,
+          OPENBOT_SCREEN_HOME: home,
+          PINCHTAB_TOKEN: "",
+          VNC_USER: process.env.USER ?? "openbot",
+        },
+      });
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.match(result.stderr, /token state must use real private files/iu);
+      assert.equal(result.stdout.includes(token), false);
+      assert.equal(result.stderr.includes(token), false);
+      assert.equal(modeOf(outside), 0o777);
+      assert.equal(modeOf(join(outside, "pinchtab.token")), 0o644);
+      assert.equal(readFileSync(join(outside, "pinchtab.token"), "utf8") === token, true);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
 
   test("display.sh cookies-in then cookies-out copies the jar", async () => {
     const root = await tempDir("openbot-pt-cookies-");
@@ -3958,7 +4774,7 @@ describe("Computer cookie jar copy", () => {
       ...process.env,
       OPENBOT_SCREEN_HOME: home,
       COOKIE_JAR: jar,
-      VNC_USER: "openbot",
+      VNC_USER: process.env.USER ?? "openbot",
     };
     const inn = spawn("bash", [displaySh, "cookies-in", "1"], { env, stdio: "inherit" });
     const inCode = await new Promise<number>((resolve) => inn.on("close", (code) => resolve(code ?? 1)));
@@ -3980,11 +4796,14 @@ describe("Computer cookie jar copy", () => {
     const out = spawn("bash", [displaySh, "cookies-out", "1"], { env, stdio: "inherit" });
     const outCode = await new Promise<number>((resolve) => out.on("close", (code) => resolve(code ?? 1)));
     assert.equal(outCode, 0);
-    assert.equal(readFileSync(join(jar, "Cookies"), "utf8"), "jar-out");
-    assert.equal(readFileSync(join(jar, "Cookies-wal"), "utf8"), "wal-out");
-    assert.equal(readFileSync(join(jar, "Local State"), "utf8"), '{"os_crypt":{"encrypted_key":"k"}}');
-    assert.equal(readFileSync(join(jar, "Network", "Cookies"), "utf8"), "net-out");
-    assert.equal(readFileSync(join(jar, "Network", "Cookies-wal"), "utf8"), "net-wal");
+    const snapshot = currentCookieSnapshot(jar);
+    assert.equal(readFileSync(join(snapshot, "Cookies"), "utf8"), "jar-out");
+    assert.equal(readFileSync(join(snapshot, "Cookies-wal"), "utf8"), "wal-out");
+    assert.equal(readFileSync(join(snapshot, "Local State"), "utf8"), '{"os_crypt":{"encrypted_key":"k"}}');
+    assert.equal(readFileSync(join(snapshot, "Network", "Cookies"), "utf8"), "net-out");
+    assert.equal(readFileSync(join(snapshot, "Network", "Cookies-wal"), "utf8"), "net-wal");
+    assert.equal(modeOf(snapshot), 0o700);
+    assert.equal(modeOf(join(snapshot, "Network", "Cookies")), 0o600);
   });
 
   test("display.sh stop copies the jar when Chrome is already gone", async () => {
@@ -3993,22 +4812,28 @@ describe("Computer cookie jar copy", () => {
     const jar = join(root, "cookies");
     mkdirSync(join(home, ".config", "google-chrome", "Default", "Network"), { recursive: true });
     mkdirSync(jar, { recursive: true });
-    writeFileSync(join(home, ".config", "google-chrome", "Default", "Cookies"), "stop-out");
-    writeFileSync(join(home, ".config", "google-chrome", "Default", "Cookies-wal"), "stop-wal");
-    writeFileSync(join(home, ".config", "google-chrome", "Local State"), '{"os_crypt":{"encrypted_key":"stop"}}');
     const env = {
       ...process.env,
       OPENBOT_SCREEN_HOME: home,
       COOKIE_JAR: jar,
-      VNC_USER: "openbot",
+      VNC_USER: process.env.USER ?? "openbot",
     };
-    const stopped = spawn("bash", [displaySh, "stop", "1"], { env, stdio: "inherit" });
-    const code = await new Promise<number>((resolve) => stopped.on("close", (status) => resolve(status ?? 1)));
-    assert.equal(code, 0);
-    assert.equal(readFileSync(join(jar, "Cookies"), "utf8"), "stop-out");
-    assert.equal(readFileSync(join(jar, "Cookies-wal"), "utf8"), "stop-wal");
-    assert.equal(readFileSync(join(jar, "Local State"), "utf8"), '{"os_crypt":{"encrypted_key":"stop"}}');
-    assert.equal(readFileSync(join(jar, "Network", "Cookies"), "utf8"), "stop-out");
+    const imported = spawnSync("bash", [displaySh, "cookies-in", "1"], { encoding: "utf8", env });
+    assert.equal(imported.status, 0, imported.stderr);
+    const prior = currentCookieSnapshot(jar);
+    writeFileSync(join(home, ".config", "google-chrome", "Default", "Cookies"), "stop-out");
+    writeFileSync(join(home, ".config", "google-chrome", "Default", "Cookies-wal"), "stop-wal");
+    writeFileSync(join(home, ".config", "google-chrome", "Local State"), '{"os_crypt":{"encrypted_key":"stop"}}');
+    const stopped = spawn("bash", [displaySh, "stop", "1"], { env, stdio: ["ignore", "pipe", "pipe"] });
+    const result = await collectChild(stopped);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /cookie export committed generation/u);
+    const snapshot = currentCookieSnapshot(jar);
+    assert.notEqual(snapshot, prior);
+    assert.equal(readFileSync(join(snapshot, "Cookies"), "utf8"), "stop-out");
+    assert.equal(readFileSync(join(snapshot, "Cookies-wal"), "utf8"), "stop-wal");
+    assert.equal(readFileSync(join(snapshot, "Local State"), "utf8"), '{"os_crypt":{"encrypted_key":"stop"}}');
+    assert.equal(readFileSync(join(snapshot, "Network", "Cookies"), "utf8"), "stop-out");
   });
 
   test("cookies-in promotes legacy Cookies into Default/Network/Cookies", async () => {
@@ -4023,7 +4848,7 @@ describe("Computer cookie jar copy", () => {
       ...process.env,
       OPENBOT_SCREEN_HOME: home,
       COOKIE_JAR: jar,
-      VNC_USER: "openbot",
+      VNC_USER: process.env.USER ?? "openbot",
     };
     const inn = spawn("bash", [displaySh, "cookies-in", "1"], { env, stdio: "inherit" });
     const code = await new Promise<number>((resolve) => inn.on("close", (status) => resolve(status ?? 1)));

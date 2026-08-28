@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readlinkSync, rmSync, statSync } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
@@ -251,7 +251,7 @@ async function listWrapperTools(server: string, token: string): Promise<string[]
   const wrapper = pinchTabWrapperCommand();
   const bin = resolvePinchTabBin();
   if (!wrapper || !bin) return [];
-  const child = spawn(wrapper.command, [...wrapper.args, "--bin", bin, "--server", server, "--token", token], {
+  const child = spawn(wrapper.command, [...wrapper.args, "--bin", bin, "--server", server], {
     env: {
       ...process.env,
       OPENBOT_PINCHTAB: bin,
@@ -284,7 +284,7 @@ async function runLiveWrapperSequence(
 ): Promise<void> {
   const wrapper = pinchTabWrapperCommand();
   if (!wrapper) throw new Error("PinchTab MCP wrapper is unavailable");
-  const child = spawn(wrapper.command, [...wrapper.args, "--bin", bin, "--server", server, "--token", token], {
+  const child = spawn(wrapper.command, [...wrapper.args, "--bin", bin, "--server", server], {
     env: {
       ...process.env,
       OPENBOT_PINCHTAB: bin,
@@ -552,6 +552,14 @@ function cookieHostsFromDb(dbPath: string): string[] {
   } catch {
     return [];
   }
+}
+
+function modeOf(path: string): number {
+  return statSync(path).mode & 0o777;
+}
+
+function currentCookieSnapshot(jar: string): string {
+  return resolve(jar, readlinkSync(join(jar, "current")));
 }
 
 function listChromeCookieFiles(containerName: string, profile: string): string {
@@ -1046,9 +1054,50 @@ describe("Live PinchTab Talk MCP", { timeout: 1_200_000 }, () => {
       adaHosts.some((host) => host.includes(COOKIE_HOST)),
       `Ada Default/Network/Cookies hosts=${adaHosts.join(",")} files=${listChromeCookieFiles(container, ADA_CHROME_PROFILE)}`,
     );
+    const tokenState = dockerChecked([
+      "exec",
+      container,
+      "stat",
+      "-c",
+      "%a %U %G",
+      "/etc/openbot/secrets",
+      "/etc/openbot/secrets/pinchtab.token",
+    ])
+      .trim()
+      .split("\n");
+    assert.deepEqual(tokenState, ["700 root root", "600 root root"]);
+    const bridgeState = dockerChecked([
+      "exec",
+      container,
+      "stat",
+      "-c",
+      "%a",
+      "/home/openbot/.pinchtab-d1",
+      "/home/openbot/.pinchtab-d1/config.json",
+      "/home/openbot/.pinchtab-d1/authorization.header",
+      "/home/openbot/.pinchtab-d1/bridge.log",
+    ])
+      .trim()
+      .split("\n");
+    assert.deepEqual(bridgeState, ["700", "600", "600", "600"]);
+    const containerProcesses = dockerChecked(["exec", container, "ps", "-eo", "args="]);
+    const hostProcesses = spawnSync("ps", ["-axo", "command="], { encoding: "utf8" }).stdout;
+    assert.equal(containerProcesses.includes(token), false, "container process argv exposed the PinchTab credential");
+    assert.equal(hostProcesses.includes(token), false, "host process argv exposed the PinchTab credential");
+    assert.equal(containerProcesses.includes("Authorization: Bearer"), false, "container argv exposed authorization");
+    assert.equal(hostProcesses.includes("Authorization: Bearer"), false, "host argv exposed authorization");
     const stopped = spawnSync("docker", ["exec", container, DISPLAY_BIN, "stop", "1"], { encoding: "utf8" });
     assert.equal(stopped.status, 0, stopped.stderr);
-    const jarHosts = cookieHostsFromDb(join(cookiesDir, "Network", "Cookies"));
+    assert.match(stopped.stdout, /cookie export committed generation/u);
+    const snapshot = currentCookieSnapshot(cookiesDir);
+    const manifest = readFileSync(join(snapshot, "manifest"), "utf8");
+    assert.match(manifest, /^schema=1\nstate=committed\ngeneration=generation-[A-Za-z0-9]+\nepoch=[0-9]+\n$/u);
+    assert.equal(modeOf(cookiesDir), 0o700);
+    assert.equal(modeOf(join(cookiesDir, "snapshots")), 0o700);
+    assert.equal(modeOf(snapshot), 0o700);
+    assert.equal(modeOf(join(snapshot, "manifest")), 0o600);
+    assert.equal(modeOf(join(snapshot, "Network", "Cookies")), 0o600);
+    const jarHosts = cookieHostsFromDb(join(snapshot, "Network", "Cookies"));
     assert.ok(
       jarHosts.some((host) => host.includes(COOKIE_HOST)),
       `jar Network/Cookies missing ${COOKIE_HOST} hosts=${jarHosts.join(",")} files=${listChromeCookieFiles(container, ADA_CHROME_PROFILE)}`,

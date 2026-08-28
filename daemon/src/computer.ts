@@ -48,6 +48,23 @@ export function defaultCookieJar(cwd = process.cwd()): string {
   return path.resolve(cwd, "computer/cookies");
 }
 
+export function assertPrivateDirectoryTarget(directory: string): void {
+  const resolved = path.resolve(directory);
+  if (directory.length === 0 || resolved === path.parse(resolved).root) {
+    throw new Error(`private state directory must not be the filesystem root: ${directory || "<empty>"}`);
+  }
+}
+
+function ensurePrivateDirectory(directory: string): void {
+  assertPrivateDirectoryTarget(directory);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const state = fs.lstatSync(directory);
+  if (!state.isDirectory() || state.isSymbolicLink()) {
+    throw new Error(`cookie jar must be a private directory: ${directory}`);
+  }
+  fs.chmodSync(directory, 0o700);
+}
+
 export function parseScreenPorts(raw: string | undefined): number[] {
   if (!raw) return [];
   return raw
@@ -144,7 +161,7 @@ export class MemoryComputerRuntime implements ComputerRuntime {
     this.name = opts.containerName ?? COMPUTER_CONTAINER;
     this.pinchTabUpstreams = opts.pinchTabUpstreams ?? [];
     this.pinchTabTokenValue = opts.pinchTabToken;
-    fs.mkdirSync(this.cookieDir, { recursive: true });
+    ensurePrivateDirectory(this.cookieDir);
   }
 
   cookieJar(): string {
@@ -216,7 +233,7 @@ export class NoopComputerRuntime implements ComputerRuntime {
   constructor(cookiesDir = defaultCookieJar(), upstream?: string) {
     this.cookieDir = cookiesDir;
     this.base = upstream;
-    fs.mkdirSync(this.cookieDir, { recursive: true });
+    ensurePrivateDirectory(this.cookieDir);
   }
 
   cookieJar(): string {
@@ -285,7 +302,7 @@ export class DockerComputerRuntime implements ComputerRuntime {
     this.pinchTabTokenValue = opts.pinchTabToken ?? process.env.PINCHTAB_TOKEN;
     this.cookiesDir = opts.cookiesDir ?? defaultCookieJar();
     this.docker = opts.docker ?? defaultDocker(opts.env ?? process.env);
-    fs.mkdirSync(this.cookiesDir, { recursive: true });
+    ensurePrivateDirectory(this.cookiesDir);
     if (opts.workspaceDir) fs.mkdirSync(opts.workspaceDir, { recursive: true });
   }
 

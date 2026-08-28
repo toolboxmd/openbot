@@ -301,9 +301,9 @@ export function runPinchTabAllowlistProxy(
 ) {
   const bin = env.OPENBOT_PINCHTAB || argvValue("--bin");
   const server = env.OPENBOT_PINCHTAB_SERVER || argvValue("--server");
-  const token = env.PINCHTAB_TOKEN || argvValue("--token");
-  if (!bin || !server) {
-    console.error("OPENBOT_PINCHTAB and OPENBOT_PINCHTAB_SERVER are required");
+  const token = env.PINCHTAB_TOKEN;
+  if (!bin || !server || !token) {
+    console.error("OPENBOT_PINCHTAB, OPENBOT_PINCHTAB_SERVER, and PINCHTAB_TOKEN are required");
     return Promise.resolve(1);
   }
   const configuredRequestTimeout = Number(env.OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS);
@@ -325,7 +325,7 @@ export function runPinchTabAllowlistProxy(
       : DEFAULT_RPC_ID_LEDGER_MAX;
 
   const child = spawn(bin, ["--server", server, "mcp"], {
-    env: { ...env, PINCHTAB_TOKEN: token ?? "" },
+    env: { ...env, PINCHTAB_TOKEN: token },
     stdio: ["pipe", "pipe", "inherit"],
   });
 
