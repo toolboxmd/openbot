@@ -380,7 +380,7 @@ describe("ACP Computer-help elicitation", () => {
           setTimeout(() => reject(new Error("overflow left the ACP prompt pending")), 2_000);
         }),
       ]),
-      /ACP client closed|ACP child exited/,
+      /ACP transport protocol error|ACP client closed|ACP child exited/,
     );
     acp.close();
   });

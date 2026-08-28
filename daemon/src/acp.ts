@@ -4,7 +4,6 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import readline from "node:readline";
 import { TextDecoder } from "node:util";
 import {
   COMPUTER_HELP_COMPLETE_FIELD,
@@ -18,14 +17,38 @@ import type { SpawnSpec } from "./harness.ts";
 type RpcId = number | string;
 const TERMINAL_ELICITATION_LIMIT = 128;
 const ACP_PROTOCOL_ERROR_MESSAGE = "ACP transport protocol error";
-/** ACP is newline-delimited JSON. One input frame may occupy at most 1 MiB before its newline. */
+/** One stdout JSON line or stderr line may occupy at most 1 MiB before its newline. */
 const MAX_ACP_INPUT_LINE_BYTES = 1024 * 1024;
+/** One active prompt generation may receive at most 16 MiB across stdout and stderr. */
+const MAX_ACTIVE_TURN_WIRE_BYTES = 16 * 1024 * 1024;
+/** One active prompt generation may retain at most 1 MiB of extracted assistant UTF-8 text. */
+const MAX_ACTIVE_TURN_ASSISTANT_TEXT_BYTES = 1024 * 1024;
+/** One active prompt generation may process at most 4,096 complete transport items. */
+const MAX_ACTIVE_TURN_ITEMS = 4_096;
+/** One active prompt generation may own at most 16 simultaneous server requests. */
+const MAX_ACTIVE_SERVER_REQUESTS = 16;
+/** One active prompt generation may see at most 128 unique server-request identities. */
+const MAX_ACTIVE_TURN_SERVER_REQUESTS = 128;
 /** ACP content may nest deeply enough for normal structured output without risking parser exhaustion. */
 const MAX_ACP_CONTENT_DEPTH = 256;
 /** Each startup/attach request, local prompt handoff, and cancelled-prompt drain gets 60 seconds. A flushed, uncancelled Bot Turn has no transport deadline. */
 const ACP_START_DEADLINE_MS = 60_000;
 /** A failed ACP transport gets one second after TERM before its owned process group is force-killed. */
 const ACP_TERMINATE_GRACE_MS = 1_000;
+/** Match Node readline's default interval for absorbing LF after a chunk-ending CR. */
+const STDERR_CRLF_DELAY_MS = 100;
+
+type ActiveTurnLedger = {
+  generation: number;
+  wireBytes: number;
+  assistantTextBytes: number;
+  items: number;
+  uniqueServerRequests: Array<{
+    kind: ActiveServerRequest["kind"];
+    rpcId: RpcId;
+    requestParams: Record<string, unknown>;
+  }>;
+};
 
 function hasOwn(record: Record<string, unknown>, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(record, key);
@@ -314,14 +337,21 @@ export type AcpClientOptions = {
   terminateGraceMs?: number;
 };
 
-function extractText(content: unknown): string | null {
+function extractText(
+  content: unknown,
+  maxUtf8Bytes: number,
+): { pieces: string[]; utf8Bytes: number } | null {
   const pieces: string[] = [];
+  let utf8Bytes = 0;
   const pending: Array<{ value: unknown; depth: number }> = [{ value: content, depth: 0 }];
   while (pending.length > 0) {
     const entry = pending.pop();
     if (!entry) break;
     if (entry.depth > MAX_ACP_CONTENT_DEPTH) return null;
     if (typeof entry.value === "string") {
+      const bytes = Buffer.byteLength(entry.value, "utf8");
+      if (bytes > maxUtf8Bytes - utf8Bytes) return null;
+      utf8Bytes += bytes;
       pieces.push(entry.value);
       continue;
     }
@@ -334,12 +364,15 @@ function extractText(content: unknown): string | null {
     if (typeof entry.value !== "object" || entry.value === null) continue;
     const record = entry.value as Record<string, unknown>;
     if (typeof record.text === "string") {
+      const bytes = Buffer.byteLength(record.text, "utf8");
+      if (bytes > maxUtf8Bytes - utf8Bytes) return null;
+      utf8Bytes += bytes;
       pieces.push(record.text);
     } else if (record.content !== undefined) {
       pending.push({ value: record.content, depth: entry.depth + 1 });
     }
   }
-  return pieces.join("");
+  return { pieces, utf8Bytes };
 }
 
 export function isAuthError(err: unknown): boolean {
@@ -399,6 +432,8 @@ export class AcpClient {
   private callbackContext = new AsyncLocalStorage<CallbackContext>();
   private callbackChain: CallbackChain;
   private stdoutBuffer = Buffer.alloc(0);
+  private stderrBuffer = Buffer.alloc(0);
+  private stderrSawCrAt = 0;
   private closed = false;
   private transportError: Error | null = null;
   private sessionId: string | null = null;
@@ -411,12 +446,14 @@ export class AcpClient {
   private gotIdle = false;
   private generation = 0;
   private activeGen = 0;
+  private activeTurnLedger: ActiveTurnLedger | null = null;
   private promptId: RpcId | null = null;
   private promptHandoffPending = false;
   private activeHandlers: AcpHandlers | null = null;
   private promptDrain: Promise<void> | null = null;
   private cancelledPromptDrain: {
     promptId: RpcId;
+    generation: number;
     resolve: () => void;
     reject: (error: Error) => void;
     timer: NodeJS.Timeout;
@@ -484,18 +521,8 @@ export class AcpClient {
     });
     this.ownedProcessGroupId = ownsProcessGroup ? (this.child.pid ?? null) : null;
     this.child.stdout.on("data", (chunk: Buffer) => this.onStdoutData(chunk));
-    const err = readline.createInterface({ input: this.child.stderr });
-    err.on("line", (line) => {
-      if (this.transportError || this.closed) {
-        void this.invokeCallback(this.processStderrHandler, [line], { cleanup: true });
-        return;
-      }
-      void this.invokeCallback(
-        this.handlers.onStderr,
-        [line],
-        { discardProcessStderr: true },
-      );
-    });
+    this.child.stderr.on("data", (chunk: Buffer) => this.onStderrData(chunk));
+    this.child.stderr.once("end", () => this.flushStderrFragment());
     this.child.stdin.on("error", () => {
       this.failTransport(transportFailureError());
     });
@@ -504,6 +531,7 @@ export class AcpClient {
     });
     this.child.once("exit", () => {
       this.childExited = true;
+      this.flushStderrFragment();
       if (!this.ownedProcessGroupExists()) this.clearForceKillTimer();
       this.failTransport(new Error("ACP child exited"));
     });
@@ -834,6 +862,8 @@ export class AcpClient {
     this.detachCallbackChain();
     this.pendingResponseFlushCallbacks.clear();
     this.stdoutBuffer = Buffer.alloc(0);
+    this.discardStderrFragment();
+    this.activeTurnLedger = null;
     this.generation += 1;
     this.activeGen = this.generation;
     this.sessionId = null;
@@ -941,7 +971,7 @@ export class AcpClient {
     return new Promise((resolve) => this.idleResolvers.push(resolve));
   }
 
-  private beginCancelledPromptDrain(promptId: RpcId): void {
+  private beginCancelledPromptDrain(promptId: RpcId, generation: number): void {
     this.finishCancelledPromptDrain();
     let resolve!: () => void;
     let reject!: (error: Error) => void;
@@ -954,7 +984,7 @@ export class AcpClient {
       this.failTransport(cancelledError(true));
     }, this.startDeadlineMs);
     timer.unref();
-    this.cancelledPromptDrain = { promptId, resolve, reject, timer };
+    this.cancelledPromptDrain = { promptId, generation, resolve, reject, timer };
     this.promptDrain = drain;
     void drain.then(
       () => {
@@ -972,7 +1002,93 @@ export class AcpClient {
     this.cancelledPromptDrain = null;
     clearTimeout(drain.timer);
     if (error) drain.reject(error);
-    else drain.resolve();
+    else {
+      this.retireActiveTurnLedger(drain.generation);
+      drain.resolve();
+    }
+    return true;
+  }
+
+  private beginActiveTurnLedger(generation: number): void {
+    this.activeTurnLedger = {
+      generation,
+      wireBytes: 0,
+      assistantTextBytes: 0,
+      items: 0,
+      uniqueServerRequests: [],
+    };
+  }
+
+  private retireActiveTurnLedger(generation: number): void {
+    if (this.activeTurnLedger?.generation === generation) this.activeTurnLedger = null;
+  }
+
+  private chargeActiveTurnWireBytes(bytes: number): boolean {
+    const ledger = this.activeTurnLedger;
+    if (!ledger) return true;
+    if (bytes > MAX_ACTIVE_TURN_WIRE_BYTES - ledger.wireBytes) {
+      this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+      return false;
+    }
+    ledger.wireBytes += bytes;
+    return true;
+  }
+
+  private chargeActiveTurnItem(): boolean {
+    const ledger = this.activeTurnLedger;
+    if (!ledger) return true;
+    if (ledger.items >= MAX_ACTIVE_TURN_ITEMS) {
+      this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+      return false;
+    }
+    ledger.items += 1;
+    return true;
+  }
+
+  private activeTurnAssistantTextRemaining(): number {
+    const ledger = this.activeTurnLedger;
+    return ledger
+      ? MAX_ACTIVE_TURN_ASSISTANT_TEXT_BYTES - ledger.assistantTextBytes
+      : MAX_ACTIVE_TURN_ASSISTANT_TEXT_BYTES;
+  }
+
+  private chargeActiveTurnAssistantText(bytes: number): boolean {
+    const ledger = this.activeTurnLedger;
+    if (!ledger) return true;
+    if (bytes > MAX_ACTIVE_TURN_ASSISTANT_TEXT_BYTES - ledger.assistantTextBytes) {
+      this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+      return false;
+    }
+    ledger.assistantTextBytes += bytes;
+    return true;
+  }
+
+  private chargeActiveTurnServerRequest(
+    kind: ActiveServerRequest["kind"],
+    rpcId: RpcId,
+    requestParams: Record<string, unknown>,
+  ): boolean {
+    const ledger = this.activeTurnLedger;
+    if (!ledger) return true;
+    if (ledger.uniqueServerRequests.some((identity) => (
+      identity.kind === kind
+      && identity.rpcId === rpcId
+      && jsonValuesEqual(identity.requestParams, requestParams)
+    ))) {
+      return true;
+    }
+    if (ledger.uniqueServerRequests.length >= MAX_ACTIVE_TURN_SERVER_REQUESTS) {
+      this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+      return false;
+    }
+    let requestSnapshot: Record<string, unknown>;
+    try {
+      requestSnapshot = structuredClone(requestParams);
+    } catch {
+      this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+      return false;
+    }
+    ledger.uniqueServerRequests.push({ kind, rpcId, requestParams: requestSnapshot });
     return true;
   }
 
@@ -986,7 +1102,7 @@ export class AcpClient {
   private claimServerRequest(
     rpcId: RpcId,
     kind: ActiveServerRequest["kind"],
-    requestParams?: Record<string, unknown>,
+    requestParams: Record<string, unknown>,
   ): boolean {
     const active = this.activeServerRequests.get(rpcId);
     if (active) {
@@ -995,11 +1111,15 @@ export class AcpClient {
         kind === "elicitation"
         && active.kind === "elicitation"
         && computerHelp?.generation === active.generation
-        && requestParams !== undefined
         && jsonValuesEqual(computerHelp.requestParams, requestParams)
       ) {
         return false;
       }
+      this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+      return false;
+    }
+    if (!this.chargeActiveTurnServerRequest(kind, rpcId, requestParams)) return false;
+    if (this.activeServerRequests.size >= MAX_ACTIVE_SERVER_REQUESTS) {
       this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
       return false;
     }
@@ -1189,6 +1309,7 @@ export class AcpClient {
 
   private onStdoutData(chunk: Buffer): void {
     if (this.transportError || this.closed) return;
+    if (!this.chargeActiveTurnWireBytes(chunk.length)) return;
     let offset = 0;
     while (offset < chunk.length) {
       const newline = chunk.indexOf(0x0a, offset);
@@ -1213,10 +1334,91 @@ export class AcpClient {
         this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
         return;
       }
+      if (decoded.trim() && !this.chargeActiveTurnItem()) return;
       this.onLine(decoded);
       if (this.transportError || this.closed) return;
       offset = newline + 1;
     }
+  }
+
+  private onStderrData(chunk: Buffer): void {
+    if (
+      !this.transportError
+      && !this.closed
+      && !this.chargeActiveTurnWireBytes(chunk.length)
+    ) {
+      return;
+    }
+    let offset = 0;
+    if (this.stderrSawCrAt > 0) {
+      if (
+        Date.now() - this.stderrSawCrAt <= STDERR_CRLF_DELAY_MS
+        && chunk[0] === 0x0a
+      ) {
+        offset = 1;
+      }
+      this.stderrSawCrAt = 0;
+    }
+    while (offset < chunk.length) {
+      let delimiter = offset;
+      while (
+        delimiter < chunk.length
+        && chunk[delimiter] !== 0x0a
+        && chunk[delimiter] !== 0x0d
+      ) {
+        delimiter += 1;
+      }
+      if (!this.appendStderrSegment(chunk.subarray(offset, delimiter))) return;
+      if (delimiter === chunk.length) return;
+      const isCrLf = chunk[delimiter] === 0x0d && chunk[delimiter + 1] === 0x0a;
+      if (chunk[delimiter] === 0x0d && delimiter + 1 === chunk.length) {
+        this.stderrSawCrAt = Date.now();
+      }
+      if (!this.dispatchStderrLine()) return;
+      offset = delimiter + (isCrLf ? 2 : 1);
+    }
+  }
+
+  private appendStderrSegment(segment: Buffer): boolean {
+    const lineLength = this.stderrBuffer.length + segment.length;
+    if (lineLength > MAX_ACP_INPUT_LINE_BYTES) {
+      this.discardStderrFragment();
+      if (!this.transportError && !this.closed) {
+        this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+      }
+      return false;
+    }
+    if (segment.length > 0) {
+      this.stderrBuffer = Buffer.concat([this.stderrBuffer, segment], lineLength);
+    }
+    return true;
+  }
+
+  private dispatchStderrLine(): boolean {
+    const line = this.stderrBuffer;
+    this.stderrBuffer = Buffer.alloc(0);
+    if (!this.chargeActiveTurnItem()) return false;
+    const decoded = new TextDecoder("utf-8").decode(line);
+    if (this.transportError || this.closed) {
+      void this.invokeCallback(this.processStderrHandler, [decoded], { cleanup: true });
+    } else {
+      void this.invokeCallback(
+        this.handlers.onStderr,
+        [decoded],
+        { discardProcessStderr: true },
+      );
+    }
+    return true;
+  }
+
+  private flushStderrFragment(): void {
+    if (this.stderrBuffer.length === 0) return;
+    this.dispatchStderrLine();
+  }
+
+  private discardStderrFragment(): void {
+    this.stderrSawCrAt = 0;
+    this.stderrBuffer = Buffer.alloc(0);
   }
 
   private onLine(line: string): void {
@@ -1294,13 +1496,14 @@ export class AcpClient {
     if (msg.method === "session/request_permission") {
       if (msg.id === undefined) return;
       const rpcId = msg.id as RpcId;
-      if (!this.claimServerRequest(rpcId, "permission")) return;
+      const requestParams = msg.params as Record<string, unknown>;
+      if (!this.claimServerRequest(rpcId, "permission", requestParams)) return;
       this.pendingPermissions.set(rpcId, { generation: this.activeGen, responding: false });
       if (this.activeGen !== this.generation) {
         this.cancelPermission(rpcId);
         return;
       }
-      const params = (msg.params ?? {}) as {
+      const params = requestParams as {
         title?: string;
         toolCall?: {
           title?: string;
@@ -1332,8 +1535,11 @@ export class AcpClient {
     if (msg.method === "elicitation/create") {
       if (msg.id === undefined) return;
       const rpcId = msg.id as RpcId;
-      if (this.terminalElicitations.has(rpcId)) return;
       const requestParams = msg.params as Record<string, unknown>;
+      if (this.terminalElicitations.has(rpcId)) {
+        this.chargeActiveTurnServerRequest("elicitation", rpcId, requestParams);
+        return;
+      }
       if (!this.claimServerRequest(rpcId, "elicitation", requestParams)) return;
       if (
         this.terminalElicitationLimitReached
@@ -1402,11 +1608,15 @@ export class AcpClient {
     if (this.activeGen !== this.generation) return;
     const kind = String(update.sessionUpdate ?? update.session_update ?? "");
     if (kind === "agent_message_chunk") {
-      const piece = extractText(update.content);
-      if (piece === null) {
+      const extracted = extractText(update.content, this.activeTurnAssistantTextRemaining());
+      if (extracted === null) {
         this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
         return;
       }
+      if (!this.chargeActiveTurnAssistantText(extracted.utf8Bytes)) return;
+      const piece = extracted.pieces.length === 1
+        ? extracted.pieces[0] ?? ""
+        : extracted.pieces.join("");
       if (!piece) return;
       const messageId = readMessageId(update);
       const startsIdentifiedMessage = messageId !== undefined
@@ -1429,11 +1639,15 @@ export class AcpClient {
       return;
     }
     if (kind === "agent_message") {
-      const piece = extractText(update.content);
-      if (piece === null) {
+      const extracted = extractText(update.content, this.activeTurnAssistantTextRemaining());
+      if (extracted === null) {
         this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
         return;
       }
+      if (!this.chargeActiveTurnAssistantText(extracted.utf8Bytes)) return;
+      const piece = extracted.pieces.length === 1
+        ? extracted.pieces[0] ?? ""
+        : extracted.pieces.join("");
       if (!piece) return;
       const messageId = readMessageId(update);
       const completesOpenStream = this.streaming && (
@@ -1563,6 +1777,7 @@ export class AcpClient {
     this.openMessageId = null;
     this.nonTextBoundary = false;
     this.gotIdle = false;
+    this.beginActiveTurnLedger(myGen);
     const id = this.nextId++;
     this.promptId = id;
     this.promptHandoffPending = true;
@@ -1628,6 +1843,9 @@ export class AcpClient {
       }
       if (this.abortPrompt === abortPrompt) this.abortPrompt = null;
       if (this.activeGen === myGen) this.activeHandlers = null;
+      if (this.cancelledPromptDrain?.generation !== myGen) {
+        this.retireActiveTurnLedger(myGen);
+      }
     }
   }
 
@@ -1657,7 +1875,7 @@ export class AcpClient {
       this.pending.delete(cancelledPromptId);
       pending?.reject(error);
       this.promptId = null;
-      this.beginCancelledPromptDrain(cancelledPromptId);
+      this.beginCancelledPromptDrain(cancelledPromptId, cancelledGeneration);
     }
     const abort = this.abortPrompt;
     this.abortPrompt = null;
