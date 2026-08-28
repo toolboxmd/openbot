@@ -292,7 +292,7 @@ export function Eyes({ name = "OpenBot", shape, color, size = 40, mode = "idle",
     }
 
     function loop(now: number) {
-      const dt = Math.min(0.05, (now - last) / 1000);
+      const dt = clamp((now - last) / 1000, 0, 0.05);
       last = now;
       paint(dt);
       raf = requestAnimationFrame(loop);
