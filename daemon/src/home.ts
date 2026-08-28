@@ -412,10 +412,17 @@ export class HomeStore {
       .run(channelId, cursor.sequence, cursor.revision, updatedAt);
   }
 
-  createGroup(input: { title?: string | null; memberBotIds: string[] }): StoredChannel {
-    const memberBotIds = uniqueIds(input.memberBotIds);
-    if (memberBotIds.length === 0) {
+  createGroup(input: { title: string; memberBotIds: string[] }): StoredChannel {
+    const title = input.title.trim();
+    if (!title) {
+      throw Object.assign(new Error("title is required"), { status: 400 });
+    }
+    const memberBotIds = input.memberBotIds.map((id) => id.trim());
+    if (memberBotIds.length === 0 || memberBotIds.some((id) => !id)) {
       throw Object.assign(new Error("members are required"), { status: 400 });
+    }
+    if (new Set(memberBotIds).size !== memberBotIds.length) {
+      throw Object.assign(new Error("group needs at least two distinct Bots"), { status: 400 });
     }
     const bots = this.listBots();
     const byId = new Map(bots.map((bot) => [bot.id, bot]));
@@ -423,9 +430,8 @@ export class HomeStore {
       if (!byId.has(id)) throw Object.assign(new Error("unknown Bot"), { status: 400 });
     }
     if (memberBotIds.length < 2) {
-      throw Object.assign(new Error("group needs several Bots"), { status: 400 });
+      throw Object.assign(new Error("group needs at least two distinct Bots"), { status: 400 });
     }
-    const title = typeof input.title === "string" && input.title.trim() ? input.title.trim() : null;
     const createdAt = new Date().toISOString();
     const id = crypto.randomUUID();
     const members: ChannelMember[] = [
@@ -1159,18 +1165,6 @@ function reviveGrant(row: SqlRow): StoredHostGrant[] {
 function reviveMember(row: SqlRow): ChannelMember[] {
   if ((row.member_kind !== "user" && row.member_kind !== "bot") || typeof row.member_id !== "string") return [];
   return [{ kind: row.member_kind, id: row.member_id }];
-}
-
-function uniqueIds(ids: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const raw of ids) {
-    const id = raw.trim();
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
-    out.push(id);
-  }
-  return out;
 }
 
 function isChannelKind(value: unknown): value is ChannelKind {

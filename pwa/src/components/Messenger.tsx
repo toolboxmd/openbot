@@ -32,6 +32,7 @@ import {
 } from "@/components/FirstUse";
 import { MessengerShell, SelectedBotSurface, type MobileSurface } from "@/components/MessengerShell";
 import { NewBotDialog } from "@/components/NewBotDialog";
+import { NewChannelDialog } from "@/components/NewChannelDialog";
 import { StackedEyes } from "@/components/StackedEyes";
 import { TranscriptCard } from "@/components/TranscriptCard";
 import { useUiPreferences } from "@/components/UiPreferencesProvider";
@@ -119,6 +120,7 @@ import {
   answerHostGrant,
   answerPermission,
   createBot,
+  createGroupChannel,
   getBot,
   getChannel,
   listBots,
@@ -483,6 +485,7 @@ export function Messenger() {
     () => window.matchMedia(TRANSCRIPT_DESKTOP_QUERY).matches,
   );
   const [commandPaletteOpen, setCommandPaletteOpenState] = useState(false);
+  const [newChannelOpen, setNewChannelOpenState] = useState(false);
   const openChatsButtonRef = useRef<HTMLButtonElement | null>(null);
   const closeChatsButtonRef = useRef<HTMLButtonElement | null>(null);
   const computerButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -560,6 +563,9 @@ export function Messenger() {
     returnTarget: pluginsReturnTargetRef.current,
   });
   const visibleComputerOpenRef = useRef(visibleComputerOpen);
+  const createdChannelSequencesRef = useRef(new Map<string, number>());
+  const createChannelRequestRef = useRef(createLatestRequestScope());
+  const newChannelOpenRef = useRef(newChannelOpen);
   globalRouteRef.current = globalRoute;
   mobileSurfaceRef.current = mobileSurface;
   desktopLayoutRef.current = desktopLayout;
@@ -574,10 +580,12 @@ export function Messenger() {
   });
   const paletteShortcutEnabled = !appSettingsOpen
     && !newBotOpen
+    && !newChannelOpen
     && !selectedBotPanelBlocksCurrentChat;
   const blockingChatSurfaceOpen = commandPaletteOpen
     || appSettingsOpen
     || newBotOpen
+    || newChannelOpen
     || selectedBotPanelBlocksCurrentChat;
   const composerKind = activeGroup ? "group" : active?.messages !== undefined ? "direct" : null;
   const activeDraftKey = activeGroup
@@ -595,6 +603,11 @@ export function Messenger() {
   function setNewBotOpen(next: boolean) {
     newBotOpenRef.current = next;
     setNewBotOpenState(next);
+  }
+
+  function setNewChannelOpen(next: boolean) {
+    newChannelOpenRef.current = next;
+    setNewChannelOpenState(next);
   }
 
   function setCommandPaletteOpen(next: boolean) {
@@ -645,6 +658,7 @@ export function Messenger() {
     return commandPaletteOpenRef.current
       || appSettingsOpenRef.current
       || newBotOpenRef.current
+      || newChannelOpenRef.current
       || selectedBotPanelBlocksChat({ desktopLayout: desktopLayoutRef.current, panelOpen });
   }
 
@@ -1044,6 +1058,7 @@ export function Messenger() {
       channelListRequestRef.current.cancel();
       harnessListRequestRef.current.cancel();
       createBotRequestRef.current.cancel();
+      createChannelRequestRef.current.cancel();
       sendRequestControllerRef.current?.abort();
       sendRequestControllerRef.current = null;
       reactionRequestControllerRef.current?.abort();
@@ -1357,6 +1372,32 @@ export function Messenger() {
     setMobileSurface("chat");
   }
 
+  async function createOrderedChannel(input: { title: string; botIds: string[] }): Promise<Channel> {
+    const identity = createChannelRequestRef.current.begin();
+    const { snapshot, sequence } = await reserveSnapshotRequest(
+      nextChannelSnapshotSequence,
+      () => createGroupChannel(input, identity.signal),
+    );
+    if (!identity.isCurrent()) throw identity.signal.reason ?? new DOMException("Aborted", "AbortError");
+    createdChannelSequencesRef.current.set(snapshot.id, sequence);
+    return snapshot;
+  }
+
+  function openCreatedGroup(channel: Channel) {
+    inboxMutationGenerationRef.current += 1;
+    const snapshotSequence = createdChannelSequencesRef.current.get(channel.id) ?? nextChannelSnapshotSequence();
+    createdChannelSequencesRef.current.delete(channel.id);
+    const accepted = acceptOrderedSnapshots(channelSnapshotAppliedRef.current, [channel], snapshotSequence)[0];
+    const remembered = accepted
+      ? rememberChannelSnapshot(accepted)
+      : latestChannelSnapshotsRef.current.get(channel.id);
+    if (!remembered) return;
+    setError(null);
+    setChannels((current) => mergeInboxSnapshots(current, [remembered]));
+    setChannelsState("ready");
+    openGroup(remembered);
+  }
+
   function openNewBot(event: MouseEvent<HTMLButtonElement>) {
     newBotOpenerRef.current = event.currentTarget;
     setNewBotOpen(true);
@@ -1365,6 +1406,10 @@ export function Messenger() {
   function openNewBotFromMenu() {
     newBotOpenerRef.current = createMenuTriggerRef.current;
     setNewBotOpen(true);
+  }
+
+  function openNewChannelFromMenu() {
+    setNewChannelOpen(true);
   }
 
   function openPlugins(returnTarget: PluginsReturnTarget) {
@@ -2217,6 +2262,10 @@ export function Messenger() {
                     <Plus />
                     New Bot
                   </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={openNewChannelFromMenu}>
+                    <MessageSquare />
+                    New Channel
+                  </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
               <Tooltip>
@@ -2749,6 +2798,15 @@ export function Messenger() {
         destinationRef={newBotDestinationRef}
         onCreate={createOrderedBot}
         onCreated={openCreatedBot}
+      />
+      <NewChannelDialog
+        open={newChannelOpen}
+        onOpenChange={setNewChannelOpen}
+        openerRef={createMenuTriggerRef}
+        destinationRef={chatRegionRef}
+        bots={bots}
+        onCreate={createOrderedChannel}
+        onCreated={openCreatedGroup}
       />
       <MessengerCommandPalette
         open={commandPaletteOpen}

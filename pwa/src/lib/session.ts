@@ -144,7 +144,7 @@ export async function listChannels(signal?: AbortSignal): Promise<{ channels: Ch
 }
 
 export async function createGroupChannel(
-  input: { title?: string; botIds: string[] },
+  input: { title: string; botIds: string[] },
   signal?: AbortSignal,
 ): Promise<Channel> {
   const res = await fetch("/api/channels", {

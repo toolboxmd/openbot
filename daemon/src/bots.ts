@@ -433,11 +433,13 @@ export class BotStore {
   }
 
   createGroup(input: { title?: unknown; botIds?: unknown }): PublicChannel {
+    if (typeof input.title !== "string") {
+      throw Object.assign(new Error("title is required"), { status: 400 });
+    }
     if (!Array.isArray(input.botIds) || input.botIds.some((id) => typeof id !== "string")) {
       throw Object.assign(new Error("botIds is required"), { status: 400 });
     }
-    const title = typeof input.title === "string" ? input.title : undefined;
-    const channel = this.home.createGroup({ title, memberBotIds: input.botIds as string[] });
+    const channel = this.home.createGroup({ title: input.title, memberBotIds: input.botIds as string[] });
     return this.toPublicChannel(channel);
   }
 
