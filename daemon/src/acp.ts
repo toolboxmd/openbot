@@ -19,12 +19,12 @@ const TERMINAL_ELICITATION_LIMIT = 128;
 const ACP_PROTOCOL_ERROR_MESSAGE = "ACP transport protocol error";
 /** One stdout JSON line or stderr line may occupy at most 1 MiB before its newline. */
 const MAX_ACP_INPUT_LINE_BYTES = 1024 * 1024;
-/** One active prompt generation may receive at most 16 MiB across stdout and stderr. */
-const MAX_ACTIVE_TURN_WIRE_BYTES = 16 * 1024 * 1024;
+/** One lifecycle output phase may receive at most 16 MiB across stdout and stderr. */
+const MAX_LIFECYCLE_PHASE_WIRE_BYTES = 16 * 1024 * 1024;
 /** One active prompt generation may retain at most 1 MiB of extracted assistant UTF-8 text. */
 const MAX_ACTIVE_TURN_ASSISTANT_TEXT_BYTES = 1024 * 1024;
-/** One active prompt generation may process at most 4,096 complete transport items. */
-const MAX_ACTIVE_TURN_ITEMS = 4_096;
+/** One lifecycle output phase may process at most 4,096 complete transport items. */
+const MAX_LIFECYCLE_PHASE_ITEMS = 4_096;
 /** One active prompt generation may own at most 16 simultaneous server requests. */
 const MAX_ACTIVE_SERVER_REQUESTS = 16;
 /** One active prompt generation may see at most 128 unique server-request identities. */
@@ -38,11 +38,36 @@ const ACP_TERMINATE_GRACE_MS = 1_000;
 /** Match Node readline's default interval for absorbing LF after a chunk-ending CR. */
 const STDERR_CRLF_DELAY_MS = 100;
 
+type LifecycleOutputPhaseKind = "startup" | "attachment" | "active-turn" | "idle";
+
+type LifecycleOutputLedger = {
+  kind: LifecycleOutputPhaseKind;
+  generation?: number;
+  wireBytes: number;
+  items: number;
+  done: Promise<void>;
+  resolveDone: () => void;
+};
+
+function createLifecycleOutputLedger(
+  kind: LifecycleOutputPhaseKind,
+  generation?: number,
+): LifecycleOutputLedger {
+  let resolveDone!: () => void;
+  const done = new Promise<void>((resolve) => { resolveDone = resolve; });
+  return {
+    kind,
+    ...(generation === undefined ? {} : { generation }),
+    wireBytes: 0,
+    items: 0,
+    done,
+    resolveDone,
+  };
+}
+
 type ActiveTurnLedger = {
   generation: number;
-  wireBytes: number;
   assistantTextBytes: number;
-  items: number;
   uniqueServerRequests: Array<{
     kind: ActiveServerRequest["kind"];
     rpcId: RpcId;
@@ -469,8 +494,11 @@ export class AcpClient {
   private callbackContext = new AsyncLocalStorage<CallbackContext>();
   private callbackChain: CallbackChain;
   private stdoutBuffer = Buffer.alloc(0);
+  private stdoutItemLedger: LifecycleOutputLedger | null = null;
   private stderrBuffer = Buffer.alloc(0);
+  private stderrItemLedger: LifecycleOutputLedger | null = null;
   private stderrSawCrAt = 0;
+  private stderrCrLfLedger: LifecycleOutputLedger | null = null;
   private closed = false;
   private transportError: Error | null = null;
   private sessionId: string | null = null;
@@ -483,6 +511,7 @@ export class AcpClient {
   private gotIdle = false;
   private generation = 0;
   private activeGen = 0;
+  private lifecycleOutputLedger: LifecycleOutputLedger | null = createLifecycleOutputLedger("startup");
   private activeTurnLedger: ActiveTurnLedger | null = null;
   private promptId: RpcId | null = null;
   private promptHandoffPending = false;
@@ -491,6 +520,7 @@ export class AcpClient {
   private cancelledPromptDrain: {
     promptId: RpcId;
     generation: number;
+    settlementQueued: boolean;
     resolve: () => void;
     reject: (error: Error) => void;
     timer: NodeJS.Timeout;
@@ -968,7 +998,14 @@ export class AcpClient {
     this.detachCallbackChain();
     this.pendingResponseFlushCallbacks.clear();
     this.stdoutBuffer = Buffer.alloc(0);
+    this.stdoutItemLedger = null;
+    const pendingCrLf = this.stderrSawCrAt;
+    const pendingCrLfLedger = this.stderrCrLfLedger;
     this.discardStderrFragment();
+    this.stderrSawCrAt = pendingCrLf;
+    this.stderrCrLfLedger = pendingCrLfLedger;
+    this.lifecycleOutputLedger?.resolveDone();
+    this.lifecycleOutputLedger = null;
     this.activeTurnLedger = null;
     this.generation += 1;
     this.activeGen = this.generation;
@@ -1090,7 +1127,14 @@ export class AcpClient {
       this.failTransport(cancelledError(true));
     }, this.startDeadlineMs);
     timer.unref();
-    this.cancelledPromptDrain = { promptId, generation, resolve, reject, timer };
+    this.cancelledPromptDrain = {
+      promptId,
+      generation,
+      settlementQueued: false,
+      resolve,
+      reject,
+      timer,
+    };
     this.promptDrain = drain;
     void drain.then(
       () => {
@@ -1115,24 +1159,58 @@ export class AcpClient {
     return true;
   }
 
-  private beginActiveTurnLedger(generation: number): void {
+  private beginLifecycleOutputPhase(
+    kind: Exclude<LifecycleOutputPhaseKind, "idle">,
+    generation?: number,
+  ): LifecycleOutputLedger | null {
+    if (this.transportError || this.closed) return null;
+    const current = this.lifecycleOutputLedger;
+    if (kind === "startup" && current?.kind === "startup") return current;
+    if (current?.kind !== "idle") {
+      this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+      return null;
+    }
+    current.resolveDone();
+    const next = createLifecycleOutputLedger(kind, generation);
+    this.lifecycleOutputLedger = next;
+    return next;
+  }
+
+  private finishLifecycleOutputPhase(phase: LifecycleOutputLedger): void {
+    if (this.lifecycleOutputLedger !== phase) return;
+    phase.resolveDone();
+    if (this.transportError || this.closed) {
+      this.lifecycleOutputLedger = null;
+      return;
+    }
+    this.lifecycleOutputLedger = createLifecycleOutputLedger("idle");
+  }
+
+  private beginActiveTurnLedger(generation: number): boolean {
+    if (!this.beginLifecycleOutputPhase("active-turn", generation)) return false;
     this.activeTurnLedger = {
       generation,
-      wireBytes: 0,
       assistantTextBytes: 0,
-      items: 0,
       uniqueServerRequests: [],
     };
+    return true;
   }
 
   private retireActiveTurnLedger(generation: number): void {
-    if (this.activeTurnLedger?.generation === generation) this.activeTurnLedger = null;
+    if (this.activeTurnLedger?.generation !== generation) return;
+    this.activeTurnLedger = null;
+    const phase = this.lifecycleOutputLedger;
+    if (phase?.kind === "active-turn" && phase.generation === generation) {
+      this.finishLifecycleOutputPhase(phase);
+    }
   }
 
-  private chargeActiveTurnWireBytes(bytes: number): boolean {
-    const ledger = this.activeTurnLedger;
+  private chargeLifecycleWireBytes(
+    bytes: number,
+    ledger: LifecycleOutputLedger | null = this.lifecycleOutputLedger,
+  ): boolean {
     if (!ledger) return true;
-    if (bytes > MAX_ACTIVE_TURN_WIRE_BYTES - ledger.wireBytes) {
+    if (bytes > MAX_LIFECYCLE_PHASE_WIRE_BYTES - ledger.wireBytes) {
       this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
       return false;
     }
@@ -1140,14 +1218,16 @@ export class AcpClient {
     return true;
   }
 
-  private chargeActiveTurnItem(): boolean {
-    return this.chargeActiveTurnItems(1);
+  private chargeLifecycleItem(ledger = this.lifecycleOutputLedger): boolean {
+    return this.chargeLifecycleItems(1, ledger);
   }
 
-  private chargeActiveTurnItems(count: number): boolean {
-    const ledger = this.activeTurnLedger;
+  private chargeLifecycleItems(
+    count: number,
+    ledger: LifecycleOutputLedger | null = this.lifecycleOutputLedger,
+  ): boolean {
     if (!ledger) return true;
-    if (count > MAX_ACTIVE_TURN_ITEMS - ledger.items) {
+    if (count > MAX_LIFECYCLE_PHASE_ITEMS - ledger.items) {
       this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
       return false;
     }
@@ -1450,12 +1530,16 @@ export class AcpClient {
 
   private onStdoutData(chunk: Buffer): void {
     if (this.transportError || this.closed) return;
-    if (!this.chargeActiveTurnWireBytes(chunk.length)) return;
     let offset = 0;
     while (offset < chunk.length) {
       const newline = chunk.indexOf(0x0a, offset);
       const end = newline === -1 ? chunk.length : newline;
       const segment = chunk.subarray(offset, end);
+      const itemLedger = this.stdoutItemLedger ?? this.lifecycleOutputLedger;
+      if (segment.length > 0 && this.stdoutItemLedger === null) {
+        this.stdoutItemLedger = itemLedger;
+      }
+      if (!this.chargeLifecycleWireBytes(segment.length, itemLedger)) return;
       const lineLength = this.stdoutBuffer.length + segment.length;
       if (lineLength > MAX_ACP_INPUT_LINE_BYTES) {
         this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
@@ -1466,7 +1550,9 @@ export class AcpClient {
       }
       if (newline === -1) return;
       let line = this.stdoutBuffer;
+      if (!this.chargeLifecycleWireBytes(1, itemLedger)) return;
       this.stdoutBuffer = Buffer.alloc(0);
+      this.stdoutItemLedger = null;
       if (line.at(-1) === 0x0d) line = line.subarray(0, -1);
       let decoded: string;
       try {
@@ -1475,30 +1561,33 @@ export class AcpClient {
         this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
         return;
       }
-      if (decoded.trim() && !this.chargeActiveTurnItem()) return;
-      this.onLine(decoded);
+      if (decoded.trim() && !this.chargeLifecycleItem(itemLedger)) return;
+      this.onLine(decoded, itemLedger);
       if (this.transportError || this.closed) return;
       offset = newline + 1;
     }
   }
 
   private onStderrData(chunk: Buffer): void {
-    if (
-      !this.transportError
-      && !this.closed
-      && !this.chargeActiveTurnWireBytes(chunk.length)
-    ) {
-      return;
-    }
     let offset = 0;
     if (this.stderrSawCrAt > 0) {
-      if (
+      const absorbsLf = (
         Date.now() - this.stderrSawCrAt <= STDERR_CRLF_DELAY_MS
         && chunk[0] === 0x0a
-      ) {
+      );
+      const crLfLedger = this.stderrCrLfLedger;
+      this.stderrSawCrAt = 0;
+      this.stderrCrLfLedger = null;
+      if (absorbsLf) {
+        if (
+          !this.transportError
+          && !this.closed
+          && !this.chargeLifecycleWireBytes(1, crLfLedger)
+        ) {
+          return;
+        }
         offset = 1;
       }
-      this.stderrSawCrAt = 0;
     }
     while (offset < chunk.length) {
       let delimiter = offset;
@@ -1512,8 +1601,17 @@ export class AcpClient {
       if (!this.appendStderrSegment(chunk.subarray(offset, delimiter))) return;
       if (delimiter === chunk.length) return;
       const isCrLf = chunk[delimiter] === 0x0d && chunk[delimiter + 1] === 0x0a;
+      const itemLedger = this.stderrItemLedger ?? this.lifecycleOutputLedger;
       if (chunk[delimiter] === 0x0d && delimiter + 1 === chunk.length) {
         this.stderrSawCrAt = Date.now();
+        this.stderrCrLfLedger = itemLedger;
+      }
+      if (
+        !this.transportError
+        && !this.closed
+        && !this.chargeLifecycleWireBytes(isCrLf ? 2 : 1, itemLedger)
+      ) {
+        return;
       }
       if (!this.dispatchStderrLine()) return;
       offset = delimiter + (isCrLf ? 2 : 1);
@@ -1521,6 +1619,17 @@ export class AcpClient {
   }
 
   private appendStderrSegment(segment: Buffer): boolean {
+    const itemLedger = this.stderrItemLedger ?? this.lifecycleOutputLedger;
+    if (segment.length > 0 && this.stderrItemLedger === null) {
+      this.stderrItemLedger = itemLedger;
+    }
+    if (
+      !this.transportError
+      && !this.closed
+      && !this.chargeLifecycleWireBytes(segment.length, itemLedger)
+    ) {
+      return false;
+    }
     const lineLength = this.stderrBuffer.length + segment.length;
     if (lineLength > MAX_ACP_INPUT_LINE_BYTES) {
       this.discardStderrFragment();
@@ -1537,8 +1646,10 @@ export class AcpClient {
 
   private dispatchStderrLine(): boolean {
     const line = this.stderrBuffer;
+    const itemLedger = this.stderrItemLedger ?? this.lifecycleOutputLedger;
     this.stderrBuffer = Buffer.alloc(0);
-    if (!this.chargeActiveTurnItem()) return false;
+    this.stderrItemLedger = null;
+    if (!this.chargeLifecycleItem(itemLedger)) return false;
     const decoded = new TextDecoder("utf-8").decode(line);
     if (this.transportError || this.closed) {
       void this.invokeCallback(this.processStderrHandler, [decoded], { cleanup: true });
@@ -1559,7 +1670,9 @@ export class AcpClient {
 
   private discardStderrFragment(): void {
     this.stderrSawCrAt = 0;
+    this.stderrCrLfLedger = null;
     this.stderrBuffer = Buffer.alloc(0);
+    this.stderrItemLedger = null;
   }
 
   private malformedResponseClaimsPendingRequest(response: Record<string, unknown>): boolean {
@@ -1569,7 +1682,7 @@ export class AcpClient {
     );
   }
 
-  private onLine(line: string): void {
+  private onLine(line: string, itemLedger: LifecycleOutputLedger | null): void {
     const trimmed = line.trim();
     if (!trimmed) return;
     let parsed: unknown;
@@ -1588,7 +1701,7 @@ export class AcpClient {
         });
         return;
       }
-      if (!this.chargeActiveTurnItems(parsed.length)) return;
+      if (!this.chargeLifecycleItems(parsed.length, itemLedger)) return;
       const batch: IncomingBatch = {
         responseSlots: [],
         pendingSettlements: [],
@@ -1773,11 +1886,16 @@ export class AcpClient {
       if (!p) {
         const drain = this.cancelledPromptDrain;
         if (drain?.promptId === id) {
-          if (hasOwn(msg, "result") && isPromptResponse(msg.result)) {
-            this.finishCancelledPromptDrain(id);
-          } else {
+          if (
+            drain.settlementQueued
+            || !hasOwn(msg, "result")
+            || !isPromptResponse(msg.result)
+          ) {
             this.failTransport(new Error(ACP_PROTOCOL_ERROR_MESSAGE));
+            return;
           }
+          drain.settlementQueued = true;
+          queueMicrotask(() => this.finishCancelledPromptDrain(id));
           return;
         }
         if (!batch) {
@@ -2020,20 +2138,28 @@ export class AcpClient {
   }
 
   async initialize(): Promise<{ authMethods: unknown[] }> {
-    const result = (await this.request("initialize", {
-      protocolVersion: 1,
-      clientCapabilities: {
-        fs: { readTextFile: false, writeTextFile: false },
-        elicitation: { form: {} },
-      },
-      clientInfo: { name: "openbot", title: "OpenBot", version: "0.0.0" },
-      info: { name: "openbot", title: "OpenBot", version: "0.0.0" },
-      capabilities: {},
-    })) as { authMethods?: unknown[] };
-    return { authMethods: Array.isArray(result?.authMethods) ? result.authMethods : [] };
+    const phase = this.beginLifecycleOutputPhase("startup");
+    if (!phase) throw this.transportError ?? new Error(ACP_PROTOCOL_ERROR_MESSAGE);
+    try {
+      const result = (await this.request("initialize", {
+        protocolVersion: 1,
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+          elicitation: { form: {} },
+        },
+        clientInfo: { name: "openbot", title: "OpenBot", version: "0.0.0" },
+        info: { name: "openbot", title: "OpenBot", version: "0.0.0" },
+        capabilities: {},
+      })) as { authMethods?: unknown[] };
+      return { authMethods: Array.isArray(result?.authMethods) ? result.authMethods : [] };
+    } finally {
+      this.finishLifecycleOutputPhase(phase);
+    }
   }
 
   async newSession(cwd: string): Promise<string> {
+    const phase = this.beginLifecycleOutputPhase("attachment");
+    if (!phase) throw this.transportError ?? new Error(ACP_PROTOCOL_ERROR_MESSAGE);
     const attachment: SessionAttachment = {
       requestId: this.nextId,
       method: "session/new",
@@ -2054,6 +2180,7 @@ export class AcpClient {
       return id;
     } finally {
       if (this.sessionAttachment === attachment) this.sessionAttachment = null;
+      this.finishLifecycleOutputPhase(phase);
     }
   }
 
@@ -2066,6 +2193,8 @@ export class AcpClient {
   }
 
   private async attachSession(method: "session/load" | "session/resume", sessionId: string): Promise<string> {
+    const phase = this.beginLifecycleOutputPhase("attachment");
+    if (!phase) throw this.transportError ?? new Error(ACP_PROTOCOL_ERROR_MESSAGE);
     this.generation += 1;
     this.streaming = false;
     this.turnText = "";
@@ -2089,15 +2218,20 @@ export class AcpClient {
       return sessionId;
     } finally {
       if (this.sessionAttachment === attachment) this.sessionAttachment = null;
+      this.finishLifecycleOutputPhase(phase);
     }
   }
 
   async prompt(text: string, handlers?: AcpHandlers): Promise<string> {
     if (this.transportError) throw this.transportError;
     if (!this.sessionId) throw new Error("no ACP session");
+    const priorOutputPhase = this.lifecycleOutputLedger?.kind === "active-turn"
+      ? this.lifecycleOutputLedger
+      : null;
     const myGen = ++this.generation;
     const priorDrain = this.promptDrain;
     if (priorDrain) await priorDrain;
+    if (priorOutputPhase) await priorOutputPhase.done;
     if (this.transportError) throw this.transportError;
     if (myGen !== this.generation) throw cancelledError();
     this.activeGen = myGen;
@@ -2114,7 +2248,9 @@ export class AcpClient {
     this.openMessageId = null;
     this.nonTextBoundary = false;
     this.gotIdle = false;
-    this.beginActiveTurnLedger(myGen);
+    if (!this.beginActiveTurnLedger(myGen)) {
+      throw this.transportError ?? new Error(ACP_PROTOCOL_ERROR_MESSAGE);
+    }
     const id = this.nextId++;
     this.promptId = id;
     this.promptHandoffPending = true;

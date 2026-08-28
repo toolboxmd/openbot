@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.11.1] - 2026-08-28
+
+### Changed
+
+- Bound ACP output across lifecycle phases
+
 ## [0.11.0] - 2026-08-28
 
 ### Added

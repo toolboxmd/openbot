@@ -139,9 +139,6 @@ input.on("line", (line) => {
   }
   if (message.method === "session/prompt") {
     process.stderr.write("PRIVATE-STDERR-LINE\n");
-    setImmediate(() => {
-      send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
-    });
   }
 });
 `;
