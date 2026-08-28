@@ -424,7 +424,9 @@ describe("PWA async wiring contract", () => {
     assert.match(botSettingsSource, /instructionsRequestRef\.current\.cancel\(\)/);
     assert.match(botSettingsSource, /saveRequestRef\.current\.cancel\(\)/);
     assert.match(botSettingsSource, /getThisBotAgents\(bot\.id, signal\)/);
-    assert.match(botSettingsSource, /putThisBotAgents\(bot\.id, botInstructions, signal\)/);
+    assert.match(botSettingsSource, /putThisBotAgents\(bot\.id, instructions\.drafts\.bot, signal\)/);
+    assert.match(botSettingsSource, /acceptBotInstructions\(state, bot\.id/);
+    assert.match(botSettingsSource, /acceptBotInstructionSave\(state, bot\.id/);
   });
 
   test("cancels selected-Bot mutations and keeps polling on the current generation", () => {

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.11.0] - 2026-08-28
+
+### Added
+
+- Restore compact Computer preview and unified selected-Bot panel (#88)
+
 ## [0.10.7] - 2026-08-28
 
 ### Changed
