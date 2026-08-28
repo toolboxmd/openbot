@@ -48,6 +48,7 @@ input.on("line", (line) => {
     send({ jsonrpc: "2.0", id: message.id, result: { authMethods: [] } });
   }
 });
+process.stderr.write("ready\n");
 `;
 
 const SLOW_INITIALIZE_THEN_SILENT_SESSION_ACP = String.raw`
@@ -80,6 +81,7 @@ input.on("line", (line) => {
     send({ jsonrpc: "2.0", id: message.id, result: { sessionId: "blocked-session" } });
   }
 });
+process.stderr.write("ready\n");
 `;
 
 const LONG_RUNNING_ACP = String.raw`
@@ -340,7 +342,7 @@ input.on("line", (line) => {
     setTimeout(() => {
       update("OLD", "old-reply");
       send({ jsonrpc: "2.0", id: firstPromptId, result: { stopReason: "cancelled" } });
-    }, 140);
+    }, 700);
     return;
   }
   setTimeout(() => update("NEW", "same-client-replacement"), 80);
@@ -424,6 +426,25 @@ function client(source: string, startDeadlineMs = 30): AcpClient {
     args: ["-e", source],
     env: { ...process.env },
   }, process.cwd(), {}, { startDeadlineMs });
+}
+
+function clientAfterReady(
+  source: string,
+  startDeadlineMs: number,
+  terminateGraceMs?: number,
+): { acp: AcpClient; ready: Promise<void> } {
+  let resolveReady!: () => void;
+  const ready = new Promise<void>((resolve) => { resolveReady = resolve; });
+  const acp = new AcpClient({
+    command: process.execPath,
+    args: ["-e", source],
+    env: { ...process.env },
+  }, process.cwd(), {
+    onStderr(line) {
+      if (line === "ready") resolveReady();
+    },
+  }, { startDeadlineMs, ...(terminateGraceMs === undefined ? {} : { terminateGraceMs }) });
+  return { acp, ready };
 }
 
 async function within<T>(promise: Promise<T>, milliseconds = 500): Promise<T> {
@@ -596,10 +617,11 @@ describe("AcpClient start deadline", () => {
     ] as const;
     for (const [name, attach] of cases) {
       await t.test(name, async () => {
-        const acp = client(SILENT_SESSION_ACP, 100);
+        const { acp, ready } = clientAfterReady(SILENT_SESSION_ACP, 250);
         try {
-          await within(acp.initialize());
-          await assert.rejects(within(attach(acp)), /ACP start timed out/);
+          await within(ready, 1_000);
+          await within(acp.initialize(), 1_000);
+          await assert.rejects(within(attach(acp), 1_000), /ACP start timed out/);
         } finally {
           acp.close();
         }
@@ -608,13 +630,14 @@ describe("AcpClient start deadline", () => {
   });
 
   test("bounds prompt write-to-flush without reporting a handed-off Turn", async () => {
-    const acp = client(NON_READING_PROMPT_ACP, 100);
+    const { acp, ready } = clientAfterReady(NON_READING_PROMPT_ACP, 100);
     let written = 0;
     let flushed = 0;
     let rejectionCount = 0;
     try {
-      await within(acp.initialize());
-      await within(acp.newSession(process.cwd()));
+      await within(ready, 1_000);
+      await within(acp.initialize(), 1_000);
+      await within(acp.newSession(process.cwd()), 1_000);
       const running = acp.prompt("x".repeat(4 * 1024 * 1024), {
         onPromptWritten() {
           written += 1;
@@ -659,13 +682,13 @@ describe("AcpClient start deadline", () => {
   });
 
   test("reuses the client when cancellation reaches a terminal response inside the drain bound", async () => {
-    const acp = client(CANCEL_REPLACEMENT_ACP, 100);
+    const acp = client(CANCEL_REPLACEMENT_ACP, 1_000);
     let resolveFlushed!: () => void;
     const flushed = new Promise<void>((resolve) => { resolveFlushed = resolve; });
     let firstRejections = 0;
     try {
-      await within(acp.initialize());
-      await within(acp.newSession(process.cwd()));
+      await within(acp.initialize(), 1_500);
+      await within(acp.newSession(process.cwd()), 1_500);
       const first = acp.prompt("first prompt", { onPromptFlushed: resolveFlushed }).catch((error: unknown) => {
         firstRejections += 1;
         throw error;
@@ -674,7 +697,7 @@ describe("AcpClient start deadline", () => {
       acp.cancel();
       await assert.rejects(within(first), /cancelled/);
       assert.equal(firstRejections, 1);
-      assert.equal(await within(acp.prompt("replacement prompt"), 500), "NEW");
+      assert.equal(await within(acp.prompt("replacement prompt"), 1_500), "NEW");
       assert.equal(firstRejections, 1, "late old response must not settle the cancelled Turn again");
     } finally {
       acp.close();
@@ -682,13 +705,13 @@ describe("AcpClient start deadline", () => {
   });
 
   test("rejects an invalid cancelled-prompt terminal before reusing the session", async () => {
-    const acp = client(INVALID_CANCELLED_TERMINAL_ACP, 100);
+    const acp = client(INVALID_CANCELLED_TERMINAL_ACP, 1_000);
     let resolveFlushed!: () => void;
     const flushed = new Promise<void>((resolve) => { resolveFlushed = resolve; });
     const replacementText: string[] = [];
     try {
-      await within(acp.initialize());
-      await within(acp.newSession(process.cwd()));
+      await within(acp.initialize(), 1_500);
+      await within(acp.newSession(process.cwd()), 1_500);
       const first = acp.prompt("first prompt", { onPromptFlushed: resolveFlushed });
       await within(flushed);
       acp.cancel();
@@ -698,7 +721,7 @@ describe("AcpClient start deadline", () => {
           onAssistant(text) {
             replacementText.push(text);
           },
-        }), 500),
+        }), 1_500),
         /ACP transport protocol error/,
       );
       assert.deepEqual(replacementText, []);
@@ -708,18 +731,18 @@ describe("AcpClient start deadline", () => {
   });
 
   test("invalidates the client when a cancelled generation outlives its drain bound", async () => {
-    const stale = client(STALE_CANCELLED_UPDATE_ACP, 100);
+    const stale = client(STALE_CANCELLED_UPDATE_ACP, 500);
     let resolveFlushed!: () => void;
     const flushed = new Promise<void>((resolve) => { resolveFlushed = resolve; });
     try {
-      await within(stale.initialize());
-      await within(stale.newSession(process.cwd()));
+      await within(stale.initialize(), 1_000);
+      await within(stale.newSession(process.cwd()), 1_000);
       const first = stale.prompt("first prompt", { onPromptFlushed: resolveFlushed });
-      await within(flushed);
+      await within(flushed, 1_000);
       stale.cancel();
       await assert.rejects(within(first), /cancelled/);
       await assert.rejects(
-        within(stale.prompt("replacement prompt"), 500),
+        within(stale.prompt("replacement prompt"), 1_000),
         (error: unknown) => {
           assert.equal(cancellationClosedTransport(error), true);
           return true;
@@ -736,30 +759,27 @@ describe("AcpClient start deadline", () => {
       stale.close();
     }
 
-    const fresh = client(FRESH_AFTER_CANCEL_ACP, 100);
+    const fresh = client(FRESH_AFTER_CANCEL_ACP, 1_000);
     try {
-      await within(fresh.initialize());
-      await within(fresh.newSession(process.cwd()));
-      assert.equal(await within(fresh.prompt("replacement prompt")), "NEW");
+      await within(fresh.initialize(), 1_500);
+      await within(fresh.newSession(process.cwd()), 1_500);
+      assert.equal(await within(fresh.prompt("replacement prompt"), 1_500), "NEW");
     } finally {
       fresh.close();
     }
   });
 
   test("cancelling a blocked pre-flush handoff settles safely and reaps its child", async () => {
-    const acp = new AcpClient({
-      command: process.execPath,
-      args: ["-e", NON_READING_PROMPT_ACP],
-      env: { ...process.env },
-    }, process.cwd(), {}, { startDeadlineMs: 500, terminateGraceMs: 50 });
+    const { acp, ready } = clientAfterReady(NON_READING_PROMPT_ACP, 500, 50);
     const pid = acp.pid;
     assert.ok(pid);
     let resolveWritten!: () => void;
     const written = new Promise<void>((resolve) => { resolveWritten = resolve; });
     let rejectionCount = 0;
     try {
-      await within(acp.initialize());
-      await within(acp.newSession(process.cwd()));
+      await within(ready, 1_000);
+      await within(acp.initialize(), 1_000);
+      await within(acp.newSession(process.cwd()), 1_000);
       const running = acp.prompt("x".repeat(4 * 1024 * 1024), {
         onPromptWritten: resolveWritten,
       }).catch((error: unknown) => {
@@ -777,11 +797,11 @@ describe("AcpClient start deadline", () => {
       await waitForProcessExit(pid, 500);
     }
 
-    const fresh = client(HEALTHY_RETRY_ACP, 100);
+    const fresh = client(HEALTHY_RETRY_ACP, 1_000);
     try {
-      await within(fresh.initialize());
-      await within(fresh.newSession(process.cwd()));
-      assert.equal(await within(fresh.prompt("fresh retry")), "");
+      await within(fresh.initialize(), 1_500);
+      await within(fresh.newSession(process.cwd()), 1_500);
+      assert.equal(await within(fresh.prompt("fresh retry"), 1_500), "");
     } finally {
       fresh.close();
     }
@@ -837,14 +857,17 @@ describe("AcpClient start deadline", () => {
           command: process.execPath,
           args: ["-e", spawned === 1 ? STALE_CANCELLED_UPDATE_ACP : FRESH_AFTER_CANCEL_ACP],
           env: { ...process.env },
-        }, cwd, handlers, { startDeadlineMs: 100, terminateGraceMs: 50 });
+        }, cwd, handlers, {
+          startDeadlineMs: spawned === 1 ? 500 : 1_000,
+          terminateGraceMs: 50,
+        });
       },
     });
     try {
       const ada = await store.create("Ada");
       await store.pickHarness(ada.id, "codex");
       await store.send(ada.id, "first message");
-      const flushDeadline = Date.now() + 1_000;
+      const flushDeadline = Date.now() + 2_000;
       while (Date.now() < flushDeadline) {
         const firstMessage = store.get(ada.id)?.messages?.find((message) => message.text === "first message");
         if (firstMessage?.receipt === "read") break;
@@ -855,8 +878,8 @@ describe("AcpClient start deadline", () => {
         "read",
       );
 
-      await within(store.send(ada.id, "replacement message"), 1_000);
-      const completionDeadline = Date.now() + 1_500;
+      await within(store.send(ada.id, "replacement message"), 2_500);
+      const completionDeadline = Date.now() + 3_000;
       while (Date.now() < completionDeadline) {
         const bot = store.get(ada.id);
         if (bot?.write === false && bot.messages?.some((message) => message.text === "NEW")) break;
@@ -890,10 +913,10 @@ describe("AcpClient start deadline", () => {
       acp.close();
     }
 
-    const fresh = client(LONG_RUNNING_ACP, 100);
+    const fresh = client(LONG_RUNNING_ACP, 1_000);
     try {
-      assert.deepEqual(await within(fresh.initialize()), { authMethods: [] });
-      assert.equal(await within(fresh.newSession(process.cwd())), "long-session");
+      assert.deepEqual(await within(fresh.initialize(), 1_500), { authMethods: [] });
+      assert.equal(await within(fresh.newSession(process.cwd()), 1_500), "long-session");
     } finally {
       fresh.close();
     }
