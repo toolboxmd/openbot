@@ -205,6 +205,48 @@ async function createWritableBot(url: string, cookie: string): Promise<{ id: str
   return created;
 }
 
+async function waitForViewOnlyComputer(
+  url: string,
+  cookie: string,
+  botId: string,
+): Promise<{
+  botId: string;
+  display: number | null;
+  ownership: string;
+  path: string | null;
+  ready: boolean;
+  screenState: string;
+}> {
+  return bounded((async () => {
+    while (true) {
+      const response = await fetch(
+        `${url}/api/computer?botId=${encodeURIComponent(botId)}`,
+        { headers: { cookie } },
+      );
+      assert.equal(response.status, 200);
+      const computer = await response.json() as {
+        botId: string;
+        display: number | null;
+        ownership: string;
+        path: string | null;
+        ready: boolean;
+        screenState: string;
+      };
+      if (
+        computer.botId === botId
+        && computer.display === 1
+        && computer.ownership === "view-only"
+        && computer.path === `/screen/${botId}/`
+        && computer.ready
+        && computer.screenState === "ready"
+      ) {
+        return computer;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
+  })(), "restarted Computer did not become view-only");
+}
+
 function openScreenUpgrade(url: string, cookie: string, botId: string): Promise<net.Socket> {
   const target = new URL(url);
   return bounded(new Promise((resolve, reject) => {
@@ -474,6 +516,7 @@ for (const scenario of cleanShutdownScenarios) {
     kasm.on("upgrade", (_req, socket) => {
       upstreamSockets.add(socket);
       socket.once("close", () => upstreamSockets.delete(socket));
+      socket.on("error", () => socket.destroy());
       socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
     });
 
@@ -492,7 +535,11 @@ for (const scenario of cleanShutdownScenarios) {
 
       for (const signal of scenario.signals) assert.equal(child.kill(signal), true);
       const result = await bounded(exited, `production daemon did not exit; stderr: ${daemon.stderr()}`);
-      assert.deepEqual(result, { code: 0, signal: null });
+      assert.deepEqual(
+        result,
+        { code: 0, signal: null },
+        `production daemon shutdown failed: ${daemon.stderr()}`,
+      );
       assert.deepEqual(writeEvents.slice(grantIndex + 1), [{ write: false }]);
     } finally {
       upgraded?.destroy();
@@ -503,6 +550,114 @@ for (const scenario of cleanShutdownScenarios) {
     }
   });
 }
+
+test("a connected Screen client closes after writer revoke and restart stays view-only", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "openbot-daemon-connected-restart-"));
+  const writeEvents: KasmWriteEvent[] = [];
+  const revokeSeen = deferred<void>();
+  const allowRevoke = deferred<void>();
+  const upstreamSockets = new Set<import("node:stream").Duplex>();
+  let holdRevoke = false;
+  const kasm = http.createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    if (url.pathname === "/api/update_user") {
+      const write = url.searchParams.get("write") === "true";
+      writeEvents.push({ write });
+      if (!write && holdRevoke) {
+        revokeSeen.resolve();
+        void allowRevoke.promise.then(() => {
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.end("ok");
+        });
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/html" });
+    res.end(KASM_DOCUMENT);
+  });
+  kasm.on("upgrade", (_req, socket) => {
+    upstreamSockets.add(socket);
+    socket.once("close", () => upstreamSockets.delete(socket));
+    socket.on("error", () => socket.destroy());
+    socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+  });
+
+  let firstChild: ChildProcessWithoutNullStreams | undefined;
+  let secondChild: ChildProcessWithoutNullStreams | undefined;
+  let upgraded: net.Socket | undefined;
+  try {
+    const screenPort = await listen(kasm);
+    const first = await startProductionDaemon({ root, screenPort });
+    firstChild = first.child;
+    const firstExited = exitOf(firstChild);
+    const cookie = await login(first.url);
+    const bot = await createWritableBot(first.url, cookie);
+    assert.equal(writeEvents.at(-1)?.write, true);
+    const grantIndex = writeEvents.length - 1;
+    upgraded = await openScreenUpgrade(first.url, cookie, bot.id);
+    const downstreamClosed = new Promise<void>((resolve) => upgraded?.once("close", resolve));
+    holdRevoke = true;
+
+    assert.equal(firstChild.kill("SIGTERM"), true);
+    await bounded(revokeSeen.promise, "shutdown did not dispatch the Kasm revoke");
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    assert.equal(upgraded.destroyed, false, "Screen client closed before writer revoke completed");
+    assert.equal(upstreamSockets.size, 1, "Screen upstream closed before writer revoke completed");
+
+    holdRevoke = false;
+    allowRevoke.resolve();
+    await bounded(downstreamClosed, "shutdown did not close the connected Screen client");
+    const firstResult = await bounded(
+      firstExited,
+      `production daemon did not exit; stderr: ${first.stderr()}`,
+    );
+    assert.deepEqual(firstResult, { code: 0, signal: null });
+    assert.deepEqual(writeEvents.slice(grantIndex + 1), [{ write: false }]);
+
+    const second = await startProductionDaemon({ root, screenPort });
+    secondChild = second.child;
+    const secondExited = exitOf(secondChild);
+    const computer = await waitForViewOnlyComputer(second.url, cookie, bot.id);
+    assert.deepEqual({
+      botId: computer.botId,
+      display: computer.display,
+      ownership: computer.ownership,
+      path: computer.path,
+      ready: computer.ready,
+      screenState: computer.screenState,
+    }, {
+      botId: bot.id,
+      display: 1,
+      ownership: "view-only",
+      path: `/screen/${bot.id}/`,
+      ready: true,
+      screenState: "ready",
+    });
+    assert.equal(writeEvents.slice(grantIndex + 1).some(({ write }) => write), false);
+
+    assert.equal(secondChild.kill("SIGTERM"), true);
+    const secondResult = await bounded(
+      secondExited,
+      `restarted production daemon did not exit; stderr: ${second.stderr()}`,
+    );
+    assert.deepEqual(secondResult, { code: 0, signal: null });
+  } finally {
+    allowRevoke.resolve();
+    upgraded?.destroy();
+    for (const socket of upstreamSockets) socket.destroy();
+    if (firstChild && firstChild.exitCode === null && firstChild.signalCode === null) {
+      firstChild.kill("SIGKILL");
+    }
+    if (secondChild && secondChild.exitCode === null && secondChild.signalCode === null) {
+      secondChild.kill("SIGKILL");
+    }
+    await closeServer(kasm);
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("cleanup failure is sanitized, reported, and exits nonzero after one revoke attempt", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "openbot-daemon-shutdown-failure-"));
@@ -529,6 +684,7 @@ test("cleanup failure is sanitized, reported, and exits nonzero after one revoke
   kasm.on("upgrade", (_req, socket) => {
     upstreamSockets.add(socket);
     socket.once("close", () => upstreamSockets.delete(socket));
+    socket.on("error", () => socket.destroy());
     socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
   });
 
@@ -593,6 +749,7 @@ test("a Screen Upgrade completed after shutdown begins cannot escape Box cleanup
   kasm.on("upgrade", (_req, socket) => {
     upstreamSockets.add(socket);
     socket.once("close", () => upstreamSockets.delete(socket));
+    socket.on("error", () => socket.destroy());
     socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
   });
 
@@ -901,6 +1058,7 @@ for (const scenario of mixedUpgradeScenarios) {
       upstreamUpgradeCount += 1;
       upstreamSockets.add(socket);
       socket.once("close", () => upstreamSockets.delete(socket));
+      socket.on("error", () => socket.destroy());
       socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
     });
 
@@ -938,7 +1096,11 @@ for (const scenario of mixedUpgradeScenarios) {
       );
       assert.equal(await bounded(mixed.upgradeAccepted, "mixed Upgrade did not settle"), false);
       const result = await bounded(exited, `production daemon did not exit; stderr: ${daemon.stderr()}`);
-      assert.deepEqual(result, { code: 0, signal: null });
+      assert.deepEqual(
+        result,
+        { code: 0, signal: null },
+        `production daemon shutdown failed: ${daemon.stderr()}`,
+      );
       assert.equal(upstreamUpgradeCount, 0, "mixed Upgrade reached the upstream Screen");
       assert.deepEqual(writeEvents.slice(grantIndex + 1), [{ write: false }]);
     } finally {

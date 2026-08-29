@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.15.0] - 2026-08-29
+
+### Added
+
+- Converge the familiar Messenger and isolated runtime trains
+
 ## [0.14.0] - 2026-08-28
 
 ### Added
