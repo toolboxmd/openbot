@@ -146,7 +146,6 @@ describe("test command contract", () => {
     assert.equal(pinchtab.status, 0, pinchtab.stderr);
     assert.deepEqual(outputLines(pinchtab.stdout), ["daemon/test/pinchtab.live.test.ts"]);
   });
-
   test("a deterministic lane rejects a live module", () => {
     const result = runRunner("focused", "--list", "daemon/test/home-channel.live.test.ts");
 

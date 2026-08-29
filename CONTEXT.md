@@ -14,6 +14,9 @@ The Computer jail inside Home. A shared drop plus every Bot directory. Every Bot
 ## Channel
 A persistent conversation with members. A direct Channel is you plus one Bot and is born with that Bot. Group and Bot-to-Bot are other Channel kinds. The Channel owns its Transcript. The Bot owns its Harness.
 
+## Chat
+The user-facing name for a Channel and its Transcript. Use reply for a relationship to one message. Do not call the flat Chat a thread. Expose Session only in advanced settings or diagnostics.
+
 ## Transcript
 The human-facing messages, Cards, receipts, replies, reactions, and attachments in a Channel. Harness logs are not the Transcript.
 
@@ -63,7 +66,7 @@ Headed Chrome driver on the Screen's DISPLAY. Default browser hands. Not Playwri
 PinchTab Indirect Prompt Injection defense. wrapContent frames snapshot and get_text as untrusted page data. scanContent looks for injection patterns. Stays on when browsing the open web.
 
 ## Host grant
-Permission to read or read-write paths on the host PC outside the Workspace jail. The Harness already runs on the host OS; the jail is the folder. The card offers Read, Read and write, or Deny, and asks duration (once / this Session / until revoked). Store what they pick. One grant is Computer-wide. Isolated Harness Home is inside the jail. Open computer is Screen 2FA, not this card.
+Permission to read or read-write paths on the host PC outside the Workspace jail. The Harness already runs on the host OS; the jail is the folder. A read request can offer Read or Read and write. A write request offers Read and write, never a misleading Read choice. Deny appears only when the pending operation can reject. The card asks duration (once / this Session / until revoked). Store what they pick. One grant is Computer-wide. Isolated Harness Home is inside the jail. Open computer is Screen 2FA, not this card.
 
 ## Takeover
 There is no Takeover button on the Computer pane. Zooming or opening the Computer preview is already write and does not pause Sessions. In chat, a needs-you Computer card says it needs you; its action is **Open computer** (same as zoom). Not a second mode. User drives the Screen for password, 2FA, captcha, or payment. Never paste secrets in chat. Not used for Harness CLI login.

@@ -16,6 +16,11 @@ const NOTICE_TEXT_INLINE_WIDTH = 260;
 function activeClasses(className: string, viewportWidth: number): Set<string> {
   const active = new Set<string>();
   for (const token of className.split(/\s+/u).filter(Boolean)) {
+    const maxWidth = token.match(/^max-\[(\d+(?:\.\d+)?)rem\]:(.+)$/u);
+    if (maxWidth) {
+      if (viewportWidth <= Number(maxWidth[1]) * 16) active.add(maxWidth[2]!);
+      continue;
+    }
     if (token.startsWith("sm:")) {
       if (viewportWidth >= 640) active.add(token.slice(3));
       continue;
@@ -25,14 +30,8 @@ function activeClasses(className: string, viewportWidth: number): Set<string> {
   return active;
 }
 
-function widthFromClasses(classes: Set<string>): number {
-  const widths = new Map([
-    ["w-32", 128],
-    ["w-64", 256],
-    ["w-72", 288],
-  ]);
-  const activeWidths = [...widths].flatMap(([name, width]) => classes.has(name) ? [width] : []);
-  if (activeWidths.length > 0) return Math.max(...activeWidths);
+function widthFromClasses(classes: Set<string>, viewportWidth: number): number {
+  if (classes.has("w-full")) return viewportWidth;
   throw new Error(`rendered width class is unsupported: ${[...classes].join(" ")}`);
 }
 
@@ -43,11 +42,16 @@ function horizontalPadding(classes: Set<string>): number {
 }
 
 function classesForTestId(markup: string, testId: string): string {
-  const tag = markup.match(new RegExp(`<[^>]+data-testid="${testId}"[^>]*>`, "u"))?.[0];
-  assert.ok(tag, `missing rendered element ${testId}`);
+  const tag = tagForTestId(markup, testId);
   const className = tag.match(/\bclass="([^"]*)"/u)?.[1];
   assert.ok(className, `missing rendered classes for ${testId}`);
   return className;
+}
+
+function tagForTestId(markup: string, testId: string): string {
+  const tag = markup.match(new RegExp(`<[^>]+data-testid="${testId}"[^>]*>`, "u"))?.[0];
+  assert.ok(tag, `missing rendered element ${testId}`);
+  return tag;
 }
 
 function classesForRole(markup: string, role: string): string {
@@ -58,9 +62,8 @@ function classesForRole(markup: string, role: string): string {
   return className;
 }
 
-function classesForTags(markup: string, tagName: string): string[] {
-  return [...markup.matchAll(new RegExp(`<${tagName}\\b[^>]*\\bclass="([^"]*)"`, "gu"))]
-    .map((match) => match[1] ?? "");
+function hasBooleanAttribute(tag: string, attribute: string): boolean {
+  return new RegExp(`\\s${attribute}(?:=""|(?=\\s|>))`, "u").test(tag);
 }
 
 function stackingLevel(className: string): number {
@@ -128,19 +131,10 @@ async function renderResponsiveSeam(
   openAction: () => void;
 }> {
   const aliases = new Map([
-    ["@/components/Computer", "../src/components/Computer.tsx"],
-    ["@/components/Eyes", "../src/components/Eyes.tsx"],
-    ["@/components/StackedEyes", "../src/components/StackedEyes.tsx"],
     ["@/components/ui/button", "../src/components/ui/button.tsx"],
-    ["@/components/ui/input", "../src/components/ui/input.tsx"],
     ["@/components/ui/separator", "../src/components/ui/separator.tsx"],
-    ["@/components/ui/textarea", "../src/components/ui/textarea.tsx"],
-    ["@/components/ui/tooltip", "../src/components/ui/tooltip.tsx"],
-    ["@/components/AgentsEditors", "../src/components/AgentsEditors.tsx"],
-    ["@/components/HostGrantCard", "../src/components/HostGrantCard.tsx"],
-    ["@/lib/channels", "../src/lib/channels.ts"],
-    ["@/lib/face", "../src/lib/face.ts"],
-    ["@/lib/harness-home", "../src/lib/harness-home.ts"],
+    ["@/lib/async-state", "../src/lib/async-state.ts"],
+    ["@/lib/computer-zoom", "../src/lib/computer-zoom.ts"],
     ["@/lib/session", "../src/lib/session.ts"],
     ["@/lib/utils", "../src/lib/utils.ts"],
   ]);
@@ -158,13 +152,13 @@ async function renderResponsiveSeam(
     const cacheKey = `responsive-${Date.now()}-${Math.random()}`;
     const computerUrl = new URL("../src/components/Computer.tsx", import.meta.url);
     computerUrl.searchParams.set("responsive-harness", cacheKey);
-    const messengerUrl = new URL("../src/components/Messenger.tsx", import.meta.url);
-    messengerUrl.searchParams.set("responsive-harness", cacheKey);
-    const { ComputerScreenStateNotice } = await import(computerUrl.href) as typeof import(
+    const shellUrl = new URL("../src/components/MessengerShell.tsx", import.meta.url);
+    shellUrl.searchParams.set("responsive-harness", cacheKey);
+    const { ComputerScreenStateNotice, SelectedBotComputerPreview } = await import(computerUrl.href) as typeof import(
       "../src/components/Computer.tsx"
     );
-    const { ComputerPreview, Messenger } = await import(messengerUrl.href) as typeof import(
-      "../src/components/Messenger.tsx"
+    const { MessengerShell } = await import(shellUrl.href) as typeof import(
+      "../src/components/MessengerShell.tsx"
     );
     const unavailable: Computer = {
       path: null,
@@ -192,13 +186,22 @@ async function renderResponsiveSeam(
       onClose: () => undefined,
       onRetry,
     });
-    const preview = ComputerPreview({
-      expanded: false,
+    const preview = SelectedBotComputerPreview({
+      botName: "Recovery",
+      triggerRef: { current: null },
       onOpen,
       children: notice,
     });
+    const messenger = React.createElement(MessengerShell, {
+      sidebar: React.createElement("p", null, "Chats"),
+      chat: React.createElement("p", null, "Chat"),
+      chatRef: { current: null },
+      computer: React.createElement("div", { className: "p-4" }, preview),
+      desktopLayout: false,
+      mobileSurface: "chat",
+    });
     return {
-      messenger: renderToStaticMarkup(React.createElement(Messenger)),
+      messenger: renderToStaticMarkup(messenger),
       notice: renderToStaticMarkup(notice),
       preview: renderToStaticMarkup(preview),
       retryAction: renderedButtonAction(preview, "Retry Screen"),
@@ -252,42 +255,31 @@ describe("Computer responsive PWA", () => {
 
   test("390px unavailable Screen has no horizontal overflow and keeps Retry fully reachable", async () => {
     const rendered = await renderResponsiveSeam();
-    const asideClasses = classesForTags(rendered.messenger, "aside");
-    const sectionClasses = classesForTags(rendered.messenger, "section");
-    assert.equal(asideClasses.length, 2);
-    assert.equal(sectionClasses.length, 1);
-
     const rootPhone = activeClasses(classesForTestId(rendered.messenger, "messenger"), PHONE_WIDTH);
-    const leftPhone = activeClasses(asideClasses[0]!, PHONE_WIDTH);
-    const mainPhone = activeClasses(sectionClasses[0]!, PHONE_WIDTH);
-    const rightPhone = activeClasses(asideClasses[1]!, PHONE_WIDTH);
-    const leftWidth = widthFromClasses(leftPhone);
-    const rightWidth = widthFromClasses(rightPhone);
-    const separatorWidth = 2;
-    const mainWidth = Math.max(0, PHONE_WIDTH - leftWidth - rightWidth - separatorWidth);
-    const documentScrollWidth = leftWidth + mainWidth + rightWidth + separatorWidth;
+    const sidebarTag = tagForTestId(rendered.messenger, "sidebar-region");
+    const chatTag = tagForTestId(rendered.messenger, "chat-region");
+    const selectedTag = tagForTestId(rendered.messenger, "selected-bot-region");
+    const selectedClasses = classesForTestId(rendered.messenger, "selected-bot-region");
+    const selectedPhone = activeClasses(selectedClasses, PHONE_WIDTH);
+    const selectedWidth = widthFromClasses(selectedPhone, PHONE_WIDTH);
+    const panelPadding = 16;
+    const previewWidth = selectedWidth - panelPadding * 2;
+    const previewHeight = previewWidth * 10 / 16;
+    const documentScrollWidth = selectedWidth;
 
-    assert.match(rendered.messenger, /class="p-3"/u);
-    const rightPadding = 12;
     const noticePadding = horizontalPadding(activeClasses(classesForRole(rendered.notice, "status"), PHONE_WIDTH));
-    const rightStart = leftWidth + mainWidth + separatorWidth;
     const statusCard = {
-      left: rightStart + rightPadding + noticePadding,
-      right: rightStart + rightWidth - rightPadding - noticePadding,
+      left: panelPadding,
+      right: panelPadding + previewWidth,
     };
     const retryCenter = (statusCard.left + statusCard.right) / 2;
     const retry = {
       left: retryCenter - LIVE_RETRY_WIDTH / 2,
       right: retryCenter + LIVE_RETRY_WIDTH / 2,
     };
-    const previewPhone = activeClasses(
-      classesForTestId(rendered.messenger, "computer-preview"),
-      PHONE_WIDTH,
+    const noticeLines = Math.ceil(
+      NOTICE_TEXT_INLINE_WIDTH / (previewWidth - noticePadding * 2),
     );
-    const previewHeight = previewPhone.has("h-40")
-      ? 160
-      : (rightWidth - rightPadding * 2) * 9 / 16;
-    const noticeLines = Math.ceil(NOTICE_TEXT_INLINE_WIDTH / (statusCard.right - statusCard.left));
     const noticeHeight = noticeLines * NOTICE_TEXT_LINE_HEIGHT + NOTICE_GAP + RETRY_HEIGHT;
     const retryVertical = {
       top: (previewHeight - noticeHeight) / 2 + noticeLines * NOTICE_TEXT_LINE_HEIGHT + NOTICE_GAP,
@@ -299,7 +291,10 @@ describe("Computer responsive PWA", () => {
     assert.ok(retryButton);
     assert.doesNotMatch(rendered.notice, /<iframe\b/u);
     assert.doesNotMatch(retryButton, /\sdisabled(?:=|\s|>)/u);
-    assert.equal(leftWidth, 256, "phone navigation keeps its established width and focus surface");
+    assert.equal(hasBooleanAttribute(sidebarTag, "hidden"), true);
+    assert.equal(hasBooleanAttribute(chatTag, "hidden"), true);
+    assert.equal(hasBooleanAttribute(selectedTag, "hidden"), false);
+    assert.equal(selectedWidth, PHONE_WIDTH, "the selected-Bot surface owns the phone viewport");
 
     const failures: string[] = [];
     if (documentScrollWidth > PHONE_WIDTH) {
@@ -314,13 +309,11 @@ describe("Computer responsive PWA", () => {
     if (retryVertical.top < 0 || retryVertical.bottom > previewHeight) {
       failures.push(`Retry Screen ${retryVertical.top}..${retryVertical.bottom}px is vertically clipped`);
     }
-    if (!rootPhone.has("overflow-x-hidden")) failures.push("Messenger does not contain mobile overflow");
-    if (!mainPhone.has("overflow-x-hidden") && !mainPhone.has("overflow-x-auto")) {
-      failures.push("Chat pane can expand the mobile document");
-    }
+    if (!rootPhone.has("flex")) failures.push("Messenger shell lost its bounded flex layout");
     assert.deepEqual(failures, []);
 
-    assert.equal(widthFromClasses(activeClasses(asideClasses[0]!, DESKTOP_WIDTH)), 256);
-    assert.equal(widthFromClasses(activeClasses(asideClasses[1]!, DESKTOP_WIDTH)), 288);
+    const selectedDesktop = activeClasses(selectedClasses, DESKTOP_WIDTH);
+    assert.equal(selectedDesktop.has("w-full"), false);
+    assert.ok(selectedDesktop.has("w-[min(var(--computer-pane-width),28vw)]"));
   });
 });

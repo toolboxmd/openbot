@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { UiPreferencesProvider } from "./components/UiPreferencesProvider";
 import "./index.css";
 
 if ("serviceWorker" in navigator) {
@@ -16,6 +17,8 @@ if (!root) {
 
 createRoot(root).render(
   <StrictMode>
-    <App />
+    <UiPreferencesProvider>
+      <App />
+    </UiPreferencesProvider>
   </StrictMode>,
 );

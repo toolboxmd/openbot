@@ -14,11 +14,15 @@ import {
   HUMAN_MEMBER_ID,
   HomeStore,
   defaultWorkspaceDir,
+  type ChannelActivity,
+  type ChannelCursor,
   type ChannelKind,
   type ChannelMember,
   type MessageReceipt,
+  type StoredAppSettings,
   type StoredBot,
   type StoredChannel,
+  type StoredChannelSummary,
   type TranscriptMessage,
 } from "./home.ts";
 import {
@@ -26,17 +30,13 @@ import {
   botWorkspaceDir,
   ensureBotWorkspace,
   ensureHarnessHome,
-  extractPermissionPath,
   isConfigMode,
   isHostGrantAccess,
   isHostGrantDuration,
-  isInsideWorkspace,
-  isInsideScreenWorkspace,
   pickAllowOption,
   pickRejectOption,
   prepareBotWorkspace,
   readAgentsFile,
-  requestedAccessFromKind,
   rollbackPreparedBotWorkspace,
   thisBotAgentsPath,
   writeAgentsFile,
@@ -49,15 +49,44 @@ import {
   type PreparedBotWorkspace,
 } from "./harness-home.ts";
 import {
+  botFailureTranscriptCard,
+  expiredTranscriptCard,
+  failedNeedsYouResumeCard,
+  hostGrantTranscriptCard,
+  needsYouComputerCard,
+  permissionTranscriptCard,
+  retriedBotFailureTranscriptCard,
+  resolvedHostGrantCard,
+  resolvedNeedsYouComputerCard,
+  resolvedPermissionCard,
+  retryingBotFailureTranscriptCard,
+  transcriptCardSummary,
+  unconfirmedNeedsYouComputerCard,
+  unavailableNeedsYouComputerCard,
+  unsupportedPermissionTranscriptCard,
+  type TranscriptCard,
+} from "./transcript-card.ts";
+import {
+  acpResponseWasFlushed,
+  callbackFailedTransport,
+  cancellationClosedTransport,
   isAuthError,
   isCancelled,
+  permissionOptionKind,
   spawnAcp,
+  validatedPermissionOptions,
   type AcpHandlers,
   type AssistantDelta,
+  type ComputerHelpPrompt,
+  type ComputerHelpResolution,
   type PermissionPrompt,
 } from "./acp.ts";
 import { NoopComputerRuntime, type ComputerRuntime, type DisplayHandle } from "./computer.ts";
-import { pinchTabMcpServers, stripPinchTabFromPath } from "./pinchtab.ts";
+import {
+  pinchTabMcpServers,
+  pinchTabToolAllowed,
+  stripPinchTabFromPath,
+} from "./pinchtab.ts";
 import type { KasmWriteAuthority } from "./kasm.ts";
 
 export { defaultHomeDir, defaultWorkspaceDir } from "./home.ts";
@@ -90,6 +119,7 @@ export type PublicScreenCleanupError = {
 };
 
 export type PublicPermission = {
+  cardId?: string;
   title: string;
   description?: string;
   options: Array<{ optionId: string; name: string; kind?: string }>;
@@ -111,7 +141,11 @@ export type PublicBot = {
   screenError: PublicScreenError | null;
   screenCleanupError: PublicScreenCleanupError | null;
   permission: PublicPermission | null;
-  needsYou: { reason: "login"; hint: string } | null;
+  needsYou:
+    | { reason: "login"; hint: string }
+    | { reason: "computer-help"; hint: string; eventId: string; cardId: string }
+    | null;
+  activity: ChannelActivity;
   messages?: PublicMessage[];
 };
 
@@ -137,6 +171,12 @@ export type PublicChannel = {
   title: string | null;
   createdAt: string;
   members: PublicChannelMember[];
+  activity: ChannelActivity;
+};
+
+export type PublicInbox = {
+  bots: PublicBot[];
+  channels: PublicChannel[];
 };
 
 export type AcpSession = {
@@ -145,12 +185,59 @@ export type AcpSession = {
   newSession(cwd: string): Promise<string>;
   loadSession?(sessionId: string): Promise<unknown>;
   resumeSession?(sessionId: string): Promise<unknown>;
-  prompt(text: string): Promise<string>;
-  cancel(): void;
-  respondPermission(rpcId: PermissionPrompt["rpcId"], optionId: string): void;
+  prompt(text: string, handlers?: AcpHandlers): Promise<string>;
+  cancel(): boolean | void;
+  respondPermission(
+    rpcId: PermissionPrompt["rpcId"],
+    optionId: string,
+    onFlushed?: () => void | Promise<void>,
+  ): void | Promise<void>;
+  respondComputerHelp?(
+    rpcId: ComputerHelpPrompt["rpcId"],
+    resolution: ComputerHelpResolution,
+    onFlushed?: () => void | Promise<void>,
+  ): void | Promise<void>;
 };
 
-type BotPermission = PermissionPrompt & PublicPermission;
+type BotPermission = PermissionPrompt & PublicPermission & {
+  client?: AcpSession;
+  turnSeq?: number;
+  queueGeneration?: number;
+};
+
+type PermissionCardChoice =
+  | { kind: "permission"; optionId: string }
+  | { kind: "host-grant"; access: HostGrantAccess };
+
+type BotComputerHelp = {
+  eventId: string;
+  cardId: string;
+  rpcId: ComputerHelpPrompt["rpcId"];
+  client: AcpSession;
+  turnSeq: number;
+  queueGeneration: number;
+};
+
+type CallbackQueueDetachment = {
+  publicError: Error;
+};
+
+type BotCallbackQueues = {
+  generation: number;
+  permissionTail: Promise<void>;
+  computerHelpTail: Promise<void>;
+  detached: Promise<CallbackQueueDetachment>;
+  detachment: CallbackQueueDetachment | null;
+  detach(detachment: CallbackQueueDetachment): void;
+};
+
+type CallbackQueueTail = "permissionTail" | "computerHelpTail";
+
+type CallbackQueueRotation = {
+  invalidateClient?: boolean;
+  responseFlushed?: boolean;
+  publicError?: Error;
+};
 
 type Bot = {
   id: string;
@@ -169,12 +256,28 @@ type Bot = {
   screenError: PublicScreenError | null;
   screenCleanupError: PublicScreenCleanupError | null;
   eyesMode: EyesMode;
-  needsYou: { reason: "login"; hint: string } | null;
+  needsYou: PublicBot["needsYou"];
+  computerHelp: BotComputerHelp | null;
   permission: BotPermission | null;
-  openAssistantId: string | null;
+  pendingAssistant: { text: string; messageId?: string } | null;
+  assistantMessageIds: Map<string, string>;
   activeUserId: string | null;
   turnSeq: number;
+  startingTurn: boolean;
+  callbackQueues: BotCallbackQueues;
   client: AcpSession | null;
+};
+
+type PermissionResponseContext = {
+  bot: Bot;
+  queues: BotCallbackQueues;
+  permission: BotPermission;
+  client: AcpSession;
+  turnSeq: number;
+  rpcId: PermissionPrompt["rpcId"];
+  cardId: string;
+  optionId: string;
+  choice: PermissionCardChoice;
 };
 
 export type BotStoreDeps = {
@@ -197,9 +300,163 @@ type ScreenAttachmentAttempt = {
 
 function publicPermission(p: BotPermission | null): PublicPermission | null {
   if (!p) return null;
-  const out: PublicPermission = { title: p.title, description: p.description, options: p.options };
+  const options = validatedPermissionOptions(p.options);
+  const permissionCard = permissionTranscriptCard(p.toolKind, options);
+  const card = p.hostGrant
+    ? hostGrantTranscriptCard(p.hostGrant.path, p.hostGrant.requested, options)
+    : permissionCard;
+  const safeOptions = p.hostGrant
+    ? options.flatMap((option) => {
+      const kind = permissionOptionKind(option);
+      if (!kind) return [];
+      const name = kind.startsWith("allow_") ? "Allow" : "Deny";
+      return [{ optionId: option.optionId, name, kind }];
+    })
+    : permissionCard.actions.flatMap((action) => {
+      if (action.command.kind !== "permission") return [];
+      const optionId = action.command.optionId;
+      const source = options.find((option) => option.optionId === optionId);
+      const kind = source ? permissionOptionKind(source) : null;
+      return [{ optionId, name: action.label, ...(kind ? { kind } : {}) }];
+    });
+  const out: PublicPermission = {
+    title: card.title,
+    description: card.body,
+    options: safeOptions,
+  };
+  if (p.cardId) out.cardId = p.cardId;
   if (p.hostGrant) out.hostGrant = p.hostGrant;
   return out;
+}
+
+function botWorkspaceCleanupRequiredError(
+  context: string,
+  error: unknown,
+  rollback: BotWorkspaceRollback,
+): Error {
+  const detail = error instanceof Error ? error.message : String(error);
+  const status = typeof error === "object" && error !== null
+    ? (error as { status?: unknown }).status
+    : undefined;
+  return Object.assign(
+    new Error(
+      `${context}: ${detail}. Bot workspace ${JSON.stringify(rollback.preservedPath)} was preserved because ${rollback.reason}. Inspect it, preserve anything you need, and remove the directory only if safe before retrying.`,
+      { cause: error },
+    ),
+    {
+      status: typeof status === "number" ? status : 503,
+      code: "BOT_WORKSPACE_CLEANUP_REQUIRED",
+      recoverable: true,
+    },
+  );
+}
+
+function errorDetail(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function missingScreenAssignmentError(): PublicScreenError {
+  return {
+    stage: "reserve",
+    code: "SCREEN_ASSIGNMENT_MISSING",
+    message: "Screen display assignment is missing.",
+  };
+}
+
+function screenAttachmentError(stage: ScreenAttachmentStage): PublicScreenError {
+  if (stage === "readiness") {
+    return {
+      stage,
+      code: "SCREEN_NOT_READY",
+      message: "Screen application did not become ready.",
+    };
+  }
+  if (stage === "ownership") {
+    return {
+      stage,
+      code: "SCREEN_OWNERSHIP_FAILED",
+      message: "Screen ownership registration failed.",
+    };
+  }
+  return {
+    stage,
+    code: "SCREEN_ATTACHMENT_FAILED",
+    message: `Screen attachment failed during ${stage}.`,
+  };
+}
+
+function screenCleanupError(): PublicScreenCleanupError {
+  return {
+    code: "SCREEN_CLEANUP_FAILED",
+    message: "Screen cleanup did not complete.",
+  };
+}
+
+function staleScreenAttemptError(): Error {
+  return Object.assign(new Error("Screen changed. Refresh and retry Screen."), {
+    status: 409,
+    code: "STALE_SCREEN_ATTEMPT",
+  });
+}
+
+function botProvisioningCleanupRequiredError(botId: string, cause: unknown, cleanup: string): Error {
+  const status = typeof cause === "object" && cause !== null
+    ? (cause as { status?: unknown }).status
+    : undefined;
+  return Object.assign(
+    new Error(
+      `Bot provisioning failed: ${errorDetail(cause)}. Cleanup is incomplete for ${botId}: ${cleanup}. `
+      + "The recoverable provisioning state was preserved for daemon restart or explicit retry.",
+      { cause },
+    ),
+    {
+      status: typeof status === "number" ? status : 503,
+      code: "BOT_PROVISIONING_CLEANUP_REQUIRED",
+      provisioningId: botId,
+      recoverable: true,
+    },
+  );
+}
+
+function isPinchTabPermission(prompt: PermissionPrompt): boolean {
+  const prefix = "mcp__pinchtab__";
+  if (!prompt.title.startsWith(prefix)) return false;
+  const toolName = prompt.title.slice(prefix.length);
+  return /^[A-Za-z0-9_-]+$/u.test(toolName) && pinchTabToolAllowed(toolName);
+}
+
+function botActionNoLongerActive(): Error {
+  return Object.assign(new Error("Bot action is no longer active"), { status: 409 });
+}
+
+function unconfirmedProviderResponse(): Error {
+  return Object.assign(
+    new Error("The response was sent, but OpenBot could not confirm this Card."),
+    { status: 409 },
+  );
+}
+
+function callbackQueues(generation = 0): BotCallbackQueues {
+  let resolveDetached!: (detachment: CallbackQueueDetachment) => void;
+  const queues: BotCallbackQueues = {
+    generation,
+    permissionTail: Promise.resolve(),
+    computerHelpTail: Promise.resolve(),
+    detached: new Promise<CallbackQueueDetachment>((resolve) => {
+      resolveDetached = resolve;
+    }),
+    detachment: null,
+    detach(detachment) {
+      if (queues.detachment) return;
+      queues.detachment = detachment;
+      resolveDetached(detachment);
+    },
+  };
+  return queues;
+}
+
+function pickGenericRejectOption(options: PermissionPrompt["options"]): string | null {
+  return options.find((option) => permissionOptionKind(option) === "reject_once")?.optionId ?? null;
 }
 
 export class BotStore {
@@ -232,6 +489,7 @@ export class BotStore {
       const storedBots = this.home.listBots();
       fs.mkdirSync(this.workspaceDir, { recursive: true });
       ensureHarnessHome(this.home.homeDir, this.workspaceDir);
+      this.home.expirePendingTranscriptCards();
       this.load(storedBots);
     } catch (error) {
       this.home.close();
@@ -245,8 +503,9 @@ export class BotStore {
       throw new Error("Screen attachments are still settling; await stopScreenAttachments before closing BotStore");
     }
     for (const bot of this.bots.values()) {
-      bot.client?.close();
-      bot.client = null;
+      const client = bot.client;
+      this.rotateCallbackQueues(bot, client, bot.turnSeq, { invalidateClient: true });
+      client?.close();
     }
     this.home.close();
   }
@@ -542,8 +801,46 @@ export class BotStore {
     this.home.clearBotProvisioning(input.botId);
   }
 
+
   listHarnesses(): HarnessInfo[] {
     return this.listHarnessesFn();
+  }
+
+  appSettings(): StoredAppSettings {
+    return this.home.readAppSettings();
+  }
+
+  updateAppSettings(input: {
+    defaultConnection?: unknown;
+    defaultConfigMode?: unknown;
+  }): StoredAppSettings {
+    const patch: Partial<StoredAppSettings> = {};
+    if (Object.hasOwn(input, "defaultConnection")) {
+      const connection = input.defaultConnection;
+      if (connection !== null && (typeof connection !== "string" || !isHarnessId(connection))) {
+        throw Object.assign(new Error("unknown Connection"), { status: 400 });
+      }
+      if (
+        connection !== null
+        && (
+          connection !== "codex"
+          || !this.listHarnesses().some((harness) => harness.id === connection && harness.talk)
+        )
+      ) {
+        throw Object.assign(new Error("Connection is not available"), { status: 400 });
+      }
+      patch.defaultConnection = connection;
+    }
+    if (Object.hasOwn(input, "defaultConfigMode")) {
+      if (!isConfigMode(input.defaultConfigMode)) {
+        throw Object.assign(new Error("unknown config mode"), { status: 400 });
+      }
+      patch.defaultConfigMode = input.defaultConfigMode;
+    }
+    if (Object.keys(patch).length === 0) {
+      throw Object.assign(new Error("no App Settings supplied"), { status: 400 });
+    }
+    return this.home.updateAppSettings(patch);
   }
 
   hasAcpChild(id: string): boolean {
@@ -563,7 +860,7 @@ export class BotStore {
   }
 
   list(): PublicBot[] {
-    return [...this.bots.values()].map((bot) => this.toPublic(bot, false));
+    return this.publicBotSummaries(this.home.listChannelSummaries());
   }
 
   get(id: string): PublicBot | null {
@@ -592,6 +889,18 @@ export class BotStore {
     });
   }
 
+  inbox(): PublicInbox {
+    const summaries = this.home.listChannelSummaries();
+    const storedBots = this.home.listBots();
+    const byId = new Map(storedBots.map((bot) => [bot.id, bot]));
+    return {
+      bots: this.publicBotSummaries(summaries),
+      channels: summaries
+        .filter((channel) => channel.kind !== "bot-to-bot")
+        .map((channel) => this.toPublicChannel(channel, byId)),
+    };
+  }
+
   messages(id: string): {
     messages: PublicMessage[];
     write: boolean;
@@ -609,25 +918,45 @@ export class BotStore {
   }
 
   createGroup(input: { title?: unknown; botIds?: unknown }): PublicChannel {
+    if (typeof input.title !== "string") {
+      throw Object.assign(new Error("title is required"), { status: 400 });
+    }
     if (!Array.isArray(input.botIds) || input.botIds.some((id) => typeof id !== "string")) {
       throw Object.assign(new Error("botIds is required"), { status: 400 });
     }
-    const title = typeof input.title === "string" ? input.title : undefined;
-    const channel = this.home.createGroup({ title, memberBotIds: input.botIds as string[] });
+    const channel = this.home.createGroup({ title: input.title, memberBotIds: input.botIds as string[] });
     return this.toPublicChannel(channel);
   }
 
   listChannels(): PublicChannel[] {
+    const storedBots = this.home.listBots();
+    const byId = new Map(storedBots.map((bot) => [bot.id, bot]));
     return this.home
-      .listChannels()
+      .listChannelSummaries()
       .filter((channel) => channel.kind !== "bot-to-bot")
-      .map((channel) => this.toPublicChannel(channel));
+      .map((channel) => this.toPublicChannel(channel, byId));
   }
 
   getChannel(id: string): PublicChannel | null {
-    const channel = this.home.getChannel(id);
+    const channel = this.home.getChannelSummary(id);
     if (!channel) return null;
     return this.toPublicChannel(channel);
+  }
+
+  markBotRead(id: string, cursor: ChannelCursor): ChannelActivity {
+    this.require(id);
+    const channelId = this.channelId(id);
+    this.home.markChannelRead(channelId, cursor);
+    return this.home.channelActivity(channelId);
+  }
+
+  markChannelRead(id: string, cursor: ChannelCursor): ChannelActivity {
+    const channel = this.home.getChannelSummary(id);
+    if (!channel || channel.kind === "bot-to-bot") {
+      throw Object.assign(new Error("Channel not found"), { status: 404 });
+    }
+    this.home.markChannelRead(id, cursor);
+    return this.home.channelActivity(id);
   }
 
   async create(name: string): Promise<PublicBot> {
@@ -635,13 +964,18 @@ export class BotStore {
     if (!trimmed) throw Object.assign(new Error("name is required"), { status: 400 });
     const taken = [...this.bots.values()].map((bot) => bot.shape);
     const id = crypto.randomUUID();
+    const defaults = this.home.readAppSettings();
+    const defaultConnection = defaults.defaultConnection === "codex"
+      && this.listHarnesses().some((harness) => harness.id === defaults.defaultConnection && harness.talk)
+      ? defaults.defaultConnection
+      : null;
     const stored: StoredBot = {
       id,
       name: trimmed,
       color: pickColor(trimmed),
       shape: pickShape(trimmed, taken),
-      harness: null,
-      configMode: "isolated",
+      harness: defaultConnection,
+      configMode: defaults.defaultConfigMode,
       createdAt: nowIso(),
     };
     this.home.beginBotProvisioning(id);
@@ -756,11 +1090,13 @@ export class BotStore {
     if (bot.harness === harness) return this.toPublic(bot, true);
 
     this.home.setHarness(bot.id, harness);
-    bot.client?.close();
-    bot.client = null;
+    const client = bot.client;
+    const turnSeq = bot.turnSeq;
+    this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
+    bot.turnSeq += 1;
+    client?.close();
     bot.harness = harness;
     bot.write = false;
-    bot.permission = null;
     bot.needsYou = null;
     bot.eyesMode = "idle";
     return this.toPublic(bot, true);
@@ -770,12 +1106,17 @@ export class BotStore {
     const bot = this.require(id);
     if (!isConfigMode(configMode)) throw Object.assign(new Error("unknown config mode"), { status: 400 });
     if (bot.configMode === configMode) return this.toPublic(bot, true);
+    if (bot.computerHelp) {
+      throw Object.assign(new Error("resolve the pending action before changing this Bot"), { status: 409 });
+    }
     this.home.setConfigMode(bot.id, configMode);
-    bot.client?.close();
-    bot.client = null;
+    const client = bot.client;
+    const turnSeq = bot.turnSeq;
+    this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
+    bot.turnSeq += 1;
+    client?.close();
     bot.configMode = configMode;
     bot.write = false;
-    bot.permission = null;
     bot.needsYou = null;
     bot.eyesMode = "idle";
     return this.toPublic(bot, true);
@@ -831,27 +1172,81 @@ export class BotStore {
     if (bot.harness !== "codex") {
       throw Object.assign(new Error("Talk spawn is Codex-only in this slice"), { status: 400 });
     }
-
-    const channelId = this.channelId(bot.id);
-    const prior = this.home.listMessages(channelId);
-    const replyTarget = this.resolveReplyTarget(prior, replyTo);
-    const attached = await this.ensureClient(bot);
-    const history = attached.skipHistory ? "" : channelHistory(prior, bot.name);
-    const client = attached.client;
-
-    if (bot.write) {
-      try {
-        client.cancel();
-      } catch {
-        /* local cancel still proceeds */
-      }
+    if (bot.computerHelp) {
+      throw Object.assign(new Error("This Bot is waiting for you"), { status: 409 });
+    }
+    if (bot.startingTurn) {
+      throw Object.assign(new Error("wait for the current message to start"), { status: 409 });
     }
 
-    bot.turnSeq += 1;
-    const turnSeq = bot.turnSeq;
+    const channelId = this.channelId(bot.id);
+    const beforeInterrupt = this.home.listMessages(channelId);
+    const replyTarget = this.resolveReplyTarget(beforeInterrupt, replyTo);
+    const startTurnSeq = bot.turnSeq;
+    let replacementTurnSeq: number | null = null;
+    bot.startingTurn = true;
+    let attached: { client: AcpSession; skipHistory: boolean };
+    try {
+      attached = await this.ensureClient(bot);
+      if (startTurnSeq !== bot.turnSeq) {
+        this.rotateCallbackQueues(bot, attached.client, bot.turnSeq, { invalidateClient: true });
+        attached.client.close();
+        this.home.setSessionId(bot.id, channelId, null);
+        throw Object.assign(new Error("message start was replaced"), { status: 409 });
+      }
+      if (bot.write) {
+        const replacedTurnSeq = bot.turnSeq;
+        replacementTurnSeq = replacedTurnSeq + 1;
+        bot.pendingAssistant = null;
+        bot.assistantMessageIds.clear();
+        bot.activeUserId = null;
+        if (!this.rotateCallbackQueues(bot, attached.client, replacedTurnSeq)) {
+          throw Object.assign(new Error("message start was replaced"), { status: 409 });
+        }
+        bot.turnSeq = replacementTurnSeq;
+        let reusable = true;
+        try {
+          reusable = attached.client.cancel() !== false;
+        } catch {
+          reusable = false;
+        }
+        if (!reusable) {
+          if (!this.rotateCallbackQueues(bot, attached.client, replacementTurnSeq, {
+            invalidateClient: true,
+          })) {
+            throw Object.assign(new Error("message start was replaced"), { status: 409 });
+          }
+          attached = await this.ensureClient(bot);
+          if (replacementTurnSeq !== bot.turnSeq) {
+            this.rotateCallbackQueues(bot, attached.client, bot.turnSeq, { invalidateClient: true });
+            attached.client.close();
+            this.home.setSessionId(bot.id, channelId, null);
+            throw Object.assign(new Error("message start was replaced"), { status: 409 });
+          }
+        }
+      }
+    } catch (err) {
+      if ((replacementTurnSeq ?? startTurnSeq) !== bot.turnSeq) {
+        throw Object.assign(new Error("message start was replaced"), { status: 409 });
+      }
+      return this.recordClientFailure(bot, channelId, trimmed, replyTarget, err);
+    } finally {
+      bot.startingTurn = false;
+    }
+    let client = attached.client;
+    const turnSeq = replacementTurnSeq ?? ++bot.turnSeq;
+    if (replacementTurnSeq === null) {
+      this.expireActivePermission(bot);
+      bot.assistantMessageIds.clear();
+    }
+
+    const prior = this.home.listMessages(channelId);
+    const history = attached.skipHistory ? "" : channelHistory(prior, bot.name);
+
     const userMessage: PublicMessage = {
       id: crypto.randomUUID(),
       role: "user",
+      senderId: HUMAN_MEMBER_ID,
       text: trimmed,
       createdAt: nowIso(),
       receipt: "sent",
@@ -859,18 +1254,66 @@ export class BotStore {
     if (replyTarget) userMessage.replyTo = replyTarget.id;
     this.home.appendMessage(channelId, {
       ...userMessage,
-      senderId: HUMAN_MEMBER_ID,
       recipientBotId: bot.id,
     });
     bot.activeUserId = userMessage.id;
-    bot.openAssistantId = null;
+    bot.pendingAssistant = null;
     bot.write = true;
     bot.eyesMode = "write";
-    bot.permission = null;
 
     void (async () => {
+      const promptWithClient = (attemptClient: AcpSession, attemptHistory: string) => (
+        attemptClient.prompt(talkPrompt(trimmed, replyTarget?.text, attemptHistory), {
+          onComputerHelp: (prompt) => {
+            if (turnSeq !== bot.turnSeq) return;
+            return this.queueComputerHelp(bot, attemptClient, prompt, turnSeq);
+          },
+          onComputerHelpCancelled: (prompt) => {
+            return this.queueComputerHelpCancellation(bot, attemptClient, prompt, turnSeq);
+          },
+          onPermission: (prompt) => {
+            if (turnSeq !== bot.turnSeq) return;
+            return this.queuePermission(bot, attemptClient, prompt, turnSeq);
+          },
+          onAssistant: (assistantText, delta) => {
+            if (turnSeq !== bot.turnSeq) return;
+            this.applyAssistant(bot, channelId, assistantText, delta);
+          },
+          onPromptWritten: () => {
+            if (turnSeq !== bot.turnSeq) return;
+            this.setUserReceipt(bot, channelId, "delivered");
+          },
+          onPromptFlushed: () => {
+            if (turnSeq !== bot.turnSeq) return;
+            this.setUserReceipt(bot, channelId, "read");
+          },
+        })
+      );
       try {
-        const reply = await client.prompt(talkPrompt(trimmed, replyTarget?.text, history));
+        let reply: string;
+        try {
+          reply = await promptWithClient(client, history);
+        } catch (err) {
+          if (!cancellationClosedTransport(err) || turnSeq !== bot.turnSeq) throw err;
+          this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
+          this.home.setSessionId(bot.id, channelId, null);
+          bot.startingTurn = true;
+          let recovered: { client: AcpSession; skipHistory: boolean };
+          try {
+            recovered = await this.ensureClient(bot);
+          } finally {
+            bot.startingTurn = false;
+          }
+          if (turnSeq !== bot.turnSeq) {
+            this.rotateCallbackQueues(bot, recovered.client, bot.turnSeq, { invalidateClient: true });
+            recovered.client.close();
+            return;
+          }
+          client = recovered.client;
+          bot.eyesMode = "write";
+          const retryHistory = recovered.skipHistory ? "" : channelHistory(prior, bot.name);
+          reply = await promptWithClient(client, retryHistory);
+        }
         if (turnSeq !== bot.turnSeq) return;
         const messages = this.home.listMessages(channelId);
         const userIdx = messages.findIndex((item) => item.id === userMessage.id);
@@ -878,21 +1321,38 @@ export class BotStore {
         if (assistants.length === 0) this.pushAssistant(bot, channelId, reply || ".");
       } catch (err) {
         if (turnSeq !== bot.turnSeq) return;
-        if (isCancelled(err)) return;
-        if (isAuthError(err) || isLikelyLogin(err)) {
+        if (isCancelled(err)) {
+          if (cancellationClosedTransport(err)) {
+            this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
+          }
+          return;
+        }
+        if (acpResponseWasFlushed(err)) {
+          this.rotateCallbackQueues(bot, client, turnSeq, {
+            invalidateClient: true,
+            responseFlushed: true,
+          });
+          this.home.setSessionId(bot.id, channelId, null);
+          return;
+        }
+        const needsSignIn = isAuthError(err) || isLikelyLogin(err);
+        if (needsSignIn) {
           bot.eyesMode = "needs-you";
           bot.needsYou = { reason: "login", hint: loginHint("codex") };
-          this.fillAssistant(bot, channelId, loginHint("codex"));
-        } else {
-          this.fillAssistant(bot, channelId, err instanceof Error ? err.message : "Harness error");
         }
+        this.discardUnfinishedAssistant(bot);
+        this.appendFailureCard(bot, channelId, userMessage.id, needsSignIn);
+        if (callbackFailedTransport(err)) this.home.setSessionId(bot.id, channelId, null);
+        this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
+        client.close();
       } finally {
         if (turnSeq !== bot.turnSeq) return;
-        bot.openAssistantId = null;
+        bot.pendingAssistant = null;
+        bot.assistantMessageIds.clear();
         bot.activeUserId = null;
         bot.write = false;
         if (bot.eyesMode === "write") bot.eyesMode = bot.needsYou ? "needs-you" : "idle";
-        bot.permission = null;
+        this.expireActivePermission(bot);
       }
     })();
 
@@ -910,40 +1370,217 @@ export class BotStore {
     return this.toPublic(bot, true);
   }
 
-  answerPermission(id: string, optionId: string): PublicBot {
+  async retryCard(id: string, cardId: string): Promise<PublicBot> {
     const bot = this.require(id);
-    if (!bot.permission || !bot.client) {
-      throw Object.assign(new Error("no permission prompt"), { status: 409 });
+    if (!cardId) throw Object.assign(new Error("cardId is required"), { status: 400 });
+    if (bot.write || bot.startingTurn) {
+      throw Object.assign(new Error("wait for the current message to finish"), { status: 409 });
     }
-    if (!optionId) throw Object.assign(new Error("optionId is required"), { status: 400 });
-    const rpcId = bot.permission.rpcId;
-    bot.permission = null;
-    bot.eyesMode = bot.write ? "write" : "idle";
-    bot.client.respondPermission(rpcId, optionId);
-    return this.toPublic(bot, true);
+    const message = this.home.getMessage(this.channelId(bot.id), cardId);
+    if (!message?.card || message.card.kind !== "bot-failure") {
+      throw Object.assign(new Error("failure Card not found"), { status: 404 });
+    }
+    const action = message.card.actions.find((candidate) => candidate.command.kind === "retry-message");
+    if (!action || action.command.kind !== "retry-message") {
+      throw Object.assign(new Error("failure Card is no longer actionable"), { status: 409 });
+    }
+    const source = this.home.getMessage(this.channelId(bot.id), action.command.messageId);
+    if (!source || source.role !== "user" || (source.kind && source.kind !== "text")) {
+      throw Object.assign(new Error("original message is no longer available"), { status: 409 });
+    }
+    const originalCard = message.card;
+    this.home.updateMessageCard(message.id, retryingBotFailureTranscriptCard(originalCard));
+    try {
+      await this.send(bot.id, source.text, source.replyTo);
+      this.home.updateMessageCard(message.id, retriedBotFailureTranscriptCard(originalCard));
+      return this.toPublic(bot, true);
+    } catch (err) {
+      this.home.updateMessageCard(message.id, originalCard);
+      throw err;
+    }
   }
 
-  answerHostGrant(id: string, access: string, duration: string): PublicBot {
+  async resolveNeedsYou(
+    id: string,
+    cardId: string,
+    eventId: string,
+    resolution: string,
+  ): Promise<PublicBot> {
     const bot = this.require(id);
-    if (!bot.permission?.hostGrant || !bot.client) {
-      throw Object.assign(new Error("no Host grant prompt"), { status: 409 });
+    if (!cardId) throw Object.assign(new Error("cardId is required"), { status: 400 });
+    if (!eventId) throw Object.assign(new Error("eventId is required"), { status: 400 });
+    if (resolution !== "done" && resolution !== "skip") {
+      throw Object.assign(new Error("resolution must be done or skip"), { status: 400 });
     }
-    if (!isHostGrantAccess(access)) throw Object.assign(new Error("access is required"), { status: 400 });
-    if (!isHostGrantDuration(duration)) throw Object.assign(new Error("duration is required"), { status: 400 });
-    const requestPath = bot.permission.hostGrant.path;
-    const rpcId = bot.permission.rpcId;
-    const options = bot.permission.options;
-    const optionId =
-      access === "deny" ? pickRejectOption(options) : pickAllowOption(options);
-    if (!optionId) throw Object.assign(new Error("no matching permission option"), { status: 409 });
-    if (duration !== "once") {
-      this.home.addHostGrant({ path: requestPath, access, duration });
-    }
-    bot.permission = null;
-    bot.eyesMode = bot.write ? "write" : "idle";
-    bot.client.respondPermission(rpcId, optionId);
-    this.appendHostGrantCard(bot, requestPath, access, duration);
-    return this.toPublic(bot, true);
+    return this.enqueueComputerHelp(bot, async (queues) => {
+      const channelId = this.channelId(bot.id);
+      const message = this.home.getMessage(channelId, cardId);
+      if (!message?.card || message.card.kind !== "computer") {
+        throw Object.assign(new Error("needs-you Computer Card not found"), { status: 404 });
+      }
+      const pendingCard = message.card;
+      const resolved = resolvedNeedsYouComputerCard(pendingCard, eventId, resolution);
+      const active = bot.computerHelp;
+      if (
+        !active
+        || !this.computerHelpContextIsCurrent(bot, queues, active, eventId, cardId)
+        || !active.client.respondComputerHelp
+      ) {
+        throw Object.assign(new Error("needs-you event is no longer active"), { status: 409 });
+      }
+      let committed = false;
+      try {
+        await active.client.respondComputerHelp(active.rpcId, resolution, () => {
+          if (
+            !this.computerHelpContextIsCurrent(bot, queues, active, eventId, cardId)
+          ) {
+            throw new Error("needs-you event changed before response flush");
+          }
+          this.home.updateMessageCard(cardId, resolved);
+          bot.computerHelp = null;
+          bot.needsYou = null;
+          bot.eyesMode = bot.permission ? "needs-you" : bot.write ? "write" : "idle";
+          committed = true;
+        });
+      } catch (err) {
+        if (acpResponseWasFlushed(err)) {
+          if (
+            !committed
+            && this.computerHelpContextIsCurrent(bot, queues, active, eventId, cardId)
+          ) {
+            try {
+              this.home.updateMessageCard(
+                cardId,
+                unconfirmedNeedsYouComputerCard(pendingCard, eventId),
+              );
+            } catch {
+              // The exact event is still cleared below so it cannot advertise a dead retry.
+            }
+            bot.computerHelp = null;
+            if (
+              bot.needsYou?.reason === "computer-help"
+              && bot.needsYou.eventId === eventId
+              && bot.needsYou.cardId === cardId
+            ) {
+              bot.needsYou = null;
+            }
+            bot.eyesMode = bot.permission ? "needs-you" : bot.write ? "write" : "idle";
+          }
+          throw unconfirmedProviderResponse();
+        }
+        if (!this.callbackQueuesAreCurrent(bot, queues)) {
+          throw queues.detachment?.publicError ?? botActionNoLongerActive();
+        }
+        if (!committed && this.computerHelpContextIsCurrent(bot, queues, active, eventId, cardId)) {
+          this.home.updateMessageCard(cardId, failedNeedsYouResumeCard(pendingCard, eventId));
+          bot.eyesMode = "needs-you";
+        }
+        throw Object.assign(new Error("The Bot could not receive your response. Try again."), { status: 409 });
+      }
+      if (!committed) {
+        throw Object.assign(new Error("needs-you event is no longer active"), { status: 409 });
+      }
+      if (
+        !this.callbackQueuesAreCurrent(bot, queues)
+        || bot.client !== active.client
+        || bot.turnSeq !== active.turnSeq
+        || this.home.getMessage(channelId, cardId)?.id !== cardId
+      ) {
+        throw queues.detachment?.publicError ?? botActionNoLongerActive();
+      }
+      return this.toPublic(bot, true);
+    });
+  }
+
+  async answerPermission(id: string, optionId: string, cardId: string): Promise<PublicBot> {
+    const bot = this.require(id);
+    return this.enqueuePermission(bot, async (queues) => {
+      if (!bot.permission || !bot.client) {
+        throw Object.assign(new Error("no permission prompt"), { status: 409 });
+      }
+      if (!optionId) throw Object.assign(new Error("optionId is required"), { status: 400 });
+      const activeCardId = bot.permission.cardId;
+      if (!activeCardId) throw Object.assign(new Error("permission Card not found"), { status: 409 });
+      if (!cardId) throw Object.assign(new Error("cardId is required"), { status: 400 });
+      if (cardId !== activeCardId) {
+        throw Object.assign(new Error("permission Card is no longer active"), { status: 409 });
+      }
+      const message = this.home.getMessage(this.channelId(bot.id), activeCardId);
+      if (!message?.card || message.card.kind !== "permission") {
+        throw Object.assign(new Error("permission Card not found"), { status: 409 });
+      }
+      const resolvedCard = resolvedPermissionCard(message.card, optionId);
+      const activePermission = bot.permission;
+      if (!activePermission.options.some((option) => option.optionId === optionId)) {
+        throw Object.assign(new Error("permission choice is not available"), { status: 409 });
+      }
+      const permissionTurnSeq = bot.turnSeq;
+      const sourceMessageId = bot.activeUserId;
+      const rpcId = activePermission.rpcId;
+      const client = bot.client;
+      return this.commitPermissionResponse({
+        bot,
+        queues,
+        permission: activePermission,
+        client,
+        turnSeq: permissionTurnSeq,
+        rpcId,
+        cardId: activeCardId,
+        optionId,
+        choice: { kind: "permission", optionId },
+      }, sourceMessageId, () => {
+        this.home.updateMessageCard(message.id, resolvedCard);
+      }, "permission Card is no longer active");
+    });
+  }
+
+  async answerHostGrant(id: string, access: string, duration: string, cardId: string): Promise<PublicBot> {
+    const bot = this.require(id);
+    return this.enqueuePermission(bot, async (queues) => {
+      if (!bot.permission?.hostGrant || !bot.client) {
+        throw Object.assign(new Error("no Host grant prompt"), { status: 409 });
+      }
+      if (!isHostGrantAccess(access)) throw Object.assign(new Error("access is required"), { status: 400 });
+      if (!isHostGrantDuration(duration)) throw Object.assign(new Error("duration is required"), { status: 400 });
+      const activeCardId = bot.permission.cardId;
+      if (!activeCardId) throw Object.assign(new Error("Host grant Card not found"), { status: 409 });
+      if (!cardId) throw Object.assign(new Error("cardId is required"), { status: 400 });
+      if (cardId !== activeCardId) {
+        throw Object.assign(new Error("Host grant Card is no longer active"), { status: 409 });
+      }
+      const message = this.home.getMessage(this.channelId(bot.id), activeCardId);
+      if (!message?.card || message.card.kind !== "host-grant") {
+        throw Object.assign(new Error("Host grant Card not found"), { status: 409 });
+      }
+      const resolvedCard = resolvedHostGrantCard(message.card, access, duration);
+      const activePermission = bot.permission;
+      const permissionTurnSeq = bot.turnSeq;
+      const sourceMessageId = bot.activeUserId;
+      const requestPath = activePermission.hostGrant!.path;
+      const rpcId = activePermission.rpcId;
+      const options = activePermission.options;
+      const optionId =
+        access === "deny" ? pickRejectOption(options) : pickAllowOption(options);
+      if (!optionId) throw Object.assign(new Error("no matching permission option"), { status: 409 });
+      const client = bot.client;
+      return this.commitPermissionResponse({
+        bot,
+        queues,
+        permission: activePermission,
+        client,
+        turnSeq: permissionTurnSeq,
+        rpcId,
+        cardId: activeCardId,
+        optionId,
+        choice: { kind: "host-grant", access },
+      }, sourceMessageId, () => {
+        this.home.resolveHostGrantCard(message.id, resolvedCard, {
+          path: requestPath,
+          access,
+          duration,
+        });
+      }, "Host grant Card is no longer active");
+    });
   }
 
   private load(storedBots: StoredBot[]): void {
@@ -977,10 +1614,14 @@ export class BotStore {
       screenCleanupError: null,
       eyesMode: "idle",
       needsYou: null,
+      computerHelp: null,
       permission: null,
-      openAssistantId: null,
+      pendingAssistant: null,
+      assistantMessageIds: new Map(),
       activeUserId: null,
       turnSeq: 0,
+      startingTurn: false,
+      callbackQueues: callbackQueues(),
       client: null,
     };
   }
@@ -1007,8 +1648,9 @@ export class BotStore {
       if (attached.length > 0) return { client: bot.client, skipHistory: true };
       const next = await pinchTabMcpServers(this.computer, bot.id, this.spawnSpecs.get(bot.id)?.env);
       if (next.length === 0) return { client: bot.client, skipHistory: true };
-      bot.client.close();
-      bot.client = null;
+      const client = bot.client;
+      this.rotateCallbackQueues(bot, client, bot.turnSeq, { invalidateClient: true });
+      client.close();
     }
     const harness = bot.harness;
     if (!harness) throw Object.assign(new Error("pick a Harness first"), { status: 400 });
@@ -1026,6 +1668,7 @@ export class BotStore {
     } catch (err) {
       if (this.spawnAcpFn === spawnAcp) {
         bot.eyesMode = "needs-you";
+        bot.computerHelp = null;
         bot.needsYou = { reason: "login", hint: loginHint(harness) };
         throw Object.assign(err instanceof Error ? err : new Error(loginHint(harness)), { status: 409 });
       }
@@ -1039,42 +1682,70 @@ export class BotStore {
     this.spawnSpecs.set(bot.id, spec);
 
     const channelId = this.channelId(bot.id);
-    let client: AcpSession | undefined;
-    try {
-      client = this.spawnAcpFn(spec, cwd, {
+    const spawnClient = (): AcpSession => {
+      let spawned: AcpSession | undefined;
+      spawned = this.spawnAcpFn(spec, cwd, {
+        onComputerHelp: (prompt) => {
+          if (!spawned) return;
+          return this.queueComputerHelp(bot, spawned, prompt, bot.turnSeq);
+        },
+        onComputerHelpCancelled: (prompt) => {
+          if (!spawned) return;
+          return this.queueComputerHelpCancellation(bot, spawned, prompt, bot.turnSeq);
+        },
         onPermission: (prompt) => {
-          if (!client) return;
-          this.handlePermission(bot, client, prompt);
+          if (!spawned) return;
+          return this.queuePermission(bot, spawned, prompt, bot.turnSeq);
         },
         onAssistant: (text, delta) => this.applyAssistant(bot, channelId, text, delta),
         onPromptWritten: () => this.setUserReceipt(bot, channelId, "delivered"),
         onPromptFlushed: () => this.setUserReceipt(bot, channelId, "read"),
       });
+      return spawned;
+    };
+    let client: AcpSession | undefined;
+    try {
+      client = spawnClient();
       await client.initialize();
-      const restored = await this.restoreOrCreateSession(bot, client, channelId);
+      const attached = await this.restoreOrCreateSession(
+        bot,
+        client,
+        channelId,
+        async () => {
+          client = spawnClient();
+          await client.initialize();
+          return client;
+        },
+      );
+      client = attached.client;
       bot.client = client;
       this.spawnEnvs.set(bot.id, spec.env);
       this.spawnCwds.set(bot.id, cwd);
       this.spawnSpecs.set(bot.id, spec);
       bot.eyesMode = "idle";
+      bot.computerHelp = null;
       bot.needsYou = null;
-      return { client, skipHistory: restored };
+      return { client, skipHistory: attached.skipHistory };
     } catch (err) {
       client?.close();
       bot.client = null;
-      bot.eyesMode = "needs-you";
-      bot.needsYou = { reason: "login", hint: loginHint(harness) };
-      const message =
-        isAuthError(err) || isLikelyLogin(err)
-          ? loginHint(harness)
-          : err instanceof Error
-            ? err.message
-            : loginHint(harness);
-      throw Object.assign(new Error(message), { status: 409 });
+      const needsSignIn = isAuthError(err) || isLikelyLogin(err);
+      bot.eyesMode = needsSignIn ? "needs-you" : "idle";
+      bot.computerHelp = null;
+      bot.needsYou = needsSignIn ? { reason: "login", hint: loginHint(harness) } : null;
+      throw Object.assign(new Error(needsSignIn ? loginHint(harness) : "Harness could not start"), {
+        status: 409,
+        cause: err,
+      });
     }
   }
 
-  private async restoreOrCreateSession(bot: Bot, client: AcpSession, channelId: string): Promise<boolean> {
+  private async restoreOrCreateSession(
+    bot: Bot,
+    client: AcpSession,
+    channelId: string,
+    replaceClient: () => Promise<AcpSession>,
+  ): Promise<{ client: AcpSession; skipHistory: boolean }> {
     const storedId = this.home.getSessionId(bot.id, channelId);
     const channelHarness = this.home.getChannelHarness(bot.id, channelId);
     const sameHarness = Boolean(bot.harness && channelHarness === bot.harness);
@@ -1084,18 +1755,22 @@ export class BotStore {
           const loaded = await client.loadSession(storedId);
           const id = typeof loaded === "string" && loaded ? loaded : storedId;
           this.home.setSessionId(bot.id, channelId, id);
-          return true;
+          return { client, skipHistory: true };
         } catch {
-          // Fall back to session/new plus Channel inject.
+          this.home.setSessionId(bot.id, channelId, null);
+          client.close();
+          client = await replaceClient();
         }
       } else if (typeof client.resumeSession === "function") {
         try {
           const resumed = await client.resumeSession(storedId);
           const id = typeof resumed === "string" && resumed ? resumed : storedId;
           this.home.setSessionId(bot.id, channelId, id);
-          return true;
+          return { client, skipHistory: true };
         } catch {
-          // Fall back to session/new plus Channel inject.
+          this.home.setSessionId(bot.id, channelId, null);
+          client.close();
+          client = await replaceClient();
         }
       }
     }
@@ -1104,7 +1779,7 @@ export class BotStore {
       throw new Error("session/new did not return a sessionId");
     }
     this.home.setSessionId(bot.id, channelId, created);
-    return false;
+    return { client, skipHistory: false };
   }
 
   private resolveReplyTarget(messages: PublicMessage[], replyTo: string | undefined): PublicMessage | null {
@@ -1117,33 +1792,41 @@ export class BotStore {
   }
 
   private pushAssistant(bot: Bot, channelId: string, text: string): void {
-    bot.openAssistantId = null;
+    bot.pendingAssistant = null;
     const message: PublicMessage = {
       id: crypto.randomUUID(),
       role: "assistant",
+      senderId: bot.id,
       text: capTalkBubble(text),
       createdAt: nowIso(),
     };
-    this.home.appendMessage(channelId, { ...message, senderId: bot.id });
+    this.home.appendMessage(channelId, message);
   }
 
   private applyAssistant(bot: Bot, channelId: string, text: string, delta?: AssistantDelta): void {
     const capped = capTalkBubble(text);
-    const startNew = Boolean(delta?.start) || !bot.openAssistantId;
-    if (startNew) {
-      const id = crypto.randomUUID();
-      this.home.appendMessage(channelId, {
-        id,
-        role: "assistant",
+    const protocolMessageId = delta?.messageId;
+    if (!delta?.done) {
+      bot.pendingAssistant = {
         text: capped,
-        createdAt: nowIso(),
-        senderId: bot.id,
-      });
-      bot.openAssistantId = id;
-    } else if (bot.openAssistantId) {
-      this.home.updateMessageText(bot.openAssistantId, capped);
+        ...(protocolMessageId ? { messageId: protocolMessageId } : {}),
+      };
+      return;
     }
-    if (delta?.done) bot.openAssistantId = null;
+    bot.pendingAssistant = null;
+    const existingMessageId = protocolMessageId
+      ? bot.assistantMessageIds.get(protocolMessageId)
+      : undefined;
+    if (existingMessageId) return;
+    const id = crypto.randomUUID();
+    this.home.appendMessage(channelId, {
+      id,
+      role: "assistant",
+      senderId: bot.id,
+      text: capped,
+      createdAt: nowIso(),
+    });
+    if (protocolMessageId) bot.assistantMessageIds.set(protocolMessageId, id);
   }
 
   private setUserReceipt(bot: Bot, channelId: string, next: MessageReceipt): void {
@@ -1156,88 +1839,632 @@ export class BotStore {
     this.home.setReceipt(messageId, bot.id, receipt, nowIso());
   }
 
-  private fillAssistant(bot: Bot, channelId: string, text: string): void {
-    if (bot.openAssistantId) {
-      this.home.updateMessageText(bot.openAssistantId, text);
-      bot.openAssistantId = null;
-      return;
-    }
-    this.pushAssistant(bot, channelId, text);
+  private discardUnfinishedAssistant(bot: Bot): void {
+    bot.pendingAssistant = null;
   }
 
-  private handlePermission(bot: Bot, client: AcpSession, prompt: PermissionPrompt): void {
-    const cwd = this.botCwd(bot.id);
-    const requestPath = extractPermissionPath(prompt, cwd);
-    if (isPinchTabPermission(prompt)) {
-      const allow = pickAllowOption(prompt.options);
-      if (allow) {
-        client.respondPermission(prompt.rpcId, allow);
-        return;
-      }
-    }
-    const requested = requestedAccessFromKind(prompt.toolKind);
-    const inJail =
-      (requestPath && isInsideWorkspace(requestPath, this.workspaceDir)) ||
-      (requestPath && bot.configMode === "isolated" && isInsideScreenWorkspace(requestPath));
-    if (inJail) {
-      const allow = pickAllowOption(prompt.options);
-      if (allow) {
-        client.respondPermission(prompt.rpcId, allow);
-        return;
-      }
-    }
-    if (requestPath && !inJail) {
-      const grant = this.home.matchHostGrant(requestPath, requested);
-      if (grant) {
-        if (grant.access === "deny") {
-          const reject = pickRejectOption(prompt.options);
-          if (reject) client.respondPermission(prompt.rpcId, reject);
-        } else {
-          const allow = pickAllowOption(prompt.options);
-          if (allow) client.respondPermission(prompt.rpcId, allow);
-        }
-        if (grant.duration === "once") this.home.consumeHostGrant(grant.id);
-        return;
-      }
-      bot.permission = {
-        ...prompt,
-        hostGrant: { path: requestPath, requested: requested === "read" ? "read" : "read-write" },
-      };
-      bot.eyesMode = "needs-you";
-      return;
-    }
-    // Isolated v1 is not a jail (ADR 0010). Pathless commands auto-allow. Host grant is host paths only.
-    const allow = pickAllowOption(prompt.options);
-    if (allow) {
-      client.respondPermission(prompt.rpcId, allow);
-      return;
-    }
-    bot.permission = prompt;
-    bot.eyesMode = "needs-you";
-  }
-
-  private appendHostGrantCard(
+  private recordClientFailure(
     bot: Bot,
-    requestPath: string,
-    access: HostGrantAccess,
-    duration: HostGrantDuration,
-  ): void {
-    const accessLabel = access === "read-write" ? "Read and write" : access === "read" ? "Read" : "Deny";
-    const durationLabel =
-      duration === "session" ? "this Session" : duration === "until-revoked" ? "until revoked" : "once";
-    this.home.appendMessage(this.channelId(bot.id), {
+    channelId: string,
+    text: string,
+    replyTarget: PublicMessage | null,
+    err: unknown,
+  ): PublicBot {
+    const needsSignIn = isAuthError(err) || isLikelyLogin(err);
+    const userMessage: PublicMessage = {
       id: crypto.randomUUID(),
       role: "user",
-      kind: "host-grant",
-      text: `${accessLabel} · ${durationLabel}\n${requestPath}`,
-      createdAt: nowIso(),
       senderId: HUMAN_MEMBER_ID,
+      text,
+      createdAt: nowIso(),
+      receipt: "sent",
+      ...(replyTarget ? { replyTo: replyTarget.id } : {}),
+    };
+    this.home.appendMessage(channelId, {
+      ...userMessage,
+      recipientBotId: bot.id,
+    });
+    bot.write = false;
+    bot.computerHelp = null;
+    bot.needsYou = needsSignIn ? { reason: "login", hint: loginHint("codex") } : null;
+    bot.eyesMode = needsSignIn ? "needs-you" : "idle";
+    this.appendFailureCard(bot, channelId, userMessage.id, needsSignIn);
+    return this.toPublic(bot, true);
+  }
+
+  private appendFailureCard(bot: Bot, channelId: string, messageId: string, needsSignIn: boolean): void {
+    const card = botFailureTranscriptCard(messageId, needsSignIn);
+    this.home.appendMessage(channelId, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      kind: "card",
+      card,
+      text: transcriptCardSummary(card),
+      createdAt: nowIso(),
+      senderId: bot.id,
     });
   }
 
-  private toPublicChannel(channel: StoredChannel): PublicChannel {
-    const bots = this.home.listBots();
-    const byId = new Map(bots.map((bot) => [bot.id, bot]));
+  private callbackQueuesAreCurrent(bot: Bot, queues: BotCallbackQueues): boolean {
+    return bot.callbackQueues === queues
+      && bot.callbackQueues.generation === queues.generation
+      && queues.detachment === null;
+  }
+
+  private clientQueueContextIsCurrent(
+    bot: Bot,
+    queues: BotCallbackQueues,
+    client: AcpSession,
+    turnSeq: number,
+  ): boolean {
+    return this.callbackQueuesAreCurrent(bot, queues)
+      && bot.client === client
+      && bot.turnSeq === turnSeq;
+  }
+
+  private permissionBelongsToContext(
+    permission: BotPermission,
+    queues: BotCallbackQueues,
+    client: AcpSession | null,
+    turnSeq: number,
+  ): boolean {
+    return (permission.queueGeneration === undefined || permission.queueGeneration === queues.generation)
+      && (permission.client === undefined || permission.client === client)
+      && (permission.turnSeq === undefined || permission.turnSeq === turnSeq);
+  }
+
+  private permissionContextIsCurrent(
+    bot: Bot,
+    queues: BotCallbackQueues,
+    permission: BotPermission,
+    client: AcpSession,
+    turnSeq: number,
+    cardId: string,
+  ): boolean {
+    return this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)
+      && bot.permission === permission
+      && permission.cardId === cardId
+      && this.permissionBelongsToContext(permission, queues, client, turnSeq);
+  }
+
+  private permissionResponseIdentityIsCurrent(context: PermissionResponseContext): boolean {
+    const { bot, queues, permission, client, turnSeq, rpcId, cardId, optionId } = context;
+    return bot.permission === permission
+      && permission.cardId === cardId
+      && this.permissionBelongsToContext(permission, queues, client, turnSeq)
+      && permission.rpcId === rpcId
+      && permission.options.some((option) => option.optionId === optionId);
+  }
+
+  private permissionResponseRuntimeIsCurrent(context: PermissionResponseContext): boolean {
+    const { bot, queues, client, turnSeq } = context;
+    return this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)
+      && this.permissionResponseIdentityIsCurrent(context);
+  }
+
+  private permissionResponseCard(context: PermissionResponseContext): TranscriptCard | null {
+    if (!this.permissionResponseRuntimeIsCurrent(context)) return null;
+    const { bot, cardId, choice } = context;
+    try {
+      const message = this.home.getMessage(this.channelId(bot.id), cardId);
+      return message?.id === cardId && message.card?.kind === choice.kind
+        ? message.card
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private permissionCardAtFlush(context: PermissionResponseContext): TranscriptCard | null {
+    const card = this.permissionResponseCard(context);
+    if (!card || card.status.tone !== "waiting") return null;
+    const { choice } = context;
+    const choiceIsActionable = card.actions.some((action) => {
+      if (choice.kind === "permission") {
+        return action.command.kind === "permission"
+          && action.command.optionId === choice.optionId;
+      }
+      return action.command.kind === "host-grant"
+        && action.command.access === choice.access;
+    });
+    return choiceIsActionable ? card : null;
+  }
+
+  private clearUnconfirmedPermission(context: PermissionResponseContext): void {
+    if (!this.permissionResponseIdentityIsCurrent(context)) return;
+    const { bot, permission, cardId, choice } = context;
+    try {
+      const message = this.home.getMessage(this.channelId(bot.id), cardId);
+      if (
+        message?.card?.kind === choice.kind
+        && message.card.status.tone === "waiting"
+        && message.card.actions.length > 0
+      ) {
+        this.home.updateMessageCard(cardId, expiredTranscriptCard(message.card));
+      }
+    } catch {
+      // The exact in-memory action is still cleared so it cannot resend a flushed choice.
+    }
+    if (bot.permission === permission) bot.permission = null;
+    bot.eyesMode = bot.needsYou ? "needs-you" : bot.write ? "write" : "idle";
+  }
+
+  private async commitPermissionResponse(
+    context: PermissionResponseContext,
+    sourceMessageId: string | null,
+    commitDurableState: () => void,
+    inactiveMessage: string,
+  ): Promise<PublicBot> {
+    const { bot, queues, permission, client, turnSeq, rpcId, cardId, optionId } = context;
+    if (!this.permissionResponseRuntimeIsCurrent(context)) {
+      throw Object.assign(new Error(inactiveMessage), { status: 409 });
+    }
+    let committed = false;
+    const commitAtFlush = () => {
+      if (!this.permissionCardAtFlush(context)) {
+        throw new Error("permission response context changed before flush commit");
+      }
+      commitDurableState();
+      committed = true;
+    };
+    try {
+      await this.respondPermissionAtFlush(client, rpcId, optionId, commitAtFlush);
+    } catch (error) {
+      if (acpResponseWasFlushed(error)) {
+        this.clearUnconfirmedPermission(context);
+        throw unconfirmedProviderResponse();
+      }
+      if (!this.permissionResponseRuntimeIsCurrent(context)) {
+        throw Object.assign(new Error(inactiveMessage), { status: 409 });
+      }
+      this.failPermissionDelivery(
+        bot,
+        queues,
+        permission,
+        cardId,
+        client,
+        turnSeq,
+        sourceMessageId,
+      );
+    }
+    if (!committed || !this.permissionResponseRuntimeIsCurrent(context)) {
+      throw Object.assign(new Error(inactiveMessage), { status: 409 });
+    }
+    bot.permission = null;
+    bot.eyesMode = bot.write ? "write" : "idle";
+    return this.toPublic(bot, true);
+  }
+
+  private async respondPermissionAtFlush(
+    client: AcpSession,
+    rpcId: PermissionPrompt["rpcId"],
+    optionId: string,
+    onFlushed: () => void,
+  ): Promise<void> {
+    let commitInvoked = false;
+    let commitResult: Promise<void> | null = null;
+    const commit = (): Promise<void> => {
+      if (commitInvoked) return commitResult!;
+      commitInvoked = true;
+      try {
+        onFlushed();
+        commitResult = Promise.resolve();
+      } catch (error) {
+        commitResult = Promise.reject(error);
+      }
+      return commitResult;
+    };
+    await client.respondPermission(rpcId, optionId, commit);
+    // Compatibility sessions without onFlushed resolve after their response write.
+    await (commitInvoked ? commitResult : commit());
+  }
+
+  private computerHelpContextIsCurrent(
+    bot: Bot,
+    queues: BotCallbackQueues,
+    computerHelp: BotComputerHelp,
+    eventId: string,
+    cardId: string,
+  ): boolean {
+    return this.clientQueueContextIsCurrent(
+      bot,
+      queues,
+      computerHelp.client,
+      computerHelp.turnSeq,
+    )
+      && bot.computerHelp === computerHelp
+      && computerHelp.queueGeneration === queues.generation
+      && computerHelp.eventId === eventId
+      && computerHelp.cardId === cardId
+      && bot.needsYou?.reason === "computer-help"
+      && bot.needsYou.eventId === eventId
+      && bot.needsYou.cardId === cardId;
+  }
+
+  private rotateCallbackQueues(
+    bot: Bot,
+    client: AcpSession | null,
+    turnSeq: number,
+    rotation: CallbackQueueRotation = {},
+  ): boolean {
+    if (bot.client !== client || bot.turnSeq !== turnSeq) return false;
+    const queues = bot.callbackQueues;
+    if (queues.detachment) return false;
+    const permission = bot.permission;
+    const computerHelp = bot.computerHelp;
+    const next = callbackQueues(queues.generation + 1);
+    const publicError = rotation.publicError
+      ?? (rotation.responseFlushed ? unconfirmedProviderResponse() : botActionNoLongerActive());
+
+    bot.callbackQueues = next;
+    if (rotation.invalidateClient) bot.client = null;
+
+    if (
+      permission
+      && this.permissionBelongsToContext(permission, queues, client, turnSeq)
+    ) {
+      const cardId = permission.cardId;
+      if (cardId) {
+        try {
+          const message = this.home.getMessage(this.channelId(bot.id), cardId);
+          if (message?.card && message.card.status.tone === "waiting" && message.card.actions.length > 0) {
+            this.home.updateMessageCard(message.id, expiredTranscriptCard(message.card));
+          }
+        } catch (error) {
+          if (!rotation.responseFlushed) throw error;
+        }
+      }
+      if (bot.permission === permission) bot.permission = null;
+    }
+
+    if (
+      computerHelp
+      && computerHelp.client === client
+      && computerHelp.turnSeq === turnSeq
+      && computerHelp.queueGeneration === queues.generation
+    ) {
+      const message = this.home.getMessage(this.channelId(bot.id), computerHelp.cardId);
+      if (message?.card) {
+        this.home.updateMessageCard(
+          message.id,
+          rotation.responseFlushed
+            ? unconfirmedNeedsYouComputerCard(message.card, computerHelp.eventId)
+            : unavailableNeedsYouComputerCard(message.card),
+        );
+      }
+      if (bot.computerHelp === computerHelp) bot.computerHelp = null;
+      if (
+        bot.needsYou?.reason === "computer-help"
+        && bot.needsYou.eventId === computerHelp.eventId
+        && bot.needsYou.cardId === computerHelp.cardId
+      ) {
+        bot.needsYou = null;
+      }
+    }
+
+    bot.eyesMode = bot.permission || bot.needsYou
+      ? "needs-you"
+      : bot.write ? "write" : "idle";
+    queues.detach({ publicError });
+    return true;
+  }
+
+  private expireActivePermission(bot: Bot): void {
+    const cardId = bot.permission?.cardId;
+    if (cardId) {
+      const message = this.home.getMessage(this.channelId(bot.id), cardId);
+      if (message?.card && message.card.status.tone === "waiting" && message.card.actions.length > 0) {
+        this.home.updateMessageCard(message.id, expiredTranscriptCard(message.card));
+      }
+    }
+    bot.permission = null;
+  }
+
+  private async supersedeActivePermission(
+    bot: Bot,
+    queues: BotCallbackQueues,
+    client: AcpSession,
+    turnSeq: number,
+  ): Promise<boolean> {
+    if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return false;
+    const active = bot.permission;
+    if (!active) return true;
+    const cardId = active.cardId;
+    if (
+      !cardId
+      || !this.permissionContextIsCurrent(bot, queues, active, client, turnSeq, cardId)
+    ) {
+      return false;
+    }
+    const reject = active.hostGrant
+      ? pickRejectOption(active.options)
+      : pickGenericRejectOption(active.options);
+    if (!reject) {
+      try {
+        client.cancel();
+      } catch {
+        client.close();
+        this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
+      }
+      this.expireActivePermission(bot);
+      return false;
+    }
+    const context: PermissionResponseContext = {
+      bot,
+      queues,
+      permission: active,
+      client,
+      turnSeq,
+      rpcId: active.rpcId,
+      cardId,
+      optionId: reject,
+      choice: active.hostGrant
+        ? { kind: "host-grant", access: "deny" }
+        : { kind: "permission", optionId: reject },
+    };
+    let committed = false;
+    try {
+      await this.respondPermissionAtFlush(client, active.rpcId, reject, () => {
+        const card = this.permissionCardAtFlush(context);
+        if (!card) throw new Error("superseded permission changed before response flush commit");
+        this.home.updateMessageCard(cardId, expiredTranscriptCard(card));
+        committed = true;
+      });
+    } catch (error) {
+      if (acpResponseWasFlushed(error)) {
+        this.clearUnconfirmedPermission(context);
+        return false;
+      }
+      if (!this.permissionResponseRuntimeIsCurrent(context)) return false;
+      client.close();
+      this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
+      return false;
+    }
+    if (!committed || !this.permissionResponseRuntimeIsCurrent(context)) return false;
+    bot.permission = null;
+    return true;
+  }
+
+  private queueComputerHelp(
+    bot: Bot,
+    client: AcpSession,
+    prompt: ComputerHelpPrompt,
+    turnSeq: number,
+  ): Promise<void> {
+    return this.enqueueComputerHelp(bot, async (queues) => {
+      if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return;
+      if (!await this.supersedeActivePermission(bot, queues, client, turnSeq)) return;
+      if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq) || bot.computerHelp) return;
+      const stale = this.home.pendingNeedsYouCard(this.channelId(bot.id));
+      if (stale?.card) {
+        this.home.updateMessageCard(stale.id, unavailableNeedsYouComputerCard(stale.card));
+      }
+      const event = { id: crypto.randomUUID(), reason: "computer-help" as const };
+      const card = needsYouComputerCard(event, prompt.instruction);
+      const cardId = crypto.randomUUID();
+      this.home.appendMessage(this.channelId(bot.id), {
+        id: cardId,
+        role: "assistant",
+        kind: "card",
+        card,
+        text: transcriptCardSummary(card),
+        createdAt: nowIso(),
+        senderId: bot.id,
+      });
+      bot.computerHelp = {
+        eventId: event.id,
+        cardId,
+        rpcId: prompt.rpcId,
+        client,
+        turnSeq,
+        queueGeneration: queues.generation,
+      };
+      bot.needsYou = {
+        reason: "computer-help",
+        hint: prompt.instruction,
+        eventId: event.id,
+        cardId,
+      };
+      bot.eyesMode = "needs-you";
+    }, () => undefined);
+  }
+
+  private queueComputerHelpCancellation(
+    bot: Bot,
+    client: AcpSession,
+    prompt: ComputerHelpPrompt,
+    turnSeq: number,
+  ): Promise<void> {
+    return this.enqueueComputerHelp(bot, async (queues) => {
+      const active = bot.computerHelp;
+      if (
+        !active
+        || !this.callbackQueuesAreCurrent(bot, queues)
+        || active.client !== client
+        || active.rpcId !== prompt.rpcId
+        || active.turnSeq !== turnSeq
+        || active.queueGeneration !== queues.generation
+      ) {
+        return;
+      }
+      const message = this.home.getMessage(this.channelId(bot.id), active.cardId);
+      if (message?.card) {
+        this.home.updateMessageCard(message.id, unavailableNeedsYouComputerCard(message.card));
+      }
+      bot.computerHelp = null;
+      if (
+        bot.needsYou?.reason === "computer-help"
+        && bot.needsYou.eventId === active.eventId
+        && bot.needsYou.cardId === active.cardId
+      ) {
+        bot.needsYou = null;
+      }
+      bot.eyesMode = bot.permission || bot.needsYou
+        ? "needs-you"
+        : bot.write ? "write" : "idle";
+    }, () => undefined);
+  }
+
+  private enqueueComputerHelp<T>(
+    bot: Bot,
+    task: (queues: BotCallbackQueues) => Promise<T>,
+    onDetached?: (error: Error) => T | Promise<T>,
+  ): Promise<T> {
+    return this.enqueueCallbackTask(bot, "computerHelpTail", task, onDetached);
+  }
+
+  private queuePermission(
+    bot: Bot,
+    client: AcpSession,
+    prompt: PermissionPrompt,
+    turnSeq: number,
+  ): Promise<void> {
+    return this.enqueuePermission(bot, async (queues) => {
+      if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return;
+      await this.handlePermission(bot, queues, client, prompt, turnSeq);
+      if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return;
+    }, () => undefined);
+  }
+
+  private enqueuePermission<T>(
+    bot: Bot,
+    task: (queues: BotCallbackQueues) => Promise<T>,
+    onDetached?: (error: Error) => T | Promise<T>,
+  ): Promise<T> {
+    return this.enqueueCallbackTask(bot, "permissionTail", task, onDetached);
+  }
+
+  private enqueueCallbackTask<T>(
+    bot: Bot,
+    tail: CallbackQueueTail,
+    task: (queues: BotCallbackQueues) => Promise<T>,
+    onDetached?: (error: Error) => T | Promise<T>,
+  ): Promise<T> {
+    const queues = bot.callbackQueues;
+    const detached = (error: Error): T | Promise<T> => {
+      if (onDetached) return onDetached(error);
+      throw error;
+    };
+    const result = queues[tail].then(() => {
+      if (!this.callbackQueuesAreCurrent(bot, queues)) {
+        return detached(queues.detachment?.publicError ?? botActionNoLongerActive());
+      }
+      return task(queues);
+    });
+    queues[tail] = result.then(() => undefined, () => undefined);
+    return Promise.race([
+      result,
+      queues.detached.then(({ publicError }) => detached(publicError)),
+    ]);
+  }
+
+  private async handlePermission(
+    bot: Bot,
+    queues: BotCallbackQueues,
+    client: AcpSession,
+    prompt: PermissionPrompt,
+    turnSeq: number,
+  ): Promise<void> {
+    if (!await this.supersedeActivePermission(bot, queues, client, turnSeq)) return;
+    if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return;
+    if (isPinchTabPermission(prompt)) {
+      const allow = pickAllowOption(prompt.options);
+      if (allow) {
+        try {
+          await client.respondPermission(prompt.rpcId, allow);
+        } catch {
+          if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return;
+          client.close();
+          this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
+        }
+        return;
+      }
+    }
+    const card = permissionTranscriptCard(prompt.toolKind, prompt.options);
+    if (card.actions.length === 0) {
+      const reject = pickGenericRejectOption(prompt.options);
+      try {
+        if (reject) await client.respondPermission(prompt.rpcId, reject);
+        else client.cancel();
+      } catch {
+        if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return;
+        client.close();
+        this.rotateCallbackQueues(bot, client, turnSeq, { invalidateClient: true });
+      }
+      if (!this.clientQueueContextIsCurrent(bot, queues, client, turnSeq)) return;
+      const unsupported = unsupportedPermissionTranscriptCard();
+      this.home.appendMessage(this.channelId(bot.id), {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        kind: "card",
+        card: unsupported,
+        text: transcriptCardSummary(unsupported),
+        createdAt: nowIso(),
+        senderId: bot.id,
+      });
+      bot.permission = null;
+      bot.eyesMode = bot.write ? "write" : "idle";
+      return;
+    }
+    const cardId = crypto.randomUUID();
+    this.home.appendMessage(this.channelId(bot.id), {
+      id: cardId,
+      role: "assistant",
+      kind: "card",
+      card,
+      text: transcriptCardSummary(card),
+      createdAt: nowIso(),
+      senderId: bot.id,
+    });
+    bot.permission = {
+      ...prompt,
+      cardId,
+      client,
+      turnSeq,
+      queueGeneration: queues.generation,
+    };
+    bot.eyesMode = "needs-you";
+  }
+
+  private failPermissionDelivery(
+    bot: Bot,
+    queues: BotCallbackQueues,
+    permission: BotPermission,
+    cardId: string,
+    client: AcpSession,
+    turnSeq: number,
+    sourceMessageId: string | null,
+  ): never {
+    if (!this.permissionContextIsCurrent(bot, queues, permission, client, turnSeq, cardId)) {
+      throw botActionNoLongerActive();
+    }
+    const message = this.home.getMessage(this.channelId(bot.id), cardId);
+    if (message?.card) {
+      const failed = sourceMessageId
+        ? botFailureTranscriptCard(sourceMessageId)
+        : expiredTranscriptCard(message.card);
+      this.home.updateMessageCard(cardId, failed);
+    }
+    bot.permission = null;
+    bot.pendingAssistant = null;
+    bot.assistantMessageIds.clear();
+    bot.activeUserId = null;
+    bot.write = false;
+    bot.eyesMode = bot.needsYou ? "needs-you" : "idle";
+    const error = Object.assign(new Error("Permission could not be sent to the Harness"), { status: 409 });
+    this.rotateCallbackQueues(bot, client, turnSeq, {
+      invalidateClient: true,
+      publicError: error,
+    });
+    bot.turnSeq += 1;
+    client.close();
+    throw error;
+  }
+
+  private toPublicChannel(
+    channel: StoredChannel | StoredChannelSummary,
+    byId = new Map(this.home.listBots().map((bot) => [bot.id, bot])),
+  ): PublicChannel {
     return {
       id: channel.id,
       kind: channel.kind,
@@ -1258,10 +2485,21 @@ export class BotStore {
         }
         return out;
       }),
+      activity: "activity" in channel ? channel.activity : this.home.channelActivity(channel.id),
     };
   }
 
-  private toPublic(bot: Bot, withMessages: boolean): PublicBot {
+  private publicBotSummaries(summaries: StoredChannelSummary[]): PublicBot[] {
+    const activityByBot = new Map<string, ChannelActivity>();
+    for (const channel of summaries) {
+      if (channel.kind !== "direct") continue;
+      const bot = channel.members.find((member) => member.kind === "bot");
+      if (bot) activityByBot.set(bot.id, channel.activity);
+    }
+    return [...this.bots.values()].map((bot) => this.toPublic(bot, false, activityByBot.get(bot.id)));
+  }
+
+  private toPublic(bot: Bot, withMessages: boolean, activity?: ChannelActivity): PublicBot {
     const mode: EyesMode = bot.write ? "write" : bot.eyesMode;
     const out: PublicBot = {
       id: bot.id,
@@ -1279,111 +2517,10 @@ export class BotStore {
       screenCleanupError: bot.screenCleanupError,
       permission: publicPermission(bot.permission),
       needsYou: bot.needsYou,
+      activity: activity ?? this.home.channelActivity(this.channelId(bot.id)),
     };
     if (withMessages) out.messages = this.transcript(bot.id);
     return out;
-  }
-}
-
-function botWorkspaceCleanupRequiredError(
-  context: string,
-  error: unknown,
-  rollback: BotWorkspaceRollback,
-): Error {
-  const detail = error instanceof Error ? error.message : String(error);
-  const status = typeof error === "object" && error !== null
-    ? (error as { status?: unknown }).status
-    : undefined;
-  return Object.assign(
-    new Error(
-      `${context}: ${detail}. Bot workspace ${JSON.stringify(rollback.preservedPath)} was preserved because ${rollback.reason}. Inspect it, preserve anything you need, and remove the directory only if safe before retrying.`,
-      { cause: error },
-    ),
-    {
-      status: typeof status === "number" ? status : 503,
-      code: "BOT_WORKSPACE_CLEANUP_REQUIRED",
-      recoverable: true,
-    },
-  );
-}
-
-function errorDetail(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function missingScreenAssignmentError(): PublicScreenError {
-  return {
-    stage: "reserve",
-    code: "SCREEN_ASSIGNMENT_MISSING",
-    message: "Screen display assignment is missing.",
-  };
-}
-
-function screenAttachmentError(stage: ScreenAttachmentStage): PublicScreenError {
-  if (stage === "readiness") {
-    return {
-      stage,
-      code: "SCREEN_NOT_READY",
-      message: "Screen application did not become ready.",
-    };
-  }
-  if (stage === "ownership") {
-    return {
-      stage,
-      code: "SCREEN_OWNERSHIP_FAILED",
-      message: "Screen ownership registration failed.",
-    };
-  }
-  return {
-    stage,
-    code: "SCREEN_ATTACHMENT_FAILED",
-    message: `Screen attachment failed during ${stage}.`,
-  };
-}
-
-function screenCleanupError(): PublicScreenCleanupError {
-  return {
-    code: "SCREEN_CLEANUP_FAILED",
-    message: "Screen cleanup did not complete.",
-  };
-}
-
-function staleScreenAttemptError(): Error {
-  return Object.assign(new Error("Screen changed. Refresh and retry Screen."), {
-    status: 409,
-    code: "STALE_SCREEN_ATTEMPT",
-  });
-}
-
-function botProvisioningCleanupRequiredError(botId: string, cause: unknown, cleanup: string): Error {
-  const status = typeof cause === "object" && cause !== null
-    ? (cause as { status?: unknown }).status
-    : undefined;
-  return Object.assign(
-    new Error(
-      `Bot provisioning failed: ${errorDetail(cause)}. Cleanup is incomplete for ${botId}: ${cleanup}. `
-      + "The recoverable provisioning state was preserved for daemon restart or explicit retry.",
-      { cause },
-    ),
-    {
-      status: typeof status === "number" ? status : 503,
-      code: "BOT_PROVISIONING_CLEANUP_REQUIRED",
-      provisioningId: botId,
-      recoverable: true,
-    },
-  );
-}
-
-function isPinchTabPermission(prompt: PermissionPrompt): boolean {
-  const blob = `${prompt.title ?? ""}\n${prompt.description ?? ""}\n${prompt.toolKind ?? ""}\n${safePermissionJson(prompt.rawInput)}\n${safePermissionJson(prompt.meta)}\n${safePermissionJson(prompt.raw)}`;
-  return /pinchtab|mcp__pinchtab/i.test(blob);
-}
-
-function safePermissionJson(value: unknown): string {
-  try {
-    return JSON.stringify(value ?? "");
-  } catch {
-    return "";
   }
 }
 
@@ -1400,10 +2537,11 @@ const HISTORY_CHARACTER_LIMIT = 64_000;
 export function channelHistory(messages: PublicMessage[], botName: string): string {
   const heading = "Recent Channel transcript:\n";
   const transcriptLimit = HISTORY_CHARACTER_LIMIT - heading.length;
-  const userIndexes = messages.flatMap((message, index) => (message.role === "user" ? [index] : []));
+  const speech = messages.filter((message) => message.kind === undefined || message.kind === "text");
+  const userIndexes = speech.flatMap((message, index) => (message.role === "user" ? [index] : []));
   if (userIndexes.length === 0) return "";
   const firstTurn = userIndexes[Math.max(0, userIndexes.length - HISTORY_TURN_LIMIT)] ?? 0;
-  const lines = messages.slice(firstTurn).map((message) => {
+  const lines = speech.slice(firstTurn).map((message) => {
     const speaker = message.role === "user" ? "You" : botName;
     return `${speaker}: ${message.text}`;
   });

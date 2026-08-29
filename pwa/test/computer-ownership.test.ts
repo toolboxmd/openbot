@@ -115,8 +115,10 @@ async function renderComputerScreenHarness(
   `);
   const buttonUrl = moduleUrl("export const Button = () => null;");
   const utilsUrl = moduleUrl("export const cn = (...values) => values.filter(Boolean).join(' ');");
-  const iconsUrl = moduleUrl("export const MessageSquare = () => null;");
+  const iconsUrl = moduleUrl("export const Maximize2 = () => null; export const MessageSquare = () => null;");
   const sessionUrl = new URL("../src/lib/session.ts", import.meta.url).href;
+  const asyncStateUrl = new URL("../src/lib/async-state.ts", import.meta.url).href;
+  const computerZoomUrl = new URL("../src/lib/computer-zoom.ts", import.meta.url).href;
   const moduleHooks = registerHooks({
     resolve(specifier, context, nextResolve) {
       if (specifier === "react") return { url: reactUrl, shortCircuit: true };
@@ -124,6 +126,8 @@ async function renderComputerScreenHarness(
         return { url: jsxUrl, shortCircuit: true };
       }
       if (specifier === "@/lib/session") return { url: sessionUrl, shortCircuit: true };
+      if (specifier === "@/lib/async-state") return { url: asyncStateUrl, shortCircuit: true };
+      if (specifier === "@/lib/computer-zoom") return { url: computerZoomUrl, shortCircuit: true };
       if (specifier === "@/components/ui/button") return { url: buttonUrl, shortCircuit: true };
       if (specifier === "@/lib/utils") return { url: utilsUrl, shortCircuit: true };
       if (specifier === "lucide-react") return { url: iconsUrl, shortCircuit: true };
@@ -330,8 +334,10 @@ describe("Computer ownership PWA client", () => {
     `);
     const buttonUrl = moduleUrl("export const Button = () => null;");
     const utilsUrl = moduleUrl("export const cn = (...values) => values.filter(Boolean).join(' ');");
-    const iconsUrl = moduleUrl("export const MessageSquare = () => null;");
+    const iconsUrl = moduleUrl("export const Maximize2 = () => null; export const MessageSquare = () => null;");
     const sessionUrl = new URL("../src/lib/session.ts", import.meta.url).href;
+    const asyncStateUrl = new URL("../src/lib/async-state.ts", import.meta.url).href;
+    const computerZoomUrl = new URL("../src/lib/computer-zoom.ts", import.meta.url).href;
     const moduleHooks = registerHooks({
       resolve(specifier, context, nextResolve) {
         if (specifier === "react") return { url: reactUrl, shortCircuit: true };
@@ -339,6 +345,8 @@ describe("Computer ownership PWA client", () => {
           return { url: jsxUrl, shortCircuit: true };
         }
         if (specifier === "@/lib/session") return { url: sessionUrl, shortCircuit: true };
+        if (specifier === "@/lib/async-state") return { url: asyncStateUrl, shortCircuit: true };
+        if (specifier === "@/lib/computer-zoom") return { url: computerZoomUrl, shortCircuit: true };
         if (specifier === "@/components/ui/button") {
           return { url: buttonUrl, shortCircuit: true };
         }
@@ -1527,7 +1535,6 @@ describe("Computer ownership PWA client", () => {
     );
     assert.match(source, /role="alert"/);
     assert.match(source, /Retry Computer/);
-    assert.match(source, /computerCanWrite\(computer, expanded, botId\)/);
     assert.match(source, /releaseComputerForNavigation\(botId\)/);
     assert.doesNotMatch(source, /setComputerZoom\(botId, false, \{ keepalive: true \}\)/);
   });

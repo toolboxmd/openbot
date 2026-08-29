@@ -554,6 +554,14 @@ function rebuildBotsAsLegacyVersionThree(homeDir: string): void {
     DROP TABLE bots;
     ALTER TABLE bots_v3 RENAME TO bots;
     CREATE UNIQUE INDEX bots_display_unique ON bots(display);
+    DROP TABLE app_settings;
+    DROP TABLE channel_reads;
+    DROP INDEX messages_channel_activity;
+    ALTER TABLE channels DROP COLUMN activity_sequence;
+    ALTER TABLE messages DROP COLUMN card_json;
+    ALTER TABLE messages DROP COLUMN activity_at;
+    ALTER TABLE messages DROP COLUMN activity_sequence;
+    ALTER TABLE messages DROP COLUMN revision;
     PRAGMA user_version = 3;
     COMMIT;
   `);
@@ -2295,6 +2303,7 @@ test("schema-1 Home with nine Bots preserves Chat state and leaves overflow Scre
         assert.deepEqual(transcript.messages, [{
           id: bot.messageId,
           role: "user",
+          senderId: HUMAN_MEMBER_ID,
           text: `legacy transcript ${index + 1}`,
           createdAt: `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`,
           receipt: "read",
@@ -2382,6 +2391,7 @@ test("schema-1 Home with nine Bots preserves Chat state and leaves overflow Scre
         assert.deepEqual(settled.messages, [{
           id: legacy.bots[8]!.messageId,
           role: "user",
+          senderId: HUMAN_MEMBER_ID,
           text: "legacy transcript 9",
           createdAt: "2026-01-01T00:00:08.000Z",
           receipt: "read",
@@ -2439,6 +2449,7 @@ test("schema-1 Home with nine Bots preserves Chat state and leaves overflow Scre
     assert.deepEqual(recoveredTranscript.messages, [{
       id: legacy.bots[8]!.messageId,
       role: "user",
+      senderId: HUMAN_MEMBER_ID,
       text: "legacy transcript 9",
       createdAt: "2026-01-01T00:00:08.000Z",
       receipt: "read",
@@ -3293,6 +3304,7 @@ test("schema-3 Home rebuilds Bots to nullable display without changing relations
       assert.deepEqual(migrated.listMessages(firstChannelId), [{
         id: messageId,
         role: "user",
+        senderId: HUMAN_MEMBER_ID,
         text: "schema three transcript",
         createdAt: "2026-01-01T00:00:02.000Z",
         receipt: "read",
@@ -3308,8 +3320,7 @@ test("schema-3 Home rebuilds Bots to nullable display without changing relations
         name?: string;
         notnull?: number;
       }>;
-      assert.equal(version.user_version, 4);
-      assert.equal(HOME_SCHEMA_VERSION, 4);
+      assert.equal(version.user_version, HOME_SCHEMA_VERSION);
       assert.equal(columns.find((column) => column.name === "display")?.notnull, 0);
       const migratedBotChannelState = (probe
         .prepare(

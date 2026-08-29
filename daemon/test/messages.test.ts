@@ -12,6 +12,7 @@ const PASSWORD = "correct-horse";
 type PublicMessage = {
   id: string;
   role: "user" | "assistant";
+  senderId?: string;
   text: string;
   createdAt?: string;
   receipt?: "sent" | "delivered" | "read";
@@ -201,6 +202,7 @@ describe("Talk HTTP Turn bubbles and receipts", () => {
     );
     const user = (afterPost.messages ?? []).find((m) => m.role === "user");
     assert.ok(user, "user bubble must exist after POST");
+    assert.equal(user.senderId, "you");
     assert.equal(user.text, "Look at https://example.com/docs please");
     assert.equal(user.receipt, "sent");
     assert.ok(isIsoDate(user.createdAt), `createdAt must be ISO, got ${user.createdAt}`);
@@ -250,6 +252,8 @@ describe("Talk HTTP Turn bubbles and receipts", () => {
     assert.equal(assistants.length, 2, "two ACP messages must be two bubbles; server must not concatenate");
     assert.equal(assistants[0]?.text, "First.");
     assert.equal(assistants[1]?.text, "See https://example.com/docs");
+    assert.equal(assistants[0]?.senderId, id);
+    assert.equal(assistants[1]?.senderId, id);
     assert.notEqual(assistants[0]?.id, assistants[1]?.id);
     assert.ok(isIsoDate(assistants[0]?.createdAt));
     assert.ok(isIsoDate(assistants[1]?.createdAt));

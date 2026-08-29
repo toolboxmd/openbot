@@ -59,13 +59,13 @@ describe("HomeStore createGroup", () => {
     home.close();
   });
 
-  test("Restart HomeStore: the group is still there and is not bot-to-bot", async () => {
+  test("Restart HomeStore: title, member IDs, and member order survive", async () => {
     const homeDir = await tempHome();
     const home = new HomeStore(homeDir);
     const ada = addBot(home, "Ada");
     const bob = addBot(home, "Bob", 1000);
-    const group = home.createGroup({ memberBotIds: [ada.id, bob.id] });
-    assert.equal(group.title, null);
+    const group = home.createGroup({ title: "  Launch crew  ", memberBotIds: [ada.id, bob.id] });
+    assert.equal(group.title, "Launch crew");
     home.close();
 
     const again = new HomeStore(homeDir);
@@ -73,24 +73,39 @@ describe("HomeStore createGroup", () => {
     assert.ok(restored);
     assert.equal(restored.kind, "group");
     assert.notEqual(restored.kind, "bot-to-bot");
-    assert.equal(restored.members.length, 3);
+    assert.equal(restored.title, "Launch crew");
+    assert.deepEqual(
+      restored.members.map((member) => `${member.kind}:${member.id}`),
+      [`user:${HUMAN_MEMBER_ID}`, `bot:${ada.id}`, `bot:${bob.id}`],
+    );
     assert.equal(again.directChannelId(ada.id), ada.channelId);
     again.close();
   });
 
-  test("rejects empty members and unknown Bot ids", async () => {
+  test("rejects blank titles and fewer than two distinct existing Bots without mutation", async () => {
     const homeDir = await tempHome();
     const home = new HomeStore(homeDir);
     const ada = addBot(home, "Ada");
-    assert.throws(() => home.createGroup({ memberBotIds: [] }), { status: 400, message: /members/ });
-    assert.throws(() => home.createGroup({ memberBotIds: ["   "] }), { status: 400, message: /members/ });
-    assert.throws(() => home.createGroup({ memberBotIds: [crypto.randomUUID()] }), {
+    assert.throws(
+      () => home.createGroup({ title: "   ", memberBotIds: [ada.id, crypto.randomUUID()] }),
+      { status: 400, message: /title/ },
+    );
+    assert.throws(() => home.createGroup({ title: "Crew", memberBotIds: [] }), { status: 400, message: /members/ });
+    assert.throws(() => home.createGroup({ title: "Crew", memberBotIds: ["   "] }), { status: 400, message: /members/ });
+    assert.throws(() => home.createGroup({ title: "Crew", memberBotIds: [crypto.randomUUID()] }), {
       status: 400,
       message: /unknown Bot/,
     });
-    assert.throws(() => home.createGroup({ memberBotIds: [ada.id] }), { status: 400, message: /several Bots/ });
+    assert.throws(() => home.createGroup({ title: "Crew", memberBotIds: [ada.id] }), {
+      status: 400,
+      message: /two distinct Bots/,
+    });
+    assert.throws(() => home.createGroup({ title: "Crew", memberBotIds: [ada.id, ada.id] }), {
+      status: 400,
+      message: /two distinct Bots/,
+    });
     assert.throws(
-      () => home.createGroup({ memberBotIds: [ada.id, crypto.randomUUID()] }),
+      () => home.createGroup({ title: "Crew", memberBotIds: [ada.id, crypto.randomUUID()] }),
       { status: 400, message: /unknown Bot/ },
     );
     assert.equal(home.listChannels().some((channel) => channel.kind === "group"), false);
@@ -104,10 +119,10 @@ describe("PWA group sidebar helpers", () => {
     const stacked = readFileSync(join(ROOT, "pwa/src/components/StackedEyes.tsx"), "utf8");
     const channels = readFileSync(join(ROOT, "pwa/src/lib/channels.ts"), "utf8");
     assert.match(stacked, /data-testid=["']stacked-eyes["']/);
-    assert.match(messenger, /data-testid=["']group-channel-row["']/);
+    assert.match(messenger, /group-channel-row/);
     assert.match(messenger, /data-testid=["']group-members["']/);
     assert.match(messenger, /StackedEyes/);
-    assert.match(messenger, /sidebarGroups/);
+    assert.match(messenger, /buildChatInbox/);
     assert.match(channels, /bot-to-bot/);
     assert.match(channels, /kind === "group"/);
     assert.match(messenger, /composerSendEnabled/);
@@ -120,7 +135,12 @@ function cookieHeader(res: Response): string {
 }
 
 type PublicBot = { id: string; name: string };
-type PublicMember = { kind: "user" | "bot"; id: string; name?: string };
+type PublicMember = {
+  kind: "user" | "bot";
+  id: string;
+  name?: string;
+  eyes?: { color: string; shape: string; mode: string };
+};
 type PublicChannel = {
   id: string;
   kind: string;
@@ -168,42 +188,67 @@ describe("Talk HTTP group Channel", () => {
       const botsBeforeBody = (await botsBefore.json()) as { bots: PublicBot[]; channels?: unknown };
       assert.deepEqual(botsBeforeBody.bots.map((bot) => bot.name).sort(), ["Ada", "Bob"]);
 
-      const empty = await fetch(`${box.url}/api/channels`, {
-        method: "POST",
-        headers: { cookie, "content-type": "application/json" },
-        body: JSON.stringify({ kind: "group", botIds: [] }),
-      });
-      assert.ok(empty.status >= 400 && empty.status < 500, `empty members expected 4xx, got ${empty.status}`);
+      const invalidBodies: Array<{ label: string; body: unknown }> = [
+        { label: "missing title", body: { kind: "group", botIds: [ada.id, bob.id] } },
+        { label: "blank title", body: { kind: "group", title: "   ", botIds: [ada.id, bob.id] } },
+        { label: "malformed title", body: { kind: "group", title: 42, botIds: [ada.id, bob.id] } },
+        { label: "missing members", body: { kind: "group", title: "Crew" } },
+        { label: "malformed members", body: { kind: "group", title: "Crew", botIds: ada.id } },
+        { label: "malformed member", body: { kind: "group", title: "Crew", botIds: [ada.id, 42] } },
+        { label: "blank member", body: { kind: "group", title: "Crew", botIds: [ada.id, bob.id, "   "] } },
+        { label: "duplicate member", body: { kind: "group", title: "Crew", botIds: [ada.id, bob.id, ada.id] } },
+        { label: "too few distinct members", body: { kind: "group", title: "Crew", botIds: [ada.id, ada.id] } },
+        { label: "unknown Bot", body: { kind: "group", title: "Crew", botIds: [ada.id, crypto.randomUUID()] } },
+        { label: "hidden kind", body: { kind: "bot-to-bot", title: "Crew", botIds: [ada.id, bob.id] } },
+      ];
+      for (const invalid of invalidBodies) {
+        const response = await fetch(`${box.url}/api/channels`, {
+          method: "POST",
+          headers: { cookie, "content-type": "application/json" },
+          body: JSON.stringify(invalid.body),
+        });
+        assert.ok(
+          response.status >= 400 && response.status < 500,
+          `${invalid.label} expected bounded 4xx, got ${response.status}`,
+        );
+        const afterInvalid = await fetch(`${box.url}/api/channels`, { headers: { cookie } });
+        const afterInvalidBody = (await afterInvalid.json()) as { channels: PublicChannel[] };
+        assert.equal(
+          afterInvalidBody.channels.some((channel) => channel.kind === "group"),
+          false,
+          `${invalid.label} must not mutate Home`,
+        );
+      }
 
-      const unknown = await fetch(`${box.url}/api/channels`, {
+      const malformedJson = await fetch(`${box.url}/api/channels`, {
         method: "POST",
         headers: { cookie, "content-type": "application/json" },
-        body: JSON.stringify({ kind: "group", botIds: [crypto.randomUUID()] }),
-      });
-      assert.ok(unknown.status >= 400 && unknown.status < 500, `unknown Bot expected 4xx, got ${unknown.status}`);
-
-      const hiddenKind = await fetch(`${box.url}/api/channels`, {
-        method: "POST",
-        headers: { cookie, "content-type": "application/json" },
-        body: JSON.stringify({ kind: "bot-to-bot", botIds: [ada.id, bob.id] }),
+        body: "{",
       });
       assert.ok(
-        hiddenKind.status >= 400 && hiddenKind.status < 500,
-        `bot-to-bot create expected 4xx, got ${hiddenKind.status}`,
+        malformedJson.status >= 400 && malformedJson.status < 500,
+        `malformed JSON expected bounded 4xx, got ${malformedJson.status}`,
       );
+      const afterMalformed = await fetch(`${box.url}/api/channels`, { headers: { cookie } });
+      const afterMalformedBody = (await afterMalformed.json()) as { channels: PublicChannel[] };
+      assert.equal(afterMalformedBody.channels.some((channel) => channel.kind === "group"), false);
 
       const created = await fetch(`${box.url}/api/channels`, {
         method: "POST",
         headers: { cookie, "content-type": "application/json" },
-        body: JSON.stringify({ kind: "group", title: "Ada & Bob", botIds: [ada.id, bob.id] }),
+        body: JSON.stringify({ kind: "group", title: "  Launch crew  ", botIds: [ada.id, bob.id] }),
       });
       assert.equal(created.status, 201, await created.clone().text());
       const group = (await created.json()) as PublicChannel;
       assert.equal(group.kind, "group");
       assert.notEqual(group.kind, "bot-to-bot");
-      assert.equal(group.title, "Ada & Bob");
-      const memberKeys = group.members.map((member) => `${member.kind}:${member.id}`).sort();
-      assert.deepEqual(memberKeys, [`bot:${ada.id}`, `bot:${bob.id}`, `user:${HUMAN_MEMBER_ID}`].sort());
+      assert.equal(group.title, "Launch crew");
+      assert.deepEqual(
+        group.members.map((member) => `${member.kind}:${member.id}`),
+        [`user:${HUMAN_MEMBER_ID}`, `bot:${ada.id}`, `bot:${bob.id}`],
+      );
+      assert.deepEqual(group.members.filter((member) => member.kind === "bot").map((member) => member.name), ["Ada", "Bob"]);
+      assert.ok(group.members.filter((member) => member.kind === "bot").every((member) => member.eyes));
 
       const listed = await fetch(`${box.url}/api/channels`, { headers: { cookie } });
       assert.equal(listed.status, 200);
@@ -211,6 +256,20 @@ describe("Talk HTTP group Channel", () => {
       const groups = listBody.channels.filter((channel) => channel.kind === "group");
       assert.equal(groups.length, 1);
       assert.equal(groups[0]?.id, group.id);
+      assert.equal(groups[0]?.title, "Launch crew");
+      assert.deepEqual(
+        groups[0]?.members.map((member) => `${member.kind}:${member.id}`),
+        [`user:${HUMAN_MEMBER_ID}`, `bot:${ada.id}`, `bot:${bob.id}`],
+      );
+      const directBeforeRestart = listBody.channels
+        .filter((channel) => channel.kind === "direct")
+        .map((channel) => ({
+          id: channel.id,
+          title: channel.title,
+          members: channel.members.map((member) => `${member.kind}:${member.id}`),
+        }));
+      assert.equal(directBeforeRestart.length, 2, "each Bot keeps its born direct Channel");
+      assert.ok(directBeforeRestart.every((channel) => channel.title === null));
       assert.equal(
         listBody.channels.some((channel) => channel.kind === "bot-to-bot"),
         false,
@@ -220,6 +279,7 @@ describe("Talk HTTP group Channel", () => {
       assert.equal(detail.status, 200);
       const shown = (await detail.json()) as PublicChannel;
       assert.equal(shown.kind, "group");
+      assert.equal(shown.title, "Launch crew");
       assert.equal(shown.members.length, 3);
       assert.ok(shown.members.some((member) => member.kind === "bot" && member.id === ada.id && member.name === "Ada"));
       assert.ok(shown.members.some((member) => member.kind === "bot" && member.id === bob.id && member.name === "Bob"));
@@ -258,7 +318,20 @@ describe("Talk HTTP group Channel", () => {
       assert.ok(restored, "group Channel must survive Talk restart");
       assert.equal(restored.kind, "group");
       assert.notEqual(restored.kind, "bot-to-bot");
-      assert.equal(restored.members.length, 3);
+      assert.equal(restored.id, group.id);
+      assert.equal(restored.title, "Launch crew");
+      assert.deepEqual(
+        restored.members.map((member) => `${member.kind}:${member.id}`),
+        [`user:${HUMAN_MEMBER_ID}`, `bot:${ada.id}`, `bot:${bob.id}`],
+      );
+      const directAfterRestart = restoredBody.channels
+        .filter((channel) => channel.kind === "direct")
+        .map((channel) => ({
+          id: channel.id,
+          title: channel.title,
+          members: channel.members.map((member) => `${member.kind}:${member.id}`),
+        }));
+      assert.deepEqual(directAfterRestart, directBeforeRestart);
 
       const db = new DatabaseSync(join(homeDir, "talk.sqlite"));
       const hiddenId = crypto.randomUUID();
