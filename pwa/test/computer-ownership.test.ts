@@ -4,6 +4,8 @@ import { registerHooks } from "node:module";
 import { describe, test } from "node:test";
 import {
   computerCanWrite,
+  retryComputer,
+  screenCanRetry,
   createComputerOwnershipTransitions,
   getComputer,
   releaseComputerForNavigation,
@@ -31,6 +33,10 @@ function computer(botId: string, ownership: Computer["ownership"]): Computer {
     path: `/screen/${botId}/`,
     ready: true,
     botId,
+    screenState: "ready",
+    screenAttempt: `${botId}-attempt`,
+    screenError: null,
+    screenCleanupError: null,
     ownership,
     ownershipEpoch: "test-epoch",
     write: ownership === "unknown" ? null : write,
@@ -46,11 +52,14 @@ let computerScreenHarnessId = 0;
 async function renderComputerScreenHarness(
   fetchImpl: typeof fetch,
   expanded = false,
+  onClose: () => void = () => undefined,
 ): Promise<{
   effects: ComponentEffect[];
   intervals: Map<number, () => void>;
   stateValues: unknown[];
   stateUpdates: Array<{ index: number; value: unknown }>;
+  dispatchWindowEvent: (type: string, event?: unknown) => void;
+  render: (botId?: string | null, nextExpanded?: boolean) => unknown;
   restore: () => void;
 }> {
   const effects: ComponentEffect[] = [];
@@ -60,6 +69,8 @@ async function renderComputerScreenHarness(
   const hookState = globalThis as typeof globalThis & {
     __openbotComputerRenderHooks?: {
       effects: ComponentEffect[];
+      refIndex: number;
+      refValues: Array<{ current: unknown }>;
       stateIndex: number;
       stateUpdates: Array<{ index: number; value: unknown }>;
       stateValues: unknown[];
@@ -67,6 +78,8 @@ async function renderComputerScreenHarness(
   };
   hookState.__openbotComputerRenderHooks = {
     effects,
+    refIndex: 0,
+    refValues: [],
     stateIndex: 0,
     stateUpdates,
     stateValues,
@@ -78,7 +91,11 @@ async function renderComputerScreenHarness(
     const state = globalThis.__openbotComputerRenderHooks;
     export const useCallback = (callback) => callback;
     export const useEffect = (effect) => { state.effects.push(effect); };
-    export const useRef = (value) => ({ current: value });
+    export const useRef = (value) => {
+      const index = state.refIndex++;
+      if (!(index in state.refValues)) state.refValues[index] = { current: value };
+      return state.refValues[index];
+    };
     export const useState = (initial) => {
       const index = state.stateIndex++;
       if (!(index in state.stateValues)) state.stateValues[index] = initial;
@@ -115,7 +132,7 @@ async function renderComputerScreenHarness(
   });
 
   let intervalId = 0;
-  const listeners = new Map<string, Set<() => void>>();
+  const listeners = new Map<string, Set<(event?: unknown) => void>>();
   const testWindow = {
     setInterval(callback: () => void) {
       intervalId += 1;
@@ -125,14 +142,17 @@ async function renderComputerScreenHarness(
     clearInterval(id: number) {
       intervals.delete(id);
     },
-    addEventListener(type: string, listener: () => void) {
-      const registered = listeners.get(type) ?? new Set<() => void>();
+    addEventListener(type: string, listener: (event?: unknown) => void) {
+      const registered = listeners.get(type) ?? new Set<(event?: unknown) => void>();
       registered.add(listener);
       listeners.set(type, registered);
     },
-    removeEventListener(type: string, listener: () => void) {
+    removeEventListener(type: string, listener: (event?: unknown) => void) {
       listeners.get(type)?.delete(listener);
     },
+  };
+  const dispatchWindowEvent = (type: string, event?: unknown) => {
+    for (const listener of listeners.get(type) ?? []) listener(event);
   };
   const originalFetch = globalThis.fetch;
   const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
@@ -168,12 +188,24 @@ async function renderComputerScreenHarness(
     const { ComputerScreen } = await import(componentUrl.href) as typeof import(
       "../src/components/Computer.tsx"
     );
-    ComputerScreen({ botId: "Ada", expanded, onClose: () => undefined });
-    return { effects, intervals, stateValues, stateUpdates, restore };
+    const render = (botId: string | null = "Ada", nextExpanded = expanded) => {
+      hookState.__openbotComputerRenderHooks!.stateIndex = 0;
+      hookState.__openbotComputerRenderHooks!.refIndex = 0;
+      return ComputerScreen({ botId, expanded: nextExpanded, onClose });
+    };
+    render();
+    return { effects, intervals, stateValues, stateUpdates, dispatchWindowEvent, render, restore };
   } catch (error) {
     restore();
     throw error;
   }
+}
+
+function countJsxElements(node: unknown, type: string): number {
+  if (Array.isArray(node)) return node.reduce((count, child) => count + countJsxElements(child, type), 0);
+  if (typeof node !== "object" || node === null) return 0;
+  const element = node as { type?: unknown; props?: { children?: unknown } };
+  return (element.type === type ? 1 : 0) + countJsxElements(element.props?.children, type);
 }
 
 describe("Computer ownership PWA client", () => {
@@ -274,7 +306,7 @@ describe("Computer ownership PWA client", () => {
     assert.deepEqual(calls, [{ botId: "Ada", zoom: false }]);
   });
 
-  test("real ComputerScreen dispatches immediate pagehide and cleanup release during preflight", async () => {
+  test("selected Bot pagehide issues no ownership request before its Screen state loads", async () => {
     type Effect = () => void | (() => void);
     type Listener = () => void;
     const effects: Effect[] = [];
@@ -366,13 +398,10 @@ describe("Computer ownership PWA client", () => {
       const transitionCleanup = effects[1]();
       const navigationCleanup = effects[2]();
       await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.deepEqual(requests, [{ method: "GET" }]);
+      assert.deepEqual(requests, []);
 
       testWindow.dispatch("pagehide");
-      assert.deepEqual(requests, [
-        { method: "GET" },
-        { method: "POST", zoom: false, keepalive: true },
-      ]);
+      assert.deepEqual(requests, []);
       epochPreflight.resolve(new Response(JSON.stringify({
         ...computer("Ada", "view-only"),
         ownershipEpoch: "preflight-response-token",
@@ -382,14 +411,10 @@ describe("Computer ownership PWA client", () => {
       assert.equal(requests.some((request) => request.zoom === true), false);
 
       if (typeof transitionCleanup === "function") transitionCleanup();
-      assert.deepEqual(requests, [
-        { method: "GET" },
-        { method: "POST", zoom: false, keepalive: true },
-        { method: "POST", zoom: false, keepalive: true },
-      ]);
+      assert.deepEqual(requests, []);
       if (typeof navigationCleanup === "function") navigationCleanup();
       testWindow.dispatch("pagehide");
-      assert.equal(requests.length, 3);
+      assert.equal(requests.length, 0);
       await new Promise<void>((resolve) => setImmediate(resolve));
     } finally {
       moduleHooks.deregister();
@@ -403,29 +428,36 @@ describe("Computer ownership PWA client", () => {
   });
 
   test("real ComputerScreen ignores an old load failure after a confirmed transition", async () => {
-    type FetchHandler = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
     const staleLoad = deferred<Response>();
     const requests: string[] = [];
     const response = (data: Computer, token: string) => new Response(JSON.stringify({
       ...data,
       ownershipEpoch: token,
     }), { status: 200, headers: { "content-type": "application/json" } });
-    const handlers: FetchHandler[] = [
-      () => staleLoad.promise,
-      async () => response(computer("Ada", "view-only"), "confirmed-transition-token"),
-    ];
+    let getCount = 0;
     const harness = await renderComputerScreenHarness(((input, init) => {
       const method = init?.method ?? "GET";
       requests.push(method);
-      const handler = handlers.shift();
-      if (!handler) throw new Error(`Unexpected ${method} request`);
-      return handler(input, init);
+      if (method === "GET") {
+        getCount += 1;
+        if (getCount === 1) return staleLoad.promise;
+      }
+      return Promise.resolve(response(computer("Ada", "view-only"), "confirmed-transition-token"));
     }) as typeof fetch);
     let loadCleanup: void | (() => void);
     let transitionCleanup: void | (() => void);
+    let confirmedCleanup: void | (() => void);
     try {
       loadCleanup = harness.effects[0]?.();
       transitionCleanup = harness.effects[1]?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual(requests, ["GET"]);
+
+      harness.stateValues[0] = computer("Ada", "view-only");
+      const nextEffects = harness.effects.length;
+      harness.render();
+      confirmedCleanup = harness.effects[nextEffects + 1]?.();
       await new Promise<void>((resolve) => setImmediate(resolve));
       await new Promise<void>((resolve) => setImmediate(resolve));
       assert.deepEqual(requests, ["GET", "POST"]);
@@ -438,6 +470,7 @@ describe("Computer ownership PWA client", () => {
     } finally {
       if (typeof loadCleanup === "function") loadCleanup();
       if (typeof transitionCleanup === "function") transitionCleanup();
+      if (typeof confirmedCleanup === "function") confirmedCleanup();
       harness.restore();
     }
   });
@@ -453,7 +486,6 @@ describe("Computer ownership PWA client", () => {
     }), { status: 200, headers: { "content-type": "application/json" } });
     const handlers: FetchHandler[] = [
       () => initialLoad.promise,
-      async () => response(computer("Ada", "view-only"), "confirmed-transition-token"),
       () => olderPoll.promise,
       () => newerPoll.promise,
     ];
@@ -470,21 +502,30 @@ describe("Computer ownership PWA client", () => {
       transitionCleanup = harness.effects[1]?.();
       await new Promise<void>((resolve) => setImmediate(resolve));
       await new Promise<void>((resolve) => setImmediate(resolve));
-      initialLoad.resolve(response(computer("initial-stale", "view-only"), "initial-stale-token"));
+      initialLoad.resolve(response({
+        ...computer("Ada", "view-only"),
+        screenAttempt: "initial-stale-attempt",
+      }, "initial-stale-token"));
       await new Promise<void>((resolve) => setImmediate(resolve));
 
       const poll = [...harness.intervals.values()][0];
       assert.ok(poll, "Computer poll interval was not registered");
       poll();
       poll();
-      newerPoll.resolve(response(computer("newer", "view-only"), "newer-poll-token"));
+      newerPoll.resolve(response({
+        ...computer("Ada", "view-only"),
+        screenAttempt: "newer-poll-attempt",
+      }, "newer-poll-token"));
       await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.equal((harness.stateValues[0] as Computer | null)?.botId, "newer");
+      assert.equal((harness.stateValues[0] as Computer | null)?.screenAttempt, "newer-poll-attempt");
       const updatesAfterNewerPoll = harness.stateUpdates.length;
 
-      olderPoll.resolve(response(computer("older", "write"), "older-poll-token"));
+      olderPoll.resolve(response({
+        ...computer("Ada", "write"),
+        screenAttempt: "older-poll-attempt",
+      }, "older-poll-token"));
       await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.equal((harness.stateValues[0] as Computer | null)?.botId, "newer");
+      assert.equal((harness.stateValues[0] as Computer | null)?.screenAttempt, "newer-poll-attempt");
       assert.equal(harness.stateUpdates.length, updatesAfterNewerPoll);
     } finally {
       if (typeof loadCleanup === "function") loadCleanup();
@@ -716,12 +757,767 @@ describe("Computer ownership PWA client", () => {
     }
   });
 
+  test("rejects a mismatched Bot ownership preflight before dispatching a grant", async () => {
+    const requests: Array<{ pathname: string; method: string }> = [];
+    let rejectRelease = true;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input), "http://openbot.local");
+      const method = init?.method ?? "GET";
+      requests.push({ pathname: url.pathname, method });
+      if (method === "POST" && rejectRelease) {
+        rejectRelease = false;
+        throw new TypeError("release transport reset");
+      }
+      if (method === "GET") {
+        return new Response(JSON.stringify({
+          ...computer("Ben", "view-only"),
+          ownershipEpoch: "wrong-bot-token",
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify(computer("Ada", "write")), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      await assert.rejects(releaseComputerForNavigation("Ada"));
+      requests.length = 0;
+      await assert.rejects(
+        setComputerZoom("Ada", true),
+        /selected Bot/u,
+      );
+      assert.deepEqual(requests, [{ pathname: "/api/computer", method: "GET" }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("grants pointer and keyboard control only for a confirmed remote write owner", () => {
     assert.equal(computerCanWrite(computer("Ada", "view-only"), true), false);
     assert.equal(computerCanWrite(computer("Ada", "unknown"), true), false);
     assert.equal(computerCanWrite(computer("Ada", "write"), false), false);
     assert.equal(computerCanWrite(computer("Ada", "write"), true), true);
     assert.equal(computerCanWrite(computer("Ada", "write"), true, "Ben"), false);
+  });
+
+  test("every explicit non-ready Computer state renders no iframe, makes no ownership request, and closes directly", async (t) => {
+    const baseUnavailable: Computer = {
+      ...computer("Ada", "unknown"),
+      path: null,
+      ready: false,
+      screenState: "unavailable",
+      screenAttempt: "unavailable-attempt",
+      screenError: {
+        stage: "prepare",
+        code: "SCREEN_ATTACHMENT_FAILED",
+        message: "Screen attachment failed during prepare.",
+      },
+      screenCleanupError: null,
+      display: 1,
+    };
+    const cases: Array<{ state: Computer["screenState"]; value: Computer; retry: boolean }> = [
+      {
+        state: "attaching",
+        value: { ...baseUnavailable, screenState: "attaching", screenAttempt: "attaching-attempt", screenError: null },
+        retry: false,
+      },
+      { state: "unavailable", value: baseUnavailable, retry: true },
+      {
+        state: "unassigned",
+        value: {
+          ...baseUnavailable,
+          screenState: "unassigned",
+          screenAttempt: "unassigned-attempt",
+          screenError: null,
+          display: null,
+        },
+        retry: true,
+      },
+      {
+        state: "cleanup-required",
+        value: {
+          ...baseUnavailable,
+          screenState: "cleanup-required",
+          screenAttempt: "cleanup-attempt",
+          screenCleanupError: {
+            code: "SCREEN_CLEANUP_FAILED",
+            message: "Screen cleanup did not complete.",
+          },
+        },
+        retry: false,
+      },
+    ];
+
+    for (const current of cases) {
+      await t.test(current.state, async () => {
+        const requests: Array<{ pathname: string; method: string }> = [];
+        let closeCalls = 0;
+        let escapePrevented = false;
+        const harness = await renderComputerScreenHarness(((input, init) => {
+          const url = new URL(String(input), "http://openbot.local");
+          const method = init?.method ?? "GET";
+          requests.push({ pathname: url.pathname, method });
+          if (method !== "GET") throw new Error(`${current.state} Computer attempted an ownership transition`);
+          return Promise.resolve(new Response(JSON.stringify(current.value), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }));
+        }) as typeof fetch, true, () => {
+          closeCalls += 1;
+        });
+        const cleanups: Array<void | (() => void)> = [];
+        try {
+          cleanups.push(...harness.effects.map((effect) => effect()));
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          const nextEffect = harness.effects.length;
+          const rendered = harness.render() as {
+            props?: { onClose?: () => void; onRetry?: () => void };
+          };
+          cleanups.push(harness.effects[nextEffect + 1]?.());
+
+          assert.equal(countJsxElements(rendered, "iframe"), 0);
+          assert.equal(typeof rendered.props?.onRetry === "function", current.retry);
+          assert.equal(screenCanRetry(current.value), current.retry);
+          rendered.props?.onClose?.();
+          harness.dispatchWindowEvent("keydown", {
+            key: "Escape",
+            preventDefault() {
+              escapePrevented = true;
+            },
+          });
+          harness.dispatchWindowEvent("pagehide");
+          await new Promise<void>((resolve) => setImmediate(resolve));
+
+          assert.equal(closeCalls, 2);
+          assert.equal(escapePrevented, true);
+          assert.ok(requests.length >= 1);
+          assert.equal(requests.every((request) => request.method === "GET"), true);
+        } finally {
+          for (const cleanup of cleanups) if (typeof cleanup === "function") cleanup();
+          harness.restore();
+        }
+      });
+    }
+
+    const source = await readFile(new URL("../src/components/Computer.tsx", import.meta.url), "utf8");
+    assert.doesNotMatch(source, /const path = computer\?\.path \?\?/u);
+  });
+
+  test("retry invalidates an older poll and later polling can publish the recovered Screen", async () => {
+    const unavailable: Computer = {
+      ...computer("Ada", "unknown"),
+      path: null,
+      ready: false,
+      screenState: "unavailable",
+      screenAttempt: "failed-attempt",
+      screenError: {
+        stage: "commit",
+        code: "SCREEN_ATTACHMENT_FAILED",
+        message: "Screen attachment failed during commit.",
+      },
+      screenCleanupError: null,
+      display: 1,
+    };
+    const attaching: Computer = {
+      ...unavailable,
+      screenState: "attaching",
+      screenAttempt: "accepted-attempt",
+      screenError: null,
+    };
+    const recovered = computer("Ada", "view-only");
+    const stalePoll = deferred<Response>();
+    const requests: Array<{ pathname: string; method: string; body?: Record<string, unknown> }> = [];
+    let getCount = 0;
+    const response = (value: Computer, status = 200) => new Response(JSON.stringify(value), {
+      status,
+      headers: { "content-type": "application/json" },
+    });
+    const harness = await renderComputerScreenHarness(((input, init) => {
+      const url = new URL(String(input), "http://openbot.local");
+      const method = init?.method ?? "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
+      requests.push({ pathname: url.pathname, method, body });
+      if (url.pathname === "/api/computer/retry") return Promise.resolve(response(attaching, 202));
+      getCount += 1;
+      if (getCount === 1) return Promise.resolve(response(unavailable));
+      if (getCount === 2) return stalePoll.promise;
+      return Promise.resolve(response(recovered));
+    }) as typeof fetch, true);
+    const cleanups: Array<void | (() => void)> = [];
+    try {
+      cleanups.push(harness.effects[0]?.(), harness.effects[1]?.());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const poll = [...harness.intervals.values()][0];
+      assert.ok(poll);
+      poll();
+
+      const rendered = harness.render() as { props?: { onRetry?: () => void } };
+      rendered.props?.onRetry?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual(
+        {
+          state: (harness.stateValues[0] as Computer | null)?.screenState,
+          attempt: (harness.stateValues[0] as Computer | null)?.screenAttempt,
+        },
+        { state: "attaching", attempt: "accepted-attempt" },
+      );
+      assert.deepEqual(requests.find((request) => request.pathname === "/api/computer/retry"), {
+        pathname: "/api/computer/retry",
+        method: "POST",
+        body: { botId: "Ada", screenAttempt: "failed-attempt" },
+      });
+
+      stalePoll.resolve(response(unavailable));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual(
+        {
+          state: (harness.stateValues[0] as Computer | null)?.screenState,
+          attempt: (harness.stateValues[0] as Computer | null)?.screenAttempt,
+        },
+        { state: "attaching", attempt: "accepted-attempt" },
+      );
+
+      poll();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal((harness.stateValues[0] as Computer | null)?.screenState, "ready");
+      assert.equal((harness.stateValues[0] as Computer | null)?.screenAttempt, "Ada-attempt");
+    } finally {
+      for (const cleanup of cleanups) if (typeof cleanup === "function") cleanup();
+      harness.restore();
+    }
+  });
+
+  test("same rendered retry handler accepts only one in-flight Screen request", async () => {
+    const unavailable: Computer = {
+      ...computer("Ada", "unknown"),
+      path: null,
+      ready: false,
+      screenState: "unavailable",
+      screenAttempt: "failed-attempt",
+      screenError: {
+        stage: "prepare",
+        code: "SCREEN_ATTACHMENT_FAILED",
+        message: "Screen attachment failed during prepare.",
+      },
+      screenCleanupError: null,
+      display: 1,
+    };
+    const retryReply = deferred<Response>();
+    const requests: Array<{ pathname: string; method: string }> = [];
+    const harness = await renderComputerScreenHarness(((input, init) => {
+      const url = new URL(String(input), "http://openbot.local");
+      const method = init?.method ?? "GET";
+      requests.push({ pathname: url.pathname, method });
+      if (url.pathname === "/api/computer/retry") return retryReply.promise;
+      return Promise.resolve(new Response(JSON.stringify(unavailable), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }));
+    }) as typeof fetch, true);
+    const cleanups: Array<void | (() => void)> = [];
+    try {
+      cleanups.push(harness.effects[0]?.(), harness.effects[1]?.());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const rendered = harness.render() as { props?: { onRetry?: () => void } };
+      rendered.props?.onRetry?.();
+      rendered.props?.onRetry?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(
+        requests.filter((request) => request.pathname === "/api/computer/retry").length,
+        1,
+      );
+
+      retryReply.resolve(new Response(JSON.stringify({
+        ...unavailable,
+        screenState: "attaching",
+        screenAttempt: "accepted-attempt",
+        screenError: null,
+      }), { status: 202, headers: { "content-type": "application/json" } }));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual(
+        {
+          state: (harness.stateValues[0] as Computer | null)?.screenState,
+          attempt: (harness.stateValues[0] as Computer | null)?.screenAttempt,
+          error: harness.stateValues[1],
+        },
+        { state: "attaching", attempt: "accepted-attempt", error: null },
+      );
+    } finally {
+      for (const cleanup of cleanups) if (typeof cleanup === "function") cleanup();
+      harness.restore();
+    }
+  });
+
+  test("old ready Bot never renders or transitions as the newly selected Bot before its load settles", async () => {
+    const benLoad = deferred<Response>();
+    const requests: Array<{ pathname: string; method: string; body?: Record<string, unknown> }> = [];
+    let getCount = 0;
+    let closeCalls = 0;
+    const harness = await renderComputerScreenHarness(((input, init) => {
+      const url = new URL(String(input), "http://openbot.local");
+      const method = init?.method ?? "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
+      requests.push({ pathname: url.pathname, method, body });
+      if (method !== "GET") {
+        return Promise.resolve(new Response(JSON.stringify(computer("Ben", "write")), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }));
+      }
+      getCount += 1;
+      if (getCount === 1) {
+        return Promise.resolve(new Response(JSON.stringify(computer("Ada", "view-only")), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }));
+      }
+      return benLoad.promise;
+    }) as typeof fetch, true, () => {
+      closeCalls += 1;
+    });
+    const cleanups: Array<void | (() => void)> = [];
+    try {
+      cleanups.push(harness.effects[0]?.(), harness.effects[1]?.());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(countJsxElements(harness.render("Ada"), "iframe"), 1);
+
+      const nextEffect = harness.effects.length;
+      const mismatched = harness.render("Ben") as { props?: { onClose?: () => void } };
+      assert.equal(countJsxElements(mismatched, "iframe"), 0);
+      cleanups.push(harness.effects[nextEffect + 1]?.());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(requests.some((request) => request.method === "POST"), false);
+      mismatched.props?.onClose?.();
+      assert.equal(closeCalls, 1);
+      assert.equal(computerCanWrite(computer("Ada", "write"), true, "Ben"), false);
+
+      cleanups.push(harness.effects[nextEffect]?.());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal((harness.stateValues[0] as Computer | null), null);
+    } finally {
+      benLoad.resolve(new Response(JSON.stringify({
+        ...computer("Ben", "unknown"),
+        path: null,
+        ready: false,
+        screenState: "unavailable",
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+      for (const cleanup of cleanups) if (typeof cleanup === "function") cleanup();
+      harness.restore();
+    }
+  });
+
+  test("Bot switch invalidates an old delayed retry response or rejection", async (t) => {
+    for (const outcome of ["resolve", "reject"] as const) {
+      await t.test(outcome, async () => {
+        const ada: Computer = {
+          ...computer("Ada", "unknown"),
+          path: null,
+          ready: false,
+          screenState: "unavailable",
+          screenAttempt: "ada-failed-attempt",
+          screenError: {
+            stage: "reserve",
+            code: "SCREEN_ATTACHMENT_FAILED",
+            message: "Screen attachment failed during reserve.",
+          },
+          screenCleanupError: null,
+          display: 1,
+        };
+        const ben: Computer = {
+          ...ada,
+          botId: "Ben",
+          screenAttempt: "ben-failed-attempt",
+          display: 2,
+        };
+        const oldRetry = deferred<Response>();
+        let getCount = 0;
+        const harness = await renderComputerScreenHarness(((input, init) => {
+          const url = new URL(String(input), "http://openbot.local");
+          if (url.pathname === "/api/computer/retry") return oldRetry.promise;
+          getCount += 1;
+          return Promise.resolve(new Response(JSON.stringify(getCount === 1 ? ada : ben), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }));
+        }) as typeof fetch, true);
+        const cleanups: Array<void | (() => void)> = [];
+        try {
+          cleanups.push(harness.effects[0]?.(), harness.effects[1]?.());
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          const adaRendered = harness.render("Ada") as { props?: { onRetry?: () => void } };
+          adaRendered.props?.onRetry?.();
+          await new Promise<void>((resolve) => setImmediate(resolve));
+
+          const nextEffect = harness.effects.length;
+          harness.render("Ben");
+          cleanups.push(harness.effects[nextEffect]?.(), harness.effects[nextEffect + 1]?.());
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal((harness.stateValues[0] as Computer | null)?.botId, "Ben");
+          assert.equal(harness.stateValues[1], null);
+
+          if (outcome === "resolve") {
+            oldRetry.resolve(new Response(JSON.stringify({
+              ...ada,
+              screenState: "attaching",
+              screenAttempt: "ada-accepted-attempt",
+              screenError: null,
+            }), { status: 202, headers: { "content-type": "application/json" } }));
+          } else {
+            oldRetry.resolve(new Response(JSON.stringify({ error: "old Ada stale attempt" }), {
+              status: 409,
+              headers: { "content-type": "application/json" },
+            }));
+          }
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal((harness.stateValues[0] as Computer | null)?.botId, "Ben");
+          assert.equal((harness.stateValues[0] as Computer | null)?.screenAttempt, "ben-failed-attempt");
+          assert.equal(harness.stateValues[1], null);
+        } finally {
+          for (const cleanup of cleanups) if (typeof cleanup === "function") cleanup();
+          harness.restore();
+        }
+      });
+    }
+  });
+
+  test("rendered retry failure stays visible and never unlocks attaching or cleanup-required retry", async () => {
+    const unavailable: Computer = {
+      ...computer("Ada", "unknown"),
+      path: null,
+      ready: false,
+      screenState: "unavailable",
+      screenAttempt: "failed-attempt",
+      screenError: {
+        stage: "reserve",
+        code: "SCREEN_ATTACHMENT_FAILED",
+        message: "Screen attachment failed during reserve.",
+      },
+      screenCleanupError: null,
+      display: 1,
+    };
+    const harness = await renderComputerScreenHarness(((input, init) => {
+      const url = new URL(String(input), "http://openbot.local");
+      if (url.pathname === "/api/computer/retry") {
+        return Promise.resolve(new Response(JSON.stringify({ error: "opaque stale attempt detail" }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        }));
+      }
+      return Promise.resolve(new Response(JSON.stringify(unavailable), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }));
+    }) as typeof fetch, true);
+    const cleanups: Array<void | (() => void)> = [];
+    try {
+      cleanups.push(harness.effects[0]?.(), harness.effects[1]?.());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const beforeRetry = harness.render() as { props?: { onRetry?: () => void } };
+      beforeRetry.props?.onRetry?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      const failed = harness.render() as {
+        props?: { error?: string | null; onRetry?: () => void };
+      };
+      assert.equal(failed.props?.error, "Could not retry Screen. Refresh and try again.");
+      assert.equal(typeof failed.props?.onRetry, "function");
+      harness.stateValues[0] = { ...unavailable, screenState: "attaching", screenError: null };
+      const attaching = harness.render() as { props?: { error?: string | null; onRetry?: () => void } };
+      assert.equal(attaching.props?.error, "Could not retry Screen. Refresh and try again.");
+      assert.equal(attaching.props?.onRetry, undefined);
+      harness.stateValues[0] = {
+        ...unavailable,
+        screenState: "cleanup-required",
+        screenCleanupError: {
+          code: "SCREEN_CLEANUP_FAILED",
+          message: "Screen cleanup did not complete.",
+        },
+      };
+      const cleanup = harness.render() as { props?: { error?: string | null; onRetry?: () => void } };
+      assert.equal(cleanup.props?.error, "Could not retry Screen. Refresh and try again.");
+      assert.equal(cleanup.props?.onRetry, undefined);
+    } finally {
+      for (const cleanup of cleanups) if (typeof cleanup === "function") cleanup();
+      harness.restore();
+    }
+  });
+
+  test("live readiness false mounts no iframe or write grant and polling can recover", async () => {
+    const reconnecting: Computer = {
+      ...computer("Ada", "view-only"),
+      ready: false,
+    };
+    const recovered = { ...reconnecting, ready: true };
+    let getCount = 0;
+    const requests: Array<{ pathname: string; method: string }> = [];
+    const harness = await renderComputerScreenHarness(((input, init) => {
+      const url = new URL(String(input), "http://openbot.local");
+      const method = init?.method ?? "GET";
+      requests.push({ pathname: url.pathname, method });
+      if (method !== "GET") {
+        return Promise.resolve(new Response(JSON.stringify(computer("Ada", "write")), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }));
+      }
+      getCount += 1;
+      return Promise.resolve(new Response(JSON.stringify(getCount === 1 ? reconnecting : recovered), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }));
+    }) as typeof fetch, true);
+    const cleanups: Array<void | (() => void)> = [];
+    try {
+      cleanups.push(harness.effects[0]?.(), harness.effects[1]?.());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const nextEffect = harness.effects.length;
+      const pending = harness.render() as { props?: { computer?: Computer; onRetry?: () => void } };
+      cleanups.push(harness.effects[nextEffect + 1]?.());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(countJsxElements(pending, "iframe"), 0);
+      assert.equal(pending.props?.onRetry, undefined);
+      assert.equal(pending.props?.computer?.ready, false);
+      assert.equal(computerCanWrite(reconnecting, true, "Ada"), false);
+      assert.equal(requests.every((request) => request.method === "GET"), true);
+
+      const poll = [...harness.intervals.values()][0];
+      assert.ok(poll);
+      poll();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const readyEffect = harness.effects.length;
+      const ready = harness.render();
+      assert.equal((harness.stateValues[0] as Computer | null)?.ready, true);
+      assert.equal(countJsxElements(ready, "iframe"), 1);
+      cleanups.push(harness.effects[readyEffect + 1]?.());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(requests.filter((request) => request.method === "POST").length, 1);
+      const source = await readFile(new URL("../src/components/Computer.tsx", import.meta.url), "utf8");
+      assert.match(source, /computer\?\.ready/u);
+      assert.match(source, /computer\?\.botId/u);
+    } finally {
+      for (const cleanup of cleanups) if (typeof cleanup === "function") cleanup();
+      harness.restore();
+    }
+  });
+
+  test("ready Screen with unknown ownership offers canonical Computer repair before reacquiring write", async () => {
+    const unknown: Computer = {
+      ...computer("Ada", "unknown"),
+      path: null,
+      ready: false,
+      screenState: "ready",
+      ownershipEpoch: "unknown-epoch",
+    };
+    const repaired = {
+      ...computer("Ada", "view-only"),
+      ownershipEpoch: "repaired-epoch",
+    };
+    const requests: Array<{ pathname: string; method: string; body?: Record<string, unknown> }> = [];
+    const harness = await renderComputerScreenHarness(((input, init) => {
+      const url = new URL(String(input), "http://openbot.local");
+      const method = init?.method ?? "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
+      requests.push({ pathname: url.pathname, method, body });
+      const response = method === "GET"
+        ? unknown
+        : body?.zoom === false
+        ? repaired
+        : { ...computer("Ada", "write"), ownershipEpoch: "write-epoch" };
+      return Promise.resolve(new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }));
+    }) as typeof fetch, true);
+    const cleanups: Array<void | (() => void)> = [];
+    try {
+      cleanups.push(harness.effects[0]?.(), harness.effects[1]?.());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const unknownRendered = harness.render() as {
+        type?: (props: Record<string, unknown>) => unknown;
+        props?: { onRepair?: () => void; onRetry?: () => void };
+      };
+      assert.equal(countJsxElements(unknownRendered, "iframe"), 0);
+      assert.equal(unknownRendered.props?.onRetry, undefined);
+      assert.equal(typeof unknownRendered.props?.onRepair, "function");
+      const unknownNotice = JSON.stringify(
+        unknownRendered.type?.(unknownRendered.props as Record<string, unknown>),
+      );
+      assert.match(unknownNotice, /Computer access needs repair/u);
+      assert.match(unknownNotice, /Retry Computer/u);
+
+      unknownRendered.props?.onRepair?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual(
+        requests.filter((request) => request.method === "POST").map((request) => request.body?.zoom),
+        [false],
+      );
+      assert.equal((harness.stateValues[0] as Computer | null)?.ownership, "view-only");
+      assert.equal((harness.stateValues[0] as Computer | null)?.path, "/screen/Ada/");
+
+      const readyEffect = harness.effects.length;
+      const repairedRendered = harness.render();
+      assert.equal(countJsxElements(repairedRendered, "iframe"), 1);
+      cleanups.push(harness.effects[readyEffect + 1]?.());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual(
+        requests.filter((request) => request.method === "POST").map((request) => request.body?.zoom),
+        [false, true],
+      );
+      assert.equal((harness.stateValues[0] as Computer | null)?.ownership, "write");
+    } finally {
+      for (const cleanup of cleanups) if (typeof cleanup === "function") cleanup();
+      harness.restore();
+    }
+  });
+
+  test("ownership failures for another Bot never replace the selected Bot state", async (t) => {
+    const safeFailure = "Computer ownership could not be confirmed.";
+    const mismatchedFailure = {
+      ...computer("Ben", "write"),
+      ownershipError: safeFailure,
+      error: "Could not change Computer ownership.",
+    };
+
+    await t.test("automatic ownership effect", async () => {
+      const selected = computer("Ada", "view-only");
+      const harness = await renderComputerScreenHarness(((input, init) => {
+        const method = init?.method ?? "GET";
+        const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
+        if (method === "GET") {
+          return Promise.resolve(new Response(JSON.stringify(selected), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }));
+        }
+        const response = body?.zoom === false
+          ? computer("Ada", "view-only")
+          : mismatchedFailure;
+        return Promise.resolve(new Response(JSON.stringify(response), {
+          status: body?.zoom === false ? 200 : 503,
+          headers: { "content-type": "application/json" },
+        }));
+      }) as typeof fetch, true);
+      let ownershipCleanup: void | (() => void) = undefined;
+      try {
+        harness.effects[0]?.();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        const nextEffect = harness.effects.length;
+        harness.render();
+        ownershipCleanup = harness.effects[nextEffect + 1]?.();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        assert.equal((harness.stateValues[0] as Computer | null)?.botId, "Ada");
+        assert.equal((harness.stateValues[0] as Computer | null)?.ownership, "view-only");
+        assert.equal(harness.stateValues[1], safeFailure);
+      } finally {
+        if (typeof ownershipCleanup === "function") ownershipCleanup();
+        harness.restore();
+      }
+    });
+
+    await t.test("manual ownership repair", async () => {
+      const selected: Computer = {
+        ...computer("Ada", "unknown"),
+        path: null,
+        ready: false,
+      };
+      const harness = await renderComputerScreenHarness(((input, init) => {
+        const method = init?.method ?? "GET";
+        const response = method === "GET" ? selected : mismatchedFailure;
+        return Promise.resolve(new Response(JSON.stringify(response), {
+          status: method === "GET" ? 200 : 503,
+          headers: { "content-type": "application/json" },
+        }));
+      }) as typeof fetch, false);
+      try {
+        harness.effects[0]?.();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        const rendered = harness.render() as { props?: { onRepair?: () => void } };
+        assert.equal(typeof rendered.props?.onRepair, "function");
+        rendered.props?.onRepair?.();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        assert.equal((harness.stateValues[0] as Computer | null)?.botId, "Ada");
+        assert.equal((harness.stateValues[0] as Computer | null)?.ownership, "unknown");
+        assert.equal(harness.stateValues[1], safeFailure);
+      } finally {
+        harness.restore();
+      }
+    });
+  });
+
+  test("hiding a previously usable expanded Screen releases its captured write authority exactly once", async () => {
+    const usable = computer("Ada", "write");
+    const hidden: Computer = {
+      ...computer("Ada", "unknown"),
+      path: null,
+      ready: false,
+      screenState: "ready",
+    };
+    let getCount = 0;
+    const requests: Array<{ method: string; body?: Record<string, unknown> }> = [];
+    const harness = await renderComputerScreenHarness(((input, init) => {
+      const method = init?.method ?? "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
+      requests.push({ method, body });
+      if (method === "GET") {
+        getCount += 1;
+        return Promise.resolve(new Response(JSON.stringify(getCount === 1 ? usable : hidden), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }));
+      }
+      const response = body?.zoom === false
+        ? computer("Ada", "view-only")
+        : computer("Ada", "write");
+      return Promise.resolve(new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }));
+    }) as typeof fetch, true);
+    const cleanups: Array<void | (() => void)> = [];
+    let capturedOwnershipCleanup: void | (() => void) = undefined;
+    let capturedCleanupRan = false;
+    try {
+      cleanups.push(harness.effects[0]?.(), harness.effects[1]?.());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const usableEffect = harness.effects.length;
+      assert.equal(countJsxElements(harness.render(), "iframe"), 1);
+      capturedOwnershipCleanup = harness.effects[usableEffect + 1]?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      requests.length = 0;
+
+      const poll = [...harness.intervals.values()][0];
+      assert.ok(poll);
+      poll();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const hiddenEffect = harness.effects.length;
+      assert.equal(countJsxElements(harness.render(), "iframe"), 0);
+      if (typeof capturedOwnershipCleanup === "function") {
+        capturedCleanupRan = true;
+        capturedOwnershipCleanup();
+      }
+      cleanups.push(harness.effects[hiddenEffect + 1]?.());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      assert.deepEqual(
+        requests.filter((request) => request.method === "POST").map((request) => request.body?.zoom),
+        [false],
+      );
+    } finally {
+      if (!capturedCleanupRan && typeof capturedOwnershipCleanup === "function") {
+        capturedOwnershipCleanup();
+      }
+      for (const cleanup of cleanups) if (typeof cleanup === "function") cleanup();
+      harness.restore();
+    }
   });
 
   test("renders ownership failures as an accessible retryable alert", async () => {

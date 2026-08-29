@@ -44,6 +44,27 @@ async function computerEpoch(url: string, cookie: string, botId: string): Promis
   return body.ownershipEpoch as string;
 }
 
+async function waitForComputerOwnership(
+  url: string,
+  cookie: string,
+  botId: string,
+  expected: string,
+): Promise<Record<string, unknown>> {
+  // Test-only contention margin for background persisted Screen reconciliation.
+  const deadline = Date.now() + 5_000;
+  let observed: Record<string, unknown> = {};
+  while (Date.now() < deadline) {
+    const response = await fetch(`${url}/api/computer?botId=${encodeURIComponent(botId)}`, {
+      headers: { cookie },
+    });
+    assert.equal(response.status, 200);
+    observed = (await response.json()) as Record<string, unknown>;
+    if (observed.ownership === expected && observed.screenState === "ready") return observed;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Computer ownership did not settle as ${expected}: ${JSON.stringify(observed)}`);
+}
+
 async function emptyPwa(): Promise<string> {
   const pwaDir = await mkdtemp(join(tmpdir(), "openbot-pwa-"));
   await writeFile(join(pwaDir, "index.html"), `<!doctype html><title>OpenBot</title>`);
@@ -665,7 +686,7 @@ describe("Zoom orderly shutdown", () => {
 });
 
 describe("Zoom restart reconciliation", () => {
-  test("revokes a persisted remote writer before the restarted daemon serves Computer", async () => {
+  test("revokes a persisted remote writer before the restarted Screen becomes usable", async () => {
     let remoteWrite = false;
     const writes: string[] = [];
     const stub = http.createServer((req, res) => {
@@ -737,21 +758,16 @@ describe("Zoom restart reconciliation", () => {
         kasmUser: KASM_USER,
         kasmPassword: KASM_PASSWORD,
       });
+      const restartedCookie = await login(restarted.url);
+      const info = await waitForComputerOwnership(
+        restarted.url,
+        restartedCookie,
+        ada.id,
+        "view-only",
+      );
       assert.equal(remoteWrite, false);
       assert.ok(writes.length >= 1);
       assert.equal(writes.every((write) => write === "false"), true);
-
-      const restartedCookie = await login(restarted.url);
-      const computerApi = await fetch(
-        `${restarted.url}/api/computer?botId=${encodeURIComponent(ada.id)}`,
-        { headers: { cookie: restartedCookie } },
-      );
-      const info = (await computerApi.json()) as {
-        ownership?: string;
-        write?: boolean;
-        viewOnly?: boolean;
-        zoom?: boolean;
-      };
       assert.equal(info.ownership, "view-only");
       assert.equal(info.write, false);
       assert.equal(info.viewOnly, true);
@@ -816,12 +832,13 @@ describe("PWA has no Takeover button", () => {
     assert.doesNotMatch(computer, /Wake this Bot/);
   });
 
-  test("preview Open control is a real hit target and only confirmed ownership is writable", async () => {
+  test("preview Open control keeps full-surface markup and only confirmed ownership is writable", async () => {
     const computer = await readFile(join(repoRoot, "pwa/src/components/Computer.tsx"), "utf8");
     const messenger = await readFile(join(repoRoot, "pwa/src/components/Messenger.tsx"), "utf8");
     assert.match(messenger, /data-testid="open-computer"/);
     assert.match(messenger, /data-testid="open-computer-preview"/);
-    assert.match(messenger, /data-testid=\{computerOpen \? "computer-expanded" : "computer-preview"\}/);
+    assert.match(messenger, /data-testid=\{expanded \? "computer-expanded" : "computer-preview"\}/);
+    assert.match(messenger, /<ComputerPreview expanded=\{computerOpen\} onOpen=\{openComputer\}>/);
     assert.match(messenger, /aria-label="Open Computer"/);
     assert.match(
       messenger,

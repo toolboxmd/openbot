@@ -312,6 +312,73 @@ describe("Computer write ownership", () => {
     assert.equal(authorities.get("Ben"), "write");
   });
 
+  test("register retries only its cached unknown target and leaves another owner unchanged", async () => {
+    const calls: Array<{ target: string; write: boolean }> = [];
+    const remote = new Map<string, boolean>();
+    let rejectAdaRegistration = true;
+    const ownership = new KasmWriteOwnership({
+      update: async (target, write) => {
+        calls.push({ target, write });
+        if (target === "Ada" && !write && rejectAdaRegistration) {
+          rejectAdaRegistration = false;
+          throw new Error("controlled registration rejection");
+        }
+        remote.set(target, write);
+      },
+    });
+    await ownership.reconcile(["Ben"]);
+    await ownership.transition("Ben", true, ownership.epoch());
+    calls.length = 0;
+
+    await assert.rejects(
+      ownership.register("Ada"),
+      /controlled registration rejection/,
+    );
+    assert.equal(ownership.state("Ada").authority, "unknown");
+    assert.equal(ownership.state("Ben").authority, "write");
+    assert.equal(remote.get("Ben"), true);
+
+    const retried = await ownership.register("Ada");
+    assert.deepEqual(calls, [
+      { target: "Ada", write: false },
+      { target: "Ada", write: false },
+    ]);
+    assert.equal(retried.authority, "view-only");
+    assert.equal(ownership.state("Ben").authority, "write");
+    assert.equal(remote.get("Ben"), true);
+  });
+
+  test("forgetting one successfully released unknown target unblocks a healthy sibling without changing its owner", async () => {
+    const calls: Array<{ target: string; write: boolean }> = [];
+    const remote = new Map<string, boolean>();
+    const ownership = new KasmWriteOwnership({
+      update: async (target, write) => {
+        calls.push({ target, write });
+        if (target === "Ada" && !write) throw new Error("controlled Ada registration rejection");
+        remote.set(target, write);
+      },
+    });
+    await ownership.reconcile(["Ben"]);
+    calls.length = 0;
+    await assert.rejects(ownership.register("Ada"), /controlled Ada registration rejection/);
+    assert.equal(ownership.state("Ada").authority, "unknown");
+
+    ownership.forgetReleased("Ada");
+    await ownership.transition("Ben", true, ownership.epoch());
+
+    assert.deepEqual(calls, [
+      { target: "Ada", write: false },
+      { target: "Ben", write: true },
+    ]);
+    assert.equal(remote.get("Ben"), true);
+    assert.equal(ownership.state("Ben").authority, "write");
+    assert.throws(
+      () => ownership.forgetReleased("Ben"),
+      /current Computer write owner/i,
+    );
+    assert.equal(ownership.state("Ben").authority, "write");
+  });
+
   test("restart reconciliation revokes every remote writer before publishing view-only", async () => {
     const calls: Array<{ target: string; write: boolean }> = [];
     const remote = new Map<string, boolean>([

@@ -70,6 +70,25 @@ export type PublicHostGrant = {
   requested: "read" | "read-write";
 };
 
+export type ScreenState = "attaching" | "ready" | "unavailable" | "unassigned" | "cleanup-required";
+
+export type ScreenAttachmentStage = "reserve" | "prepare" | "readiness" | "commit" | "ownership";
+
+export type PublicScreenError = {
+  stage: ScreenAttachmentStage;
+  code:
+    | "SCREEN_ATTACHMENT_FAILED"
+    | "SCREEN_NOT_READY"
+    | "SCREEN_ASSIGNMENT_MISSING"
+    | "SCREEN_OWNERSHIP_FAILED";
+  message: string;
+};
+
+export type PublicScreenCleanupError = {
+  code: "SCREEN_CLEANUP_FAILED";
+  message: string;
+};
+
 export type PublicPermission = {
   title: string;
   description?: string;
@@ -87,10 +106,25 @@ export type PublicBot = {
   zoom: boolean;
   computerOwnership: KasmWriteAuthority;
   display: number | null;
+  screenState: ScreenState;
+  screenAttempt: string;
+  screenError: PublicScreenError | null;
+  screenCleanupError: PublicScreenCleanupError | null;
   permission: PublicPermission | null;
   needsYou: { reason: "login"; hint: string } | null;
   messages?: PublicMessage[];
 };
+
+export type BotScreenRuntimeState = Pick<
+  PublicBot,
+  | "id"
+  | "computerOwnership"
+  | "display"
+  | "screenState"
+  | "screenAttempt"
+  | "screenError"
+  | "screenCleanupError"
+>;
 
 export type PublicChannelMember = ChannelMember & {
   name: string;
@@ -129,6 +163,11 @@ type Bot = {
   zoom: boolean;
   computerOwnership: KasmWriteAuthority;
   display: DisplayHandle | null;
+  assignedDisplay: number | null;
+  screenState: ScreenState;
+  screenAttempt: string;
+  screenError: PublicScreenError | null;
+  screenCleanupError: PublicScreenCleanupError | null;
   eyesMode: EyesMode;
   needsYou: { reason: "login"; hint: string } | null;
   permission: BotPermission | null;
@@ -144,6 +183,16 @@ export type BotStoreDeps = {
   spawnAcp?: (spec: SpawnSpec, cwd: string, handlers?: AcpHandlers) => AcpSession;
   listHarnesses?: () => HarnessInfo[];
   workspaceDir?: string;
+};
+
+const STALE_SCREEN_ATTACHMENT = Symbol("stale Screen attachment");
+
+type ScreenRegistration = (botId: string) => Promise<KasmWriteAuthority> | KasmWriteAuthority;
+type ScreenReleaseRegistration = (botId: string) => void;
+
+type ScreenAttachmentAttempt = {
+  id: string;
+  promise: Promise<void>;
 };
 
 function publicPermission(p: BotPermission | null): PublicPermission | null {
@@ -165,6 +214,12 @@ export class BotStore {
   private readonly spawnEnvs = new Map<string, NodeJS.ProcessEnv>();
   private readonly spawnCwds = new Map<string, string>();
   private readonly spawnSpecs = new Map<string, SpawnSpec>();
+  private screenAttachmentsClosing = false;
+  private provisioningRecoveryComplete = false;
+  private persistedAttachmentRecoveryStarted = false;
+  private readonly screenAttachmentFlights = new Set<Promise<void>>();
+  private readonly screenAttachmentByBot = new Map<string, ScreenAttachmentAttempt>();
+  private screenAttachmentShutdown: Promise<void> | null = null;
 
   constructor(homeDir: string, deps: BotStoreDeps = {}) {
     this.home = new HomeStore(homeDir);
@@ -185,6 +240,10 @@ export class BotStore {
   }
 
   close(): void {
+    this.beginScreenAttachmentShutdown();
+    if (this.screenAttachmentFlights.size > 0) {
+      throw new Error("Screen attachments are still settling; await stopScreenAttachments before closing BotStore");
+    }
     for (const bot of this.bots.values()) {
       bot.client?.close();
       bot.client = null;
@@ -192,25 +251,240 @@ export class BotStore {
     this.home.close();
   }
 
-  async reattachDisplays(): Promise<void> {
-    await this.recoverBotProvisionings();
-    for (const bot of this.bots.values()) {
-      const persistedDisplay = this.home.botDisplay(bot.id);
-      if (persistedDisplay === undefined) throw new Error("Bot display state is missing");
-      this.computer.reserve(bot.id, persistedDisplay);
-      try {
-        await this.computer.prepare(bot.id);
-        // Persisted Bots are already published. Screen readiness remains observable without blocking Talk startup.
-        bot.display = this.computer.commit(bot.id);
-      } catch (error) {
-        await this.computer.release(bot.id);
-        throw error;
+  stopScreenAttachments(): Promise<void> {
+    this.beginScreenAttachmentShutdown();
+    if (this.screenAttachmentShutdown) return this.screenAttachmentShutdown;
+    const flights = [...this.screenAttachmentFlights];
+    this.screenAttachmentShutdown = Promise.allSettled(flights).then((results) => {
+      const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw Object.assign(new AggregateError(failures, "Screen attachment shutdown cleanup failed."), {
+          status: 503,
+        });
       }
-    }
+    });
+    return this.screenAttachmentShutdown;
   }
 
-  private async recoverBotProvisionings(): Promise<void> {
+  async reattachDisplays(
+    onReady: ScreenRegistration = () => "view-only",
+    onReleased: ScreenReleaseRegistration = () => undefined,
+  ): Promise<void> {
+    if (this.screenAttachmentsClosing) return;
+    if (!this.provisioningRecoveryComplete) await this.recoverBotProvisionings();
+    if (this.screenAttachmentsClosing) return;
+    if (this.persistedAttachmentRecoveryStarted) {
+      await Promise.all([...this.screenAttachmentByBot.values()].map((attempt) => attempt.promise));
+      return;
+    }
+    this.persistedAttachmentRecoveryStarted = true;
+    const attachments: Promise<void>[] = [];
+    for (const bot of this.bots.values()) {
+      const persistedDisplay = this.home.botDisplay(bot.id);
+      bot.assignedDisplay = persistedDisplay ?? null;
+      bot.computerOwnership = "unknown";
+      if (persistedDisplay === undefined) {
+        bot.screenAttempt = crypto.randomUUID();
+        bot.screenState = "unavailable";
+        bot.screenError = missingScreenAssignmentError();
+        bot.screenCleanupError = null;
+        continue;
+      }
+      if (persistedDisplay === null) {
+        bot.screenAttempt = crypto.randomUUID();
+        bot.screenState = "unassigned";
+        bot.screenError = null;
+        bot.screenCleanupError = null;
+        continue;
+      }
+      attachments.push(this.startScreenAttachment(bot, persistedDisplay, onReady, onReleased));
+    }
+    await Promise.all(attachments);
+  }
+
+  retryScreen(
+    id: string,
+    expectedAttempt: string,
+    onReady: ScreenRegistration = () => "view-only",
+    onReleased: ScreenReleaseRegistration = () => undefined,
+  ): PublicBot {
+    if (this.screenAttachmentsClosing) {
+      throw Object.assign(new Error("Screen recovery is shutting down."), {
+        status: 503,
+        code: "SCREEN_RECOVERY_SHUTTING_DOWN",
+      });
+    }
+    const bot = this.require(id);
+    if (bot.screenAttempt !== expectedAttempt) throw staleScreenAttemptError();
+    if (this.screenAttachmentByBot.has(id) || bot.screenState === "attaching") {
+      throw Object.assign(new Error("Screen attachment is already in progress."), {
+        status: 409,
+        code: "SCREEN_ATTACHMENT_IN_PROGRESS",
+      });
+    }
+    if (bot.screenState === "cleanup-required") {
+      throw Object.assign(new Error("Screen cleanup is required before retry."), {
+        status: 409,
+        code: "SCREEN_CLEANUP_REQUIRED",
+      });
+    }
+    if (bot.screenState === "ready") {
+      throw Object.assign(new Error("Screen is already ready."), {
+        status: 409,
+        code: "SCREEN_ALREADY_READY",
+      });
+    }
+    const persistedDisplay = this.home.botDisplay(id);
+    if (persistedDisplay === undefined) {
+      throw Object.assign(new Error("Screen display assignment is missing."), {
+        status: 409,
+        code: "SCREEN_ASSIGNMENT_MISSING",
+      });
+    }
+    const attachment = this.startScreenAttachment(bot, persistedDisplay, onReady, onReleased);
+    void attachment.catch(() => undefined);
+    return this.toPublic(bot, false);
+  }
+
+  private startScreenAttachment(
+    bot: Bot,
+    persistedDisplay: number | null,
+    onReady: ScreenRegistration,
+    onReleased: ScreenReleaseRegistration,
+  ): Promise<void> {
+    const active = this.screenAttachmentByBot.get(bot.id);
+    if (active) return active.promise;
+    const attemptId = crypto.randomUUID();
+    bot.screenAttempt = attemptId;
+    bot.screenState = "attaching";
+    bot.computerOwnership = "unknown";
+    bot.screenError = null;
+    bot.screenCleanupError = null;
+    const attempt: ScreenAttachmentAttempt = { id: attemptId, promise: Promise.resolve() };
+    this.screenAttachmentByBot.set(bot.id, attempt);
+    const task = Promise.resolve().then(() => (
+      this.attachPersistedDisplay(bot, persistedDisplay, attemptId, onReady, onReleased)
+    ));
+    let tracked!: Promise<void>;
+    tracked = task.finally(() => {
+      this.screenAttachmentFlights.delete(tracked);
+      if (this.screenAttachmentByBot.get(bot.id)?.id === attemptId) {
+        this.screenAttachmentByBot.delete(bot.id);
+      }
+    });
+    attempt.promise = tracked;
+    this.screenAttachmentFlights.add(tracked);
+    return tracked;
+  }
+
+  private async attachPersistedDisplay(
+    bot: Bot,
+    persistedDisplay: number | null,
+    attemptId: string,
+    onReady: ScreenRegistration,
+    onReleased: ScreenReleaseRegistration,
+  ): Promise<void> {
+    let reserved = false;
+    let stage: ScreenAttachmentStage = "reserve";
+    let failure: unknown = null;
+    try {
+      let reservation: DisplayHandle | undefined;
+      if (persistedDisplay === null) {
+        for (const candidate of this.home.availableBotDisplays()) {
+          try {
+            reservation = this.computer.reserve(bot.id, candidate);
+            reserved = true;
+            this.home.claimBotDisplay(bot.id, candidate);
+            bot.assignedDisplay = candidate;
+            break;
+          } catch (error) {
+            if (!reserved && (error as { status?: unknown })?.status === 409) continue;
+            throw error;
+          }
+        }
+        if (!reservation) throw new Error("No Screen display is available");
+      } else {
+        reservation = this.computer.reserve(bot.id, persistedDisplay);
+        reserved = true;
+      }
+      stage = "prepare";
+      await this.computer.prepare(bot.id);
+      if (!this.screenAttachmentIsCurrent(bot, attemptId)) throw STALE_SCREEN_ATTACHMENT;
+      stage = "readiness";
+      if (this.computer.requiresReadiness && !(await this.screenReadyFn(reservation.upstream))) {
+        throw new Error("Screen application is not ready");
+      }
+      if (!this.screenAttachmentIsCurrent(bot, attemptId)) throw STALE_SCREEN_ATTACHMENT;
+      stage = "commit";
+      const display = this.computer.commit(bot.id);
+      if (display.display !== bot.assignedDisplay) {
+        throw new Error("Screen committed a different display than the durable Bot assignment");
+      }
+      bot.display = display;
+      bot.computerOwnership = "unknown";
+      stage = "ownership";
+      const ownership = await onReady(bot.id);
+      if (ownership !== "view-only") {
+        throw new Error("Screen ownership registration was not confirmed view-only");
+      }
+      if (!this.screenAttachmentIsCurrent(bot, attemptId)) throw STALE_SCREEN_ATTACHMENT;
+      bot.computerOwnership = "view-only";
+      bot.screenState = "ready";
+      bot.screenError = null;
+      bot.screenCleanupError = null;
+      return;
+    } catch (error) {
+      failure = error;
+    }
+
+    let cleanupFailed = false;
+    if (reserved) {
+      try {
+        await this.computer.release(bot.id);
+        onReleased(bot.id);
+      } catch {
+        cleanupFailed = true;
+      }
+    }
+    if (failure === STALE_SCREEN_ATTACHMENT || !this.screenAttachmentIsCurrent(bot, attemptId)) {
+      if (cleanupFailed) {
+        throw Object.assign(new Error("Screen cleanup did not complete during shutdown."), { status: 503 });
+      }
+      return;
+    }
+    bot.display = null;
+    bot.screenState = cleanupFailed ? "cleanup-required" : bot.assignedDisplay === null ? "unassigned" : "unavailable";
+    bot.screenError = bot.assignedDisplay === null ? missingScreenAssignmentError() : screenAttachmentError(stage);
+    bot.screenCleanupError = cleanupFailed ? screenCleanupError() : null;
+  }
+
+  private screenAttachmentIsCurrent(bot: Bot, attemptId: string): boolean {
+    return !this.screenAttachmentsClosing
+      && bot.screenAttempt === attemptId
+      && this.screenAttachmentByBot.get(bot.id)?.id === attemptId;
+  }
+
+  private beginScreenAttachmentShutdown(): void {
+    if (this.screenAttachmentsClosing) return;
+    this.screenAttachmentsClosing = true;
+  }
+
+  async recoverBotProvisionings(): Promise<void> {
+    if (this.provisioningRecoveryComplete) return;
     for (const provisioning of this.home.listBotProvisionings()) {
+      if (provisioning.display !== null) {
+        const owner = this.home.botIdForDisplay(provisioning.display);
+        if (owner && owner !== provisioning.botId) {
+          const detail = `display ${provisioning.display} is durably owned by published Bot ${owner}; no cleanup was attempted`;
+          this.home.markBotProvisioningCleanupRequired(provisioning.botId, detail);
+          throw botProvisioningCleanupRequiredError(
+            provisioning.botId,
+            new Error("Interrupted Bot provisioning requires recovery"),
+            detail,
+          );
+        }
+      }
       await this.compensateBotProvisioning({
         botId: provisioning.botId,
         display: provisioning.display,
@@ -220,6 +494,7 @@ export class BotStore {
         cause: new Error("Interrupted Bot provisioning requires recovery"),
       });
     }
+    this.provisioningRecoveryComplete = true;
   }
 
   private async compensateBotProvisioning(input: {
@@ -294,6 +569,27 @@ export class BotStore {
   get(id: string): PublicBot | null {
     const bot = this.bots.get(id);
     return bot ? this.toPublic(bot, true) : null;
+  }
+
+  screenRuntime(id: string): BotScreenRuntimeState | null {
+    const bot = this.bots.get(id);
+    if (!bot) return null;
+    return {
+      id: bot.id,
+      computerOwnership: bot.computerOwnership,
+      display: bot.assignedDisplay,
+      screenState: bot.screenState,
+      screenAttempt: bot.screenAttempt,
+      screenError: bot.screenError,
+      screenCleanupError: bot.screenCleanupError,
+    };
+  }
+
+  listScreenRuntimes(): BotScreenRuntimeState[] {
+    return [...this.bots.keys()].flatMap((id) => {
+      const screen = this.screenRuntime(id);
+      return screen ? [screen] : [];
+    });
   }
 
   messages(id: string): {
@@ -379,9 +675,12 @@ export class BotStore {
     let display: DisplayHandle;
     let reservedDisplay: number | null = null;
     try {
-      const reservation = this.computer.reserve(id);
+      const claimedDisplay = this.home.claimBotProvisioningDisplay(id);
+      const reservation = this.computer.reserve(id, claimedDisplay);
       reservedDisplay = reservation.display;
-      this.home.setBotProvisioningDisplay(id, reservation.display);
+      if (reservedDisplay !== claimedDisplay) {
+        throw new Error("Screen display reservation did not match the durable provisioning claim");
+      }
       await this.computer.prepare(id);
       if (this.computer.requiresReadiness && !(await this.screenReadyFn(reservation.upstream))) {
         throw Object.assign(new Error("Screen application is not ready"), {
@@ -415,6 +714,15 @@ export class BotStore {
   }
 
   setComputerOwnership(id: string, authority: KasmWriteAuthority): PublicBot {
+    const bot = this.updateComputerOwnership(id, authority);
+    return this.toPublic(bot, true);
+  }
+
+  publishComputerOwnership(id: string, authority: KasmWriteAuthority): void {
+    this.updateComputerOwnership(id, authority);
+  }
+
+  private updateComputerOwnership(id: string, authority: KasmWriteAuthority): Bot {
     const bot = this.require(id);
     if (authority === "write" && this.zoomedId && this.zoomedId !== id) {
       const previous = this.require(this.zoomedId);
@@ -427,7 +735,7 @@ export class BotStore {
     if (authority === "write") this.zoomedId = id;
     else if (this.zoomedId === id) this.zoomedId = null;
     this.restoreEyes(bot);
-    return this.toPublic(bot, true);
+    return bot;
   }
 
   private restoreEyes(bot: Bot): void {
@@ -641,11 +949,16 @@ export class BotStore {
   private load(storedBots: StoredBot[]): void {
     for (const stored of storedBots) {
       ensureBotWorkspace(this.workspaceDir, stored.id);
-      this.bots.set(stored.id, this.runtimeBot(stored, null));
+      const assignedDisplay = this.home.botDisplay(stored.id) ?? null;
+      this.bots.set(stored.id, this.runtimeBot(stored, null, assignedDisplay));
     }
   }
 
-  private runtimeBot(stored: StoredBot, display: DisplayHandle | null): Bot {
+  private runtimeBot(
+    stored: StoredBot,
+    display: DisplayHandle | null,
+    assignedDisplay = display?.display ?? null,
+  ): Bot {
     return {
       id: stored.id,
       name: stored.name,
@@ -655,8 +968,13 @@ export class BotStore {
       configMode: stored.configMode ?? "isolated",
       write: false,
       zoom: false,
-      computerOwnership: "view-only",
+      computerOwnership: display ? "view-only" : "unknown",
       display,
+      assignedDisplay,
+      screenState: display ? "ready" : assignedDisplay === null ? "unassigned" : "unavailable",
+      screenAttempt: crypto.randomUUID(),
+      screenError: null,
+      screenCleanupError: null,
       eyesMode: "idle",
       needsYou: null,
       permission: null,
@@ -954,7 +1272,11 @@ export class BotStore {
       write: bot.write,
       zoom: bot.zoom,
       computerOwnership: bot.computerOwnership,
-      display: bot.display?.display ?? null,
+      display: bot.assignedDisplay,
+      screenState: bot.screenState,
+      screenAttempt: bot.screenAttempt,
+      screenError: bot.screenError,
+      screenCleanupError: bot.screenCleanupError,
       permission: publicPermission(bot.permission),
       needsYou: bot.needsYou,
     };
@@ -987,6 +1309,50 @@ function botWorkspaceCleanupRequiredError(
 
 function errorDetail(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function missingScreenAssignmentError(): PublicScreenError {
+  return {
+    stage: "reserve",
+    code: "SCREEN_ASSIGNMENT_MISSING",
+    message: "Screen display assignment is missing.",
+  };
+}
+
+function screenAttachmentError(stage: ScreenAttachmentStage): PublicScreenError {
+  if (stage === "readiness") {
+    return {
+      stage,
+      code: "SCREEN_NOT_READY",
+      message: "Screen application did not become ready.",
+    };
+  }
+  if (stage === "ownership") {
+    return {
+      stage,
+      code: "SCREEN_OWNERSHIP_FAILED",
+      message: "Screen ownership registration failed.",
+    };
+  }
+  return {
+    stage,
+    code: "SCREEN_ATTACHMENT_FAILED",
+    message: `Screen attachment failed during ${stage}.`,
+  };
+}
+
+function screenCleanupError(): PublicScreenCleanupError {
+  return {
+    code: "SCREEN_CLEANUP_FAILED",
+    message: "Screen cleanup did not complete.",
+  };
+}
+
+function staleScreenAttemptError(): Error {
+  return Object.assign(new Error("Screen changed. Refresh and retry Screen."), {
+    status: 409,
+    code: "STALE_SCREEN_ATTEMPT",
+  });
 }
 
 function botProvisioningCleanupRequiredError(botId: string, cause: unknown, cleanup: string): Error {

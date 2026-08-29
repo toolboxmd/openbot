@@ -21,19 +21,19 @@ The human-facing messages, Cards, receipts, replies, reactions, and attachments 
 One live Harness conversation for one Bot in one Channel. A Bot may run several Sessions at once. ACP `cwd` is that Bot's directory under Workspace.
 
 ## Computer
-One Linux desktop per instance (one Docker Screen container). Shared Workspace and browser cookie jar. Not a security boundary per Bot. Harness CLI logins live on the host OS, not inside Screen. The Computer pane is always a live desktop. It is never a down / "Screen is down" gate.
+One Linux desktop per instance (one Docker Screen container). Shared Workspace and browser cookie jar. Not a security boundary per Bot. Harness CLI logins live on the host OS, not inside Screen. Normal and idle attached Screens stay live; the pane is never an idle down / "Screen is down" gate. A bounded attachment failure or legacy display-capacity overflow instead exposes that Bot's truthful unavailable or unassigned Screen state, without an iframe or fallback to another Bot, while Chat remains available.
 
 ## Bot
-A named teammate with a profile (name, title, description, Eyes, Harness, Isolated or Host) and its own Screen (a display on the Computer). Persistent.
+A named teammate with a profile (name, title, description, Eyes, Harness, Isolated or Host) and its own Screen attachment on the Computer. Persistent even while that attachment is unavailable or unassigned.
 
 ## Screen
-Private XFCE display for one Bot, as an extra Kasm session inside the one Computer container. Other Bots cannot see its windows. Watch via KasmVNC. Zooming the Computer preview is write (2FA lives there). Not a second Debian.
+Private XFCE display assigned to one Bot, as an extra Kasm session inside the one Computer container. Other Bots cannot see its windows. Watch via KasmVNC. Zooming the Computer preview is write (2FA lives there). Not a second Debian. A bounded attachment failure may make the assigned Screen unavailable, and a migrated legacy Bot beyond display capacity may be unassigned; neither state may show another Bot's Screen.
 
 ## Active Bot
 A Bot the user is talking to. RAM and CPU count per Computer plus per lit display, not per extra container.
 
 ## Sleep
-Not a user-visible down pane. Do not docker-stop the Computer. Displays stay lit. The Computer stays up.
+Not a user-visible down pane. Do not docker-stop the Computer. Attached displays stay lit. The Computer stays up.
 
 ## Harness
 The coding agent CLI already on the host OS (Codex, Claude Code, Grok Build, or Kimi Code) over ACP. The picker shows what is on PATH. The process runs beside Screen, not inside XFCE. The user does not watch its terminal. Session cwd is that Bot's directory under Workspace. Vendor login is reused from the host CLI (auth file or keychain symlink only). Config mode is Isolated or Host. Zoom (not a Takeover button) is for site 2FA. Zoom does not pause Sessions. Ask the Bot to stop if two pointers fight.
