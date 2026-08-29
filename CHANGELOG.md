@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.15.2] - 2026-08-29
+
+### Changed
+
+- Give the phone Chat composer full touch targets
+
 ## [0.15.1] - 2026-08-29
 
 ### Changed

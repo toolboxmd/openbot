@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   buildFlatTranscriptRows,
+  PHONE_COMPOSER_INPUT_CLASS,
+  PHONE_COMPOSER_SEND_CLASS,
   isNearTranscriptBottom,
   isPrimaryLongPressPointer,
   LONG_PRESS_DELAY_MS,
@@ -257,5 +259,14 @@ describe("flat Chat interactions", () => {
   test("phone action controls use the shared minimum touch target", () => {
     assert.match(PHONE_ACTION_TARGET_CLASS, /min-h-\[var\(--touch-min\)\]/);
     assert.match(PHONE_ACTION_TARGET_CLASS, /min-w-\[var\(--touch-min\)\]/);
+  });
+
+  test("phone composer targets use the touch minimum without widening desktop controls", () => {
+    assert.match(PHONE_COMPOSER_INPUT_CLASS, /max-\[47\.999rem\]:min-h-\[var\(--touch-min\)\]/);
+    assert.match(PHONE_COMPOSER_SEND_CLASS, /max-\[47\.999rem\]:min-h-\[var\(--touch-min\)\]/);
+    assert.match(PHONE_COMPOSER_SEND_CLASS, /max-\[47\.999rem\]:min-w-\[var\(--touch-min\)\]/);
+    assert.match(PHONE_COMPOSER_SEND_CLASS, /shrink-0/);
+    assert.doesNotMatch(PHONE_COMPOSER_INPUT_CLASS, /(^|\s)min-h-\[var\(--touch-min\)\](\s|$)/);
+    assert.doesNotMatch(PHONE_COMPOSER_SEND_CLASS, /(^|\s)min-[hw]-\[var\(--touch-min\)\](\s|$)/);
   });
 });

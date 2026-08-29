@@ -149,6 +149,8 @@ import {
   LONG_PRESS_DELAY_MS,
   observeTranscriptViewport,
   PHONE_ACTION_TARGET_CLASS,
+  PHONE_COMPOSER_INPUT_CLASS,
+  PHONE_COMPOSER_SEND_CLASS,
   remountedTranscriptScrollTop,
   subscribeTranscriptBreakpoint,
   TRANSCRIPT_DESKTOP_QUERY,
@@ -2696,7 +2698,7 @@ export function Messenger() {
                           : "Message a Bot…"
               }
               disabled={!composerSendEnabled(composerKind)}
-              className="min-h-10 resize-none"
+              className={cn("min-h-10 resize-none", PHONE_COMPOSER_INPUT_CLASS)}
             />
             {composerSendEnabled(composerKind) ? (
             <Tooltip>
@@ -2714,7 +2716,7 @@ export function Messenger() {
                     })
                   }
                   aria-label="Send"
-                  className="shrink-0"
+                  className={PHONE_COMPOSER_SEND_CLASS}
                 >
                   <ArrowUp />
                 </Button>

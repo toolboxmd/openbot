@@ -42,6 +42,8 @@ export const TRANSCRIPT_BOTTOM_TOLERANCE_PX = 80;
 export const TRANSCRIPT_DESKTOP_QUERY = "(min-width: 48rem)";
 export const PHONE_ACTION_TARGET_CLASS =
   "max-[47.999rem]:min-h-[var(--touch-min)] max-[47.999rem]:min-w-[var(--touch-min)]";
+export const PHONE_COMPOSER_INPUT_CLASS = "max-[47.999rem]:min-h-[var(--touch-min)]";
+export const PHONE_COMPOSER_SEND_CLASS = `shrink-0 ${PHONE_ACTION_TARGET_CLASS}`;
 
 export function buildFlatTranscriptRows<T extends FlatTranscriptMessage>(
   messages: T[],
