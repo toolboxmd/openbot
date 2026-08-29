@@ -1055,6 +1055,22 @@ function probeInstructionEditors() {
     const compact = InstructionEditors(props);
     const compactTextareas = collect(compact, (node) =>
       node.props.id === "all-bots-instructions" || node.props.id === "this-bot-instructions");
+    const compactEditorCards = collect(compact, (node) => {
+      if (node.type !== "div" || typeof node.props.className !== "string") return false;
+      return node.props.className.includes("rounded-[var(--radius-card)]")
+        && collect(node, (child) =>
+          child.props.id === "all-bots-instructions" || child.props.id === "this-bot-instructions").length === 1;
+    });
+    const compactEditorHeaders = collect(compact, (node) => {
+      if (node.type !== "div" || typeof node.props.className !== "string") return false;
+      return node.props.className.includes("items-start")
+        && collect(node, (child) =>
+          typeof child.props["aria-label"] === "string"
+          && child.props["aria-label"].startsWith("Expand ")).length === 1;
+    });
+    function renderedTextareaClass(textarea) {
+      return textarea.type(textarea.props).props.className ?? "";
+    }
     for (const textarea of compactTextareas) textarea.props.onChange({ target: { value: "edited" } });
     const expandButtons = collect(compact, (node) =>
       typeof node.props["aria-label"] === "string" && node.props["aria-label"].startsWith("Expand "));
@@ -1095,16 +1111,26 @@ function probeInstructionEditors() {
     });
     process.stdout.write(JSON.stringify({
       compactMarkup: render(compact),
+      compactEditorClasses: compactEditorCards.map((card) => card.props.className ?? ""),
+      compactHeaderClasses: compactEditorHeaders.map((header) => header.props.className ?? ""),
+      compactTextareaClasses: compactTextareas.map(renderedTextareaClass),
       expandedMarkup: render(expanded),
       expandedValue: expandedEditor.props.value,
+      expandedEditorClass: renderedTextareaClass(expandedEditor),
+      expandedContentClass: expandedContent.props.className ?? "",
       failedMarkup: render(failed),
       loadingMarkup: render(loading),
       actions,
     }));
   `)) as {
     compactMarkup: string;
+    compactEditorClasses: string[];
+    compactHeaderClasses: string[];
+    compactTextareaClasses: string[];
     expandedMarkup: string;
     expandedValue: string;
+    expandedEditorClass: string;
+    expandedContentClass: string;
     failedMarkup: string;
     loadingMarkup: string;
     actions: Array<[string, string? , string?]>;
@@ -1113,6 +1139,37 @@ function probeInstructionEditors() {
 
 function surfaceTag(markup: string, testId: string): string | null {
   return markup.match(new RegExp(`<(?:aside|main)[^>]*data-testid="${testId}"[^>]*>`))?.[0] ?? null;
+}
+
+function renderedClass(markup: string, attribute: string, value: string): string {
+  const tag = markup.match(new RegExp(`<[^>]+${attribute}="${value}"[^>]*>`, "u"))?.[0];
+  assert.ok(tag, `missing rendered ${attribute}=${value}`);
+  const className = tag.match(/\bclass="([^"]*)"/u)?.[1];
+  assert.ok(className, `missing rendered class for ${attribute}=${value}`);
+  return className;
+}
+
+function hasUtility(className: string, utility: string): boolean {
+  return className.split(/\s+/u).includes(utility);
+}
+
+function renderedGridTrackWidth({
+  available,
+  intrinsic,
+  owners,
+  leaf,
+}: {
+  available: number;
+  intrinsic: number;
+  owners: string[];
+  leaf: string;
+}): number {
+  const automaticMinimum = owners.every((className) => hasUtility(className, "min-w-0"))
+    ? 0
+    : intrinsic;
+  const preferred = hasUtility(leaf, "w-full") ? available : intrinsic;
+  const maximum = hasUtility(leaf, "max-w-full") ? available : Number.POSITIVE_INFINITY;
+  return Math.max(automaticMinimum, Math.min(preferred, maximum));
 }
 
 describe("selected Bot panel", () => {
@@ -1178,6 +1235,39 @@ describe("selected Bot panel", () => {
 
     assert.equal(probe.feedback.whileComputerOpen, 0);
     assert.equal(probe.feedback.afterPanelReturn, 1);
+  });
+
+  test("keeps compact and expanded Instructions tracks inside the selected-Bot surface", () => {
+    const panel = renderPanel();
+    const instructions = probeInstructionEditors();
+    const scrollOwner = renderedClass(panel, "data-testid", "selected-bot-panel-scroll");
+    const sectionOwner = renderedClass(panel, "id", "bot-settings-instructions");
+    const intrinsicTextareaWidth = 482;
+
+    assert.equal(instructions.compactEditorClasses.length, 2);
+    assert.equal(instructions.compactHeaderClasses.length, 2);
+    assert.equal(instructions.compactTextareaClasses.length, 2);
+    for (let index = 0; index < instructions.compactTextareaClasses.length; index += 1) {
+      assert.equal(
+        hasUtility(instructions.compactHeaderClasses[index]!, "min-w-0"),
+        true,
+        "the path and expand-button row must yield its automatic grid minimum inside the 273px panel track",
+      );
+      const leaf = instructions.compactTextareaClasses[index]!;
+      assert.equal(renderedGridTrackWidth({
+        available: 273,
+        intrinsic: intrinsicTextareaWidth,
+        owners: [scrollOwner, sectionOwner, instructions.compactEditorClasses[index]!, leaf],
+        leaf,
+      }), 273, "the live 482px compact track must shrink to the 273px panel content width");
+    }
+
+    assert.equal(renderedGridTrackWidth({
+      available: 350,
+      intrinsic: intrinsicTextareaWidth,
+      owners: [instructions.expandedContentClass, instructions.expandedEditorClass],
+      leaf: instructions.expandedEditorClass,
+    }), 350, "the expanded editor must shrink inside the 390px phone dialog padding");
   });
 
   test("uses one icon-only Chat-header control with working open and close actions", () => {

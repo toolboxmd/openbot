@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.15.1] - 2026-08-29
+
+### Changed
+
+- Keep selected-Bot Instructions within the rendered panel
+
 ## [0.15.0] - 2026-08-29
 
 ### Added
