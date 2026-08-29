@@ -79,7 +79,7 @@ function SettingsSection({
 }) {
   const headingId = `bot-settings-${id}-heading`;
   return (
-    <section id={`bot-settings-${id}`} aria-labelledby={headingId} className="grid scroll-mt-4 gap-4">
+    <section id={`bot-settings-${id}`} aria-labelledby={headingId} className="grid min-w-0 scroll-mt-4 gap-4">
       <div className="grid gap-1">
         <h3 id={headingId} className="text-sm font-semibold">
           {title}
@@ -212,8 +212,8 @@ export function InstructionEditors({
     const saving = savingScope === scope;
     const changed = draft !== instructions.saved[scope];
     return (
-      <div key={scope} className="grid gap-3 rounded-[var(--radius-card)] border bg-background p-3">
-        <div className="flex items-start justify-between gap-2">
+      <div key={scope} className="grid min-w-0 gap-3 rounded-[var(--radius-card)] border bg-background p-3">
+        <div className="flex min-w-0 items-start justify-between gap-2">
           <div className="min-w-0">
             <Label htmlFor={details.compactId}>{details.label}</Label>
             <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{details.path}</p>
@@ -241,7 +241,7 @@ export function InstructionEditors({
           value={draft}
           disabled={busy}
           onChange={(event) => onDraftChange(scope, event.target.value)}
-          className="min-h-20 font-mono text-xs"
+          className="min-h-20 min-w-0 max-w-full font-mono text-xs"
         />
         <Button
           type="button"
@@ -280,7 +280,7 @@ export function InstructionEditors({
                 event.preventDefault();
                 target.focus();
               }}
-              className="min-[48rem]:max-w-3xl"
+              className="min-w-0 min-[48rem]:max-w-3xl"
             >
               <DialogHeader>
                 <DialogTitle>{`${details.label} instructions`}</DialogTitle>
@@ -294,7 +294,7 @@ export function InstructionEditors({
                 value={instructions.drafts[scope]}
                 disabled={busy}
                 onChange={(event) => onDraftChange(scope, event.target.value)}
-                className="min-h-[min(60dvh,28rem)] font-mono text-sm"
+                className="min-h-[min(60dvh,28rem)] min-w-0 max-w-full font-mono text-sm"
               />
               <Button
                 type="button"
@@ -551,7 +551,7 @@ export function BotSettings({
         <div
           ref={scrollViewportRef}
           data-testid="selected-bot-panel-scroll"
-          className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4"
+          className="min-h-0 min-w-0 flex-1 space-y-5 overflow-y-auto p-4"
         >
           <section aria-labelledby="computer-preview-heading" className="grid gap-2">
             <div className="flex items-center justify-between gap-2">
