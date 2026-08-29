@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { AcpClient } from "../src/acp.ts";
+import { AcpClient, type PermissionPrompt } from "../src/acp.ts";
 
 const NULL_ACP = String.raw`
 const readline = require("node:readline");
@@ -427,8 +427,31 @@ const permission = (id = 700) => ({
   method: "session/request_permission",
   params: {
     sessionId: "request-id-session",
-    title: "Approve the active request",
+    toolCall: {
+      toolCallId: "pinchtab-call-1",
+      title: "Approve the active request"
+    },
     options: [{ optionId: "allow-once", name: "Allow", kind: "allow_once" }]
+  }
+});
+const pinchtabToolCall = (server = "pinchtab", tool = "pinchtab_navigate") => ({
+  jsonrpc: "2.0",
+  method: "session/update",
+  params: {
+    sessionId: "request-id-session",
+    update: {
+      sessionUpdate: "tool_call",
+      toolCallId: "pinchtab-call-1",
+      kind: "execute",
+      title: "mcp.pinchtab.pinchtab_navigate",
+      status: "in_progress",
+      rawInput: {
+        server,
+        tool,
+        arguments: { url: "https://example.com" }
+      },
+      _meta: { is_mcp_tool_call: true }
+    }
   }
 });
 const elicitation = (
@@ -474,7 +497,7 @@ input.on("line", (line) => {
   if (message.method === "session/prompt") {
     promptId = message.id;
     if (mode === "duplicate-permission") {
-      sendBatch([permission(), permission()]);
+      sendBatch([pinchtabToolCall(), permission(), permission()]);
       return;
     }
     if (mode === "duplicate-elicitation") {
@@ -486,25 +509,39 @@ input.on("line", (line) => {
       return;
     }
     if (mode === "permission-then-elicitation") {
-      sendBatch([permission(), elicitation()]);
+      sendBatch([pinchtabToolCall(), permission(), elicitation()]);
       return;
     }
     if (mode === "elicitation-then-permission") {
-      sendBatch([elicitation(), permission()]);
+      sendBatch([pinchtabToolCall(), elicitation(), permission()]);
       return;
     }
     if (mode === "permission-then-terminal") {
       sendBatch([
+        pinchtabToolCall(),
         permission(),
         { jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } }
       ]);
       return;
     }
-    if (mode === "permission-reuse") send(permission());
+    if (mode === "permission-title-only") {
+      send(permission());
+      return;
+    }
+    if (mode === "permission-conflicting-tool-call") {
+      sendBatch([pinchtabToolCall(), pinchtabToolCall("other"), permission()]);
+      return;
+    }
+    if (mode === "permission-reuse") sendBatch([pinchtabToolCall(), permission()]);
     return;
   }
   if (
-    (mode === "permission-reuse" || mode === "duplicate-elicitation")
+    (
+      mode === "permission-reuse"
+      || mode === "permission-title-only"
+      || mode === "permission-conflicting-tool-call"
+      || mode === "duplicate-elicitation"
+    )
     && message.id === 700
     && message.result
   ) {
@@ -1071,6 +1108,8 @@ describe("AcpClient input validation", () => {
   test("releases a server request id only after its permission response is flushed", async () => {
     const waiters: Array<(rpcId: string | number) => void> = [];
     const queued: Array<string | number> = [];
+    const toolNames: Array<string | undefined> = [];
+    const serverNames: Array<string | undefined> = [];
     const nextPermission = () => {
       const rpcId = queued.shift();
       return rpcId === undefined
@@ -1083,6 +1122,8 @@ describe("AcpClient input validation", () => {
       env: { ...process.env },
     }, process.cwd(), {
       onPermission(prompt) {
+        toolNames.push(prompt.toolName);
+        serverNames.push((prompt as typeof prompt & { mcpServerName?: string }).mcpServerName);
         const waiter = waiters.shift();
         if (waiter) waiter(prompt.rpcId);
         else queued.push(prompt.rpcId);
@@ -1095,6 +1136,8 @@ describe("AcpClient input validation", () => {
       const firstEvent = nextPermission();
       const firstTurn = acp.prompt("first permission");
       const firstId = await firstEvent;
+      assert.deepEqual(serverNames, ["pinchtab"]);
+      assert.deepEqual(toolNames, ["pinchtab_navigate"]);
       await acp.respondPermission(firstId, "allow-once");
       assert.equal(await within(firstTurn), "");
 
@@ -1102,12 +1145,47 @@ describe("AcpClient input validation", () => {
       const secondTurn = acp.prompt("reuse permission id");
       const secondId = await secondEvent;
       assert.equal(secondId, firstId);
+      assert.deepEqual(toolNames, [
+        "pinchtab_navigate",
+        "pinchtab_navigate",
+      ]);
+      assert.deepEqual(serverNames, ["pinchtab", "pinchtab"]);
       await acp.respondPermission(secondId, "allow-once");
       assert.equal(await within(secondTurn), "");
     } finally {
       acp.close();
     }
   });
+
+  for (const mode of ["permission-title-only", "permission-conflicting-tool-call"]) {
+    test(`does not trust uncorrelated MCP identity in ${mode}`, async () => {
+      let permission!: PermissionPrompt;
+      let resolvePermission!: () => void;
+      const permissionSeen = within(new Promise<void>((resolve) => { resolvePermission = resolve; }));
+      const acp = new AcpClient({
+        command: process.execPath,
+        args: ["-e", ACTIVE_SERVER_REQUEST_ID_ACP, mode],
+        env: { ...process.env },
+      }, process.cwd(), {
+        onPermission(prompt) {
+          permission = prompt;
+          resolvePermission();
+        },
+      });
+      try {
+        await within(acp.initialize());
+        await within(acp.newSession(process.cwd()));
+        const turn = acp.prompt("reject uncorrelated MCP identity");
+        await permissionSeen;
+        assert.equal(permission.mcpServerName, undefined);
+        assert.equal(permission.toolName, undefined);
+        await acp.respondPermission(permission.rpcId, "allow-once");
+        assert.equal(await within(turn), "");
+      } finally {
+        acp.close();
+      }
+    });
+  }
 
   test("fails a prompt terminal response while its permission request is unresolved", async () => {
     let permissionId: string | number | undefined;

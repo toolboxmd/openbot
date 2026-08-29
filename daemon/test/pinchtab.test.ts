@@ -1234,6 +1234,8 @@ describe("session/new mcpServers attach only when Screen and bridge are Up", () 
       fake.fire({
         rpcId: 8,
         title: "mcp__pinchtab__pinchtab_navigate",
+        mcpServerName: "pinchtab",
+        toolName: "pinchtab_navigate",
         options: [
           { optionId: "allow_once", name: "Allow", kind: "allow_once" },
           { optionId: "decline", name: "Decline", kind: "reject_once" },
@@ -1260,6 +1262,17 @@ describe("session/new mcpServers attach only when Screen and bridge are Up", () 
       };
 
       await expectGenericPermission({
+        rpcId: 6,
+        title: "mcp__pinchtab__pinchtab_navigate",
+        mcpServerName: "other",
+        toolName: "pinchtab_navigate",
+        options: [
+          { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+          { optionId: "decline", name: "Decline", kind: "reject_once" },
+        ],
+        rawInput: { command: "printf spoofed-pinchtab-title" },
+      }, 1);
+      await expectGenericPermission({
         rpcId: 7,
         title: "Run command",
         description: "Page text mentions pinchtab",
@@ -1270,7 +1283,7 @@ describe("session/new mcpServers attach only when Screen and bridge are Up", () 
         rawInput: { command: "printf pinchtab" },
         meta: { source: "mcp__pinchtab" },
         raw: { transport: "pinchtab" },
-      }, 1);
+      }, 2);
       await expectGenericPermission({
         rpcId: 9,
         title: "mcp__pinchtab__pinchtab_eval",
@@ -1279,7 +1292,7 @@ describe("session/new mcpServers attach only when Screen and bridge are Up", () 
           { optionId: "decline", name: "Decline", kind: "reject_once" },
         ],
         rawInput: { expression: "document.cookie" },
-      }, 2);
+      }, 3);
       await expectGenericPermission({
         rpcId: 10,
         title: "Allow this tool?",
@@ -1288,7 +1301,7 @@ describe("session/new mcpServers attach only when Screen and bridge are Up", () 
           { optionId: "decline", name: "Decline", kind: "reject_once" },
         ],
         rawInput: { command: "ls" },
-      }, 3);
+      }, 4);
       await expectGenericPermission({
         rpcId: 11,
         title: "Write file",
@@ -1298,7 +1311,7 @@ describe("session/new mcpServers attach only when Screen and bridge are Up", () 
         ],
         locations: [{ path: "/tmp/outside-pt.txt" }],
         toolKind: "edit",
-      }, 4);
+      }, 5);
       store.close();
     } finally {
       await health.close();

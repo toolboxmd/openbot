@@ -366,6 +366,10 @@ type ActiveServerRequest = {
 export type PermissionPrompt = {
   rpcId: RpcId;
   title: string;
+  /** Adapter-correlated MCP server identity. Human-readable permission text is never authority. */
+  mcpServerName?: string;
+  /** Adapter-correlated MCP tool identity. Human-readable permission text is never authority. */
+  toolName?: string;
   description?: string;
   options: PermissionOption[];
   locations?: Array<{ path?: string }>;
@@ -484,6 +488,38 @@ function readMessageId(update: Record<string, unknown>): string | undefined {
   return typeof raw === "string" && raw.length > 0 ? raw : undefined;
 }
 
+type McpToolIdentity = {
+  generation: number;
+  serverName: string;
+  toolName: string;
+};
+
+function readMcpToolIdentity(
+  update: Record<string, unknown>,
+): Omit<McpToolIdentity, "generation"> & { toolCallId: string } | null {
+  const meta = update._meta;
+  const rawInput = update.rawInput;
+  const toolCallId = update.toolCallId;
+  if (
+    !isObjectRecord(meta)
+    || meta.is_mcp_tool_call !== true
+    || !isObjectRecord(rawInput)
+    || typeof toolCallId !== "string"
+    || toolCallId.length === 0
+    || typeof rawInput.server !== "string"
+    || rawInput.server.length === 0
+    || typeof rawInput.tool !== "string"
+    || rawInput.tool.length === 0
+  ) {
+    return null;
+  }
+  return {
+    toolCallId,
+    serverName: rawInput.server,
+    toolName: rawInput.tool,
+  };
+}
+
 function cancelledError(transportClosed = false): Error {
   return Object.assign(new Error("cancelled"), {
     code: "cancelled",
@@ -535,6 +571,7 @@ export class AcpClient {
   private sessionAttachment: SessionAttachment | null = null;
   private activeServerRequests = new Map<RpcId, ActiveServerRequest>();
   private pendingPermissions = new Map<RpcId, { generation: number; responding: boolean }>();
+  private activeMcpToolIdentities = new Map<string, McpToolIdentity | null>();
   private pendingComputerHelp = new Map<RpcId, {
     generation: number;
     prompt: ComputerHelpPrompt;
@@ -1028,6 +1065,7 @@ export class AcpClient {
     this.activeHandlers = null;
     this.handlers = {};
     this.pendingPermissions.clear();
+    this.activeMcpToolIdentities.clear();
     this.pendingComputerHelp.clear();
     this.activeServerRequests.clear();
     this.resetElicitationLifecycle();
@@ -1955,6 +1993,7 @@ export class AcpClient {
       const params = requestParams as {
         title?: string;
         toolCall?: {
+          toolCallId?: unknown;
           title?: string;
           kind?: string;
           locations?: Array<{ path?: string }>;
@@ -1969,9 +2008,17 @@ export class AcpClient {
         this.cancelPermission(rpcId);
         return;
       }
+      const toolCallId = typeof params.toolCall?.toolCallId === "string"
+        ? params.toolCall.toolCallId
+        : null;
+      const toolIdentity = toolCallId === null
+        ? undefined
+        : this.takeMcpToolIdentity(toolCallId);
       void this.invokeCallback(handler, [{
         rpcId,
         title: params.title ?? params.toolCall?.title ?? "Allow this tool?",
+        mcpServerName: toolIdentity?.serverName,
+        toolName: toolIdentity?.toolName,
         description: params.description ?? params.toolCall?.title,
         options: validatedPermissionOptions(params.options),
         locations: params.toolCall?.locations,
@@ -2133,7 +2180,19 @@ export class AcpClient {
       }], {}, batch);
       return;
     }
-    if (kind === "tool_call" || kind === "agent_thought_chunk") {
+    if (kind === "tool_call") {
+      this.rememberMcpToolIdentity(update);
+      if (this.streaming) this.nonTextBoundary = true;
+      return;
+    }
+    if (kind === "tool_call_update") {
+      const toolCallId = typeof update.toolCallId === "string" ? update.toolCallId : null;
+      if (toolCallId && (update.status === "completed" || update.status === "failed")) {
+        this.activeMcpToolIdentities.delete(toolCallId);
+      }
+      return;
+    }
+    if (kind === "agent_thought_chunk") {
       if (this.streaming) this.nonTextBoundary = true;
       return;
     }
@@ -2145,6 +2204,36 @@ export class AcpClient {
         this.idleResolvers = [];
       }
     }
+  }
+
+  private rememberMcpToolIdentity(update: Record<string, unknown>): void {
+    const identity = readMcpToolIdentity(update);
+    if (!identity) return;
+    const next: McpToolIdentity = {
+      generation: this.activeGen,
+      serverName: identity.serverName,
+      toolName: identity.toolName,
+    };
+    const existing = this.activeMcpToolIdentities.get(identity.toolCallId);
+    if (existing === null) return;
+    if (
+      existing
+      && (
+        existing.generation !== next.generation
+        || existing.serverName !== next.serverName
+        || existing.toolName !== next.toolName
+      )
+    ) {
+      this.activeMcpToolIdentities.set(identity.toolCallId, null);
+      return;
+    }
+    this.activeMcpToolIdentities.set(identity.toolCallId, next);
+  }
+
+  private takeMcpToolIdentity(toolCallId: string): McpToolIdentity | undefined {
+    const identity = this.activeMcpToolIdentities.get(toolCallId);
+    this.activeMcpToolIdentities.delete(toolCallId);
+    return identity?.generation === this.activeGen ? identity : undefined;
   }
 
   async initialize(): Promise<{ authMethods: unknown[] }> {
@@ -2246,6 +2335,7 @@ export class AcpClient {
     if (myGen !== this.generation) throw cancelledError();
     this.activeGen = myGen;
     this.resetElicitationLifecycle();
+    this.activeMcpToolIdentities.clear();
     this.activeComputerHelpGeneration = {
       token: this.rotateComputerHelpGeneration(),
       generation: myGen,
@@ -2326,6 +2416,7 @@ export class AcpClient {
       }
       if (this.abortPrompt === abortPrompt) this.abortPrompt = null;
       if (this.activeGen === myGen) this.activeHandlers = null;
+      if (this.activeGen === myGen) this.activeMcpToolIdentities.clear();
       if (this.cancelledPromptDrain?.generation !== myGen) {
         this.retireActiveTurnLedger(myGen);
       }
@@ -2351,6 +2442,7 @@ export class AcpClient {
     this.openMessageId = null;
     this.nonTextBoundary = false;
     this.activeHandlers = null;
+    this.activeMcpToolIdentities.clear();
     const error = cancelledError();
     if (this.promptId !== null) {
       const cancelledPromptId = this.promptId;

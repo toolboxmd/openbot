@@ -83,6 +83,7 @@ import {
 } from "./acp.ts";
 import { NoopComputerRuntime, type ComputerRuntime, type DisplayHandle } from "./computer.ts";
 import {
+  PINCHTAB_MCP_NAME,
   pinchTabMcpServers,
   pinchTabToolAllowed,
   stripPinchTabFromPath,
@@ -419,9 +420,9 @@ function botProvisioningCleanupRequiredError(botId: string, cause: unknown, clea
 }
 
 function isPinchTabPermission(prompt: PermissionPrompt): boolean {
-  const prefix = "mcp__pinchtab__";
-  if (!prompt.title.startsWith(prefix)) return false;
-  const toolName = prompt.title.slice(prefix.length);
+  if (prompt.mcpServerName !== PINCHTAB_MCP_NAME) return false;
+  const toolName = prompt.toolName;
+  if (!toolName) return false;
   return /^[A-Za-z0-9_-]+$/u.test(toolName) && pinchTabToolAllowed(toolName);
 }
 
