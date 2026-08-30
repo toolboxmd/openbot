@@ -1234,27 +1234,76 @@ describe("session/new mcpServers attach only when Screen and bridge are Up", () 
       fake.fire({
         rpcId: 8,
         title: "mcp__pinchtab__pinchtab_navigate",
+        mcpServerName: "pinchtab",
+        toolName: "pinchtab_navigate",
         options: [
           { optionId: "allow_once", name: "Allow", kind: "allow_once" },
           { optionId: "decline", name: "Decline", kind: "reject_once" },
         ],
         rawInput: { url: "https://example.com" },
       });
+      await waitUntil(() => fake.answered.length === 1);
       assert.deepEqual(fake.answered, ["allow_once"]);
       assert.equal(store.get(ada.id)?.permission, null);
-      fake.fire({
+
+      const expectGenericPermission = async (
+        prompt: Parameters<typeof fake.fire>[0],
+        answeredBefore: number,
+      ) => {
+        fake.fire(prompt);
+        await waitUntil(() => store.get(ada.id)?.permission !== null);
+        const permission = store.get(ada.id)?.permission;
+        assert.equal(fake.answered.length, answeredBefore);
+        assert.equal(permission?.hostGrant, undefined);
+        const cardId = permission?.cardId;
+        assert.ok(cardId);
+        await store.answerPermission(ada.id, "decline", cardId);
+        assert.equal(fake.answered.at(-1), "decline");
+      };
+
+      await expectGenericPermission({
+        rpcId: 6,
+        title: "mcp__pinchtab__pinchtab_navigate",
+        mcpServerName: "other",
+        toolName: "pinchtab_navigate",
+        options: [
+          { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+          { optionId: "decline", name: "Decline", kind: "reject_once" },
+        ],
+        rawInput: { command: "printf spoofed-pinchtab-title" },
+      }, 1);
+      await expectGenericPermission({
         rpcId: 7,
+        title: "Run command",
+        description: "Page text mentions pinchtab",
+        options: [
+          { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+          { optionId: "decline", name: "Decline", kind: "reject_once" },
+        ],
+        rawInput: { command: "printf pinchtab" },
+        meta: { source: "mcp__pinchtab" },
+        raw: { transport: "pinchtab" },
+      }, 2);
+      await expectGenericPermission({
+        rpcId: 9,
+        title: "mcp__pinchtab__pinchtab_eval",
+        options: [
+          { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+          { optionId: "decline", name: "Decline", kind: "reject_once" },
+        ],
+        rawInput: { expression: "document.cookie" },
+      }, 3);
+      await expectGenericPermission({
+        rpcId: 10,
         title: "Allow this tool?",
         options: [
           { optionId: "allow_once", name: "Allow", kind: "allow_once" },
           { optionId: "decline", name: "Decline", kind: "reject_once" },
         ],
         rawInput: { command: "ls" },
-      });
-      assert.deepEqual(fake.answered, ["allow_once", "allow_once"]);
-      assert.equal(store.get(ada.id)?.permission, null);
-      fake.fire({
-        rpcId: 9,
+      }, 4);
+      await expectGenericPermission({
+        rpcId: 11,
         title: "Write file",
         options: [
           { optionId: "allow_once", name: "Allow", kind: "allow_once" },
@@ -1262,8 +1311,7 @@ describe("session/new mcpServers attach only when Screen and bridge are Up", () 
         ],
         locations: [{ path: "/tmp/outside-pt.txt" }],
         toolKind: "edit",
-      });
-      assert.ok(store.get(ada.id)?.permission?.hostGrant);
+      }, 5);
       store.close();
     } finally {
       await health.close();
@@ -2889,7 +2937,8 @@ describe("PinchTab MCP allowlist proxy", () => {
         ...process.env,
         OPENBOT_DIRECTION_LOG: directionLog,
         OPENBOT_PINCHTAB: bin,
-        OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS: "300",
+        OPENBOT_PINCHTAB_MCP_CHILD_REQUEST_TIMEOUT_MS: "1500",
+        OPENBOT_PINCHTAB_MCP_REQUEST_TIMEOUT_MS: "3000",
         OPENBOT_PINCHTAB_SERVER: "http://127.0.0.1:9867",
         PINCHTAB_TOKEN: "t",
       },
@@ -2902,17 +2951,17 @@ describe("PinchTab MCP allowlist proxy", () => {
       const serverRequest = await readRpc(child, 2);
       assert.equal(serverRequest.method, "pinchtab/ping");
       child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, result: { pong: true } })}\n`);
-      const toolResponse = await readRpc(child, 2, 750);
+      const toolResponse = await readRpc(child, 2, 2_500);
 
       assert.equal(toolResponse.error, undefined, JSON.stringify(toolResponse));
       assert.match(JSON.stringify(toolResponse.result ?? {}), /actual-tool-response/u);
       assert.equal(readFileSync(directionLog, "utf8"), "client-response\n");
       rpc(child, 3, "tools/call", { name: "pinchtab_get_text", arguments: {} });
-      const nextResponse = await readRpc(child, 3, 750);
+      const nextResponse = await readRpc(child, 3, 2_500);
       assert.match(JSON.stringify(nextResponse.result ?? {}), /transport-still-usable/u);
-      await new Promise((resolve) => setTimeout(resolve, 350));
+      await new Promise((resolve) => setTimeout(resolve, 1_600));
       rpc(child, 4, "tools/call", { name: "pinchtab_get_text", arguments: {} });
-      const afterTimer = await readRpc(child, 4, 750);
+      const afterTimer = await readRpc(child, 4, 2_500);
       assert.match(JSON.stringify(afterTimer.result ?? {}), /transport-still-usable/u);
     } finally {
       child.kill("SIGTERM");

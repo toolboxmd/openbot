@@ -15,8 +15,17 @@ import {
   type HostGrantAccess,
   type HostGrantDuration,
 } from "./harness-home.ts";
+import {
+  expiredTranscriptCard,
+  isPendingNeedsYouComputerCard,
+  legacyHostGrantTranscriptCard,
+  parseTranscriptCard,
+  transcriptCardSummary,
+  unavailableNeedsYouComputerCard,
+  type TranscriptCard,
+} from "./transcript-card.ts";
 
-export const HOME_SCHEMA_VERSION = 4;
+export const HOME_SCHEMA_VERSION = 7;
 export const HUMAN_MEMBER_ID = "you";
 const BOT_DISPLAY_MAX = 8;
 
@@ -27,14 +36,16 @@ export type MessageReaction = {
   by: "user";
 };
 
-export type TranscriptKind = "text" | "host-grant";
+export type TranscriptKind = "text" | "host-grant" | "card";
 
 export type TranscriptMessage = {
   id: string;
   role: "user" | "assistant";
+  senderId: string;
   text: string;
   createdAt: string;
   kind?: TranscriptKind;
+  card?: TranscriptCard;
   receipt?: MessageReceipt;
   replyTo?: string;
   reactions?: MessageReaction[];
@@ -55,6 +66,11 @@ export type StoredBotProvisioning = {
   display: number | null;
   workspaceOwned: boolean;
   state: "preparing" | "cleanup-required";
+};
+
+export type StoredAppSettings = {
+  defaultConnection: HarnessId | null;
+  defaultConfigMode: ConfigMode;
 };
 
 export type StoredHostGrant = {
@@ -82,12 +98,82 @@ export type StoredChannel = {
   messages: TranscriptMessage[];
 };
 
+export type ChannelCursor = {
+  sequence: number;
+  revision: number;
+};
+
 export type NewMessage = TranscriptMessage & {
-  senderId: string;
   recipientBotId?: string;
 };
 
+export type ChannelActivity = {
+  latestText: string | null;
+  lastActivityAt: string;
+  unread: boolean;
+  cursor: ChannelCursor;
+};
+
+export type StoredChannelSummary = Omit<StoredChannel, "messages"> & {
+  activity: ChannelActivity;
+};
+
 type SqlRow = Record<string, unknown>;
+
+const CHANNEL_SUMMARY_SELECT = `SELECT
+  channels.id,
+  channels.kind,
+  channels.title,
+  channels.created_at,
+  (
+    SELECT substr(messages.text, 1, 512)
+    FROM messages
+    WHERE messages.channel_id = channels.id
+      AND messages.kind IN ('text', 'card')
+      AND trim(messages.text) <> ''
+    ORDER BY messages.activity_sequence DESC
+    LIMIT 1
+  ) AS latest_text,
+  COALESCE((
+    SELECT messages.activity_at
+    FROM messages
+    WHERE messages.channel_id = channels.id
+      AND messages.kind IN ('text', 'card')
+      AND trim(messages.text) <> ''
+    ORDER BY messages.activity_sequence DESC
+    LIMIT 1
+  ), channels.created_at) AS last_activity_at,
+  COALESCE((
+    SELECT messages.activity_sequence
+    FROM messages
+    WHERE messages.channel_id = channels.id
+    ORDER BY messages.activity_sequence DESC
+    LIMIT 1
+  ), 0) AS cursor_sequence,
+  COALESCE((
+    SELECT messages.revision
+    FROM messages
+    WHERE messages.channel_id = channels.id
+    ORDER BY messages.activity_sequence DESC
+    LIMIT 1
+  ), 0) AS cursor_revision,
+  EXISTS(
+    SELECT 1
+    FROM messages
+    LEFT JOIN channel_reads ON channel_reads.channel_id = messages.channel_id
+    WHERE messages.channel_id = channels.id
+      AND messages.kind IN ('text', 'card')
+      AND messages.sender_kind = 'bot'
+      AND trim(messages.text) <> ''
+      AND (
+        messages.activity_sequence > COALESCE(channel_reads.last_read_sequence, 0)
+        OR (
+          messages.activity_sequence = COALESCE(channel_reads.last_read_sequence, 0)
+          AND messages.revision > COALESCE(channel_reads.last_read_revision, 0)
+        )
+      )
+  ) AS unread
+FROM channels`;
 
 export function defaultHomeDir(env: NodeJS.ProcessEnv = process.env): string {
   const configured = env.OPENBOT_HOME?.trim();
@@ -268,6 +354,37 @@ export class HomeStore {
     this.db.prepare("DELETE FROM bot_provisioning WHERE bot_id = ?").run(botId);
   }
 
+  readAppSettings(): StoredAppSettings {
+    const row = this.db
+      .prepare("SELECT default_harness, default_config_mode FROM app_settings WHERE singleton = 1")
+      .get() as SqlRow | undefined;
+    return {
+      defaultConnection:
+        typeof row?.default_harness === "string" && isHarnessId(row.default_harness)
+          ? row.default_harness
+          : null,
+      defaultConfigMode: row?.default_config_mode === "host" ? "host" : "isolated",
+    };
+  }
+
+  updateAppSettings(patch: Partial<StoredAppSettings>): StoredAppSettings {
+    const current = this.readAppSettings();
+    const next: StoredAppSettings = {
+      defaultConnection: patch.defaultConnection === undefined
+        ? current.defaultConnection
+        : patch.defaultConnection,
+      defaultConfigMode: patch.defaultConfigMode ?? current.defaultConfigMode,
+    };
+    this.db
+      .prepare(
+        `UPDATE app_settings
+         SET default_harness = ?, default_config_mode = ?
+         WHERE singleton = 1`,
+      )
+      .run(next.defaultConnection, next.defaultConfigMode);
+    return next;
+  }
+
   listChannels(): StoredChannel[] {
     const rows = this.db
       .prepare("SELECT id, kind, title, created_at FROM channels ORDER BY created_at, id")
@@ -278,10 +395,54 @@ export class HomeStore {
     });
   }
 
+  listChannelSummaries(): StoredChannelSummary[] {
+    const rows = this.db
+      .prepare(`${CHANNEL_SUMMARY_SELECT} ORDER BY channels.created_at, channels.id`)
+      .all() as SqlRow[];
+    const membersByChannel = new Map<string, ChannelMember[]>();
+    const memberRows = this.db
+      .prepare(
+        `SELECT channel_id, member_kind, member_id
+         FROM channel_members
+         ORDER BY channel_id, position, member_id`,
+      )
+      .all() as SqlRow[];
+    for (const row of memberRows) {
+      if (typeof row.channel_id !== "string") continue;
+      const member = reviveMember(row)[0];
+      if (!member) continue;
+      const members = membersByChannel.get(row.channel_id) ?? [];
+      members.push(member);
+      membersByChannel.set(row.channel_id, members);
+    }
+    return rows.flatMap((row) => {
+      const members = typeof row.id === "string" ? membersByChannel.get(row.id) ?? [] : [];
+      const summary = this.reviveChannelSummary(row, members);
+      return summary ? [summary] : [];
+    });
+  }
+
+  getChannelSummary(id: string): StoredChannelSummary | null {
+    const row = this.db
+      .prepare(`${CHANNEL_SUMMARY_SELECT} WHERE channels.id = ?`)
+      .get(id) as SqlRow | undefined;
+    if (!row) return null;
+    const members = this.db
+      .prepare(
+        `SELECT member_kind, member_id
+         FROM channel_members
+         WHERE channel_id = ?
+         ORDER BY position, member_id`,
+      )
+      .all(id)
+      .flatMap((member) => reviveMember(member as SqlRow));
+    return this.reviveChannelSummary(row, members);
+  }
+
   listMessages(channelId: string): TranscriptMessage[] {
     return this.db
       .prepare(
-        `SELECT id, kind, sender_kind, text, created_at, reply_to
+        `SELECT id, kind, sender_kind, sender_id, text, created_at, reply_to, card_json
          FROM messages WHERE channel_id = ? ORDER BY sequence`,
       )
       .all(channelId)
@@ -291,12 +452,21 @@ export class HomeStore {
   getMessage(channelId: string, messageId: string): TranscriptMessage | null {
     const row = this.db
       .prepare(
-        `SELECT id, kind, sender_kind, text, created_at, reply_to
+        `SELECT id, kind, sender_kind, sender_id, text, created_at, reply_to, card_json
          FROM messages WHERE channel_id = ? AND id = ?`,
       )
       .get(channelId, messageId) as SqlRow | undefined;
     if (!row) return null;
     return this.reviveMessage(row)[0] ?? null;
+  }
+
+  pendingNeedsYouCard(channelId: string): TranscriptMessage | null {
+    const messages = this.listMessages(channelId);
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message?.card && isPendingNeedsYouComputerCard(message.card)) return message;
+    }
+    return null;
   }
 
   directChannelId(botId: string): string | null {
@@ -322,10 +492,79 @@ export class HomeStore {
     return this.reviveChannel(row);
   }
 
-  createGroup(input: { title?: string | null; memberBotIds: string[] }): StoredChannel {
-    const memberBotIds = uniqueIds(input.memberBotIds);
-    if (memberBotIds.length === 0) {
+  channelActivity(channelId: string): ChannelActivity {
+    const summary = this.getChannelSummary(channelId);
+    if (!summary) {
+      throw Object.assign(new Error("Channel not found"), { status: 404 });
+    }
+    return summary.activity;
+  }
+
+  markChannelRead(channelId: string, cursor: ChannelCursor, updatedAt = new Date().toISOString()): void {
+    if (this.closed) return;
+    if (
+      !Number.isSafeInteger(cursor.sequence)
+      || cursor.sequence < 0
+      || !Number.isSafeInteger(cursor.revision)
+      || cursor.revision < 0
+    ) {
+      throw Object.assign(new Error("invalid Channel cursor"), { status: 400 });
+    }
+    const channel = this.db.prepare("SELECT 1 AS found FROM channels WHERE id = ?").get(channelId) as SqlRow | undefined;
+    if (channel?.found !== 1) throw Object.assign(new Error("Channel not found"), { status: 404 });
+    if (cursor.sequence === 0 && cursor.revision !== 0) {
+      throw Object.assign(new Error("invalid Channel cursor"), { status: 400 });
+    }
+    if (cursor.sequence > 0) {
+      const latest = this.db
+        .prepare("SELECT activity_sequence AS sequence FROM channels WHERE id = ?")
+        .get(channelId) as SqlRow | undefined;
+      if (cursor.revision === 0 || typeof latest?.sequence !== "number" || cursor.sequence > latest.sequence) {
+        throw Object.assign(new Error("invalid Channel cursor"), { status: 400 });
+      }
+    }
+    this.db
+      .prepare(
+        `INSERT INTO channel_reads (channel_id, last_read_sequence, last_read_revision, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(channel_id)
+         DO UPDATE SET
+           last_read_sequence = CASE
+             WHEN excluded.last_read_sequence > channel_reads.last_read_sequence
+             THEN excluded.last_read_sequence
+             ELSE channel_reads.last_read_sequence
+           END,
+           last_read_revision = CASE
+             WHEN excluded.last_read_sequence > channel_reads.last_read_sequence
+             THEN excluded.last_read_revision
+             WHEN excluded.last_read_sequence = channel_reads.last_read_sequence
+             THEN MAX(excluded.last_read_revision, channel_reads.last_read_revision)
+             ELSE channel_reads.last_read_revision
+           END,
+           updated_at = CASE
+             WHEN excluded.last_read_sequence > channel_reads.last_read_sequence
+               OR (
+                 excluded.last_read_sequence = channel_reads.last_read_sequence
+                 AND excluded.last_read_revision > channel_reads.last_read_revision
+               )
+             THEN excluded.updated_at
+             ELSE channel_reads.updated_at
+           END`,
+      )
+      .run(channelId, cursor.sequence, cursor.revision, updatedAt);
+  }
+
+  createGroup(input: { title: string; memberBotIds: string[] }): StoredChannel {
+    const title = input.title.trim();
+    if (!title) {
+      throw Object.assign(new Error("title is required"), { status: 400 });
+    }
+    const memberBotIds = input.memberBotIds.map((id) => id.trim());
+    if (memberBotIds.length === 0 || memberBotIds.some((id) => !id)) {
       throw Object.assign(new Error("members are required"), { status: 400 });
+    }
+    if (new Set(memberBotIds).size !== memberBotIds.length) {
+      throw Object.assign(new Error("group needs at least two distinct Bots"), { status: 400 });
     }
     const bots = this.listBots();
     const byId = new Map(bots.map((bot) => [bot.id, bot]));
@@ -333,9 +572,8 @@ export class HomeStore {
       if (!byId.has(id)) throw Object.assign(new Error("unknown Bot"), { status: 400 });
     }
     if (memberBotIds.length < 2) {
-      throw Object.assign(new Error("group needs several Bots"), { status: 400 });
+      throw Object.assign(new Error("group needs at least two distinct Bots"), { status: 400 });
     }
-    const title = typeof input.title === "string" && input.title.trim() ? input.title.trim() : null;
     const createdAt = new Date().toISOString();
     const id = crypto.randomUUID();
     const members: ChannelMember[] = [
@@ -492,11 +730,13 @@ export class HomeStore {
   appendMessage(channelId: string, message: NewMessage): void {
     if (this.closed) return;
     this.transaction(() => {
+      const activitySequence = this.nextChannelActivitySequence(channelId);
       this.db
         .prepare(
           `INSERT INTO messages
-            (id, channel_id, kind, sender_kind, sender_id, text, created_at, reply_to)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            (id, channel_id, kind, sender_kind, sender_id, text, created_at, reply_to,
+             activity_sequence, activity_at, card_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           message.id,
@@ -507,6 +747,9 @@ export class HomeStore {
           message.text,
           message.createdAt,
           message.replyTo ?? null,
+          activitySequence,
+          message.createdAt,
+          message.card ? JSON.stringify(message.card) : null,
         );
       if (message.receipt && message.recipientBotId) {
         this.db
@@ -520,9 +763,113 @@ export class HomeStore {
     });
   }
 
-  updateMessageText(messageId: string, text: string): void {
+  updateMessageText(messageId: string, text: string, updatedAt = new Date().toISOString()): void {
     if (this.closed) return;
-    this.db.prepare("UPDATE messages SET text = ? WHERE id = ?").run(text, messageId);
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT channel_id FROM messages WHERE id = ?").get(messageId) as SqlRow | undefined;
+      if (typeof row?.channel_id !== "string") return;
+      const activitySequence = this.nextChannelActivitySequence(row.channel_id);
+      this.db
+        .prepare(
+          `UPDATE messages
+           SET text = ?, revision = revision + 1, activity_sequence = ?, activity_at = ?
+           WHERE id = ?`,
+        )
+        .run(text, activitySequence, updatedAt, messageId);
+    });
+  }
+
+  updateMessageCard(messageId: string, card: TranscriptCard, updatedAt = new Date().toISOString()): void {
+    if (this.closed) return;
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT channel_id FROM messages WHERE id = ? AND kind = 'card'").get(messageId) as SqlRow | undefined;
+      if (typeof row?.channel_id !== "string") {
+        throw Object.assign(new Error("Transcript Card not found"), { status: 404 });
+      }
+      const activitySequence = this.nextChannelActivitySequence(row.channel_id);
+      this.db
+        .prepare(
+          `UPDATE messages
+           SET text = ?, card_json = ?, revision = revision + 1, activity_sequence = ?, activity_at = ?
+           WHERE id = ?`,
+        )
+        .run(transcriptCardSummary(card), JSON.stringify(card), activitySequence, updatedAt, messageId);
+    });
+  }
+
+  resolveHostGrantCard(
+    messageId: string,
+    card: TranscriptCard,
+    grantInput: { path: string; access: HostGrantAccess; duration: HostGrantDuration } | null,
+    updatedAt = new Date().toISOString(),
+  ): StoredHostGrant | null {
+    if (this.closed) throw new Error("Home is closed");
+    const grant = grantInput && grantInput.duration !== "once"
+      ? {
+          id: crypto.randomUUID(),
+          path: path.resolve(grantInput.path),
+          access: grantInput.access,
+          duration: grantInput.duration,
+          consumed: false,
+          createdAt: updatedAt,
+        }
+      : null;
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT channel_id FROM messages WHERE id = ? AND kind = 'card'").get(messageId) as SqlRow | undefined;
+      if (typeof row?.channel_id !== "string") {
+        throw Object.assign(new Error("Transcript Card not found"), { status: 404 });
+      }
+      if (grant?.duration === "until-revoked") {
+        this.db
+          .prepare(
+            `INSERT INTO host_grants (id, path, access, duration, consumed, created_at)
+             VALUES (?, ?, ?, ?, 0, ?)`,
+          )
+          .run(grant.id, grant.path, grant.access, grant.duration, grant.createdAt);
+      }
+      const activitySequence = this.nextChannelActivitySequence(row.channel_id);
+      this.db
+        .prepare(
+          `UPDATE messages
+           SET text = ?, card_json = ?, revision = revision + 1, activity_sequence = ?, activity_at = ?
+           WHERE id = ?`,
+        )
+        .run(transcriptCardSummary(card), JSON.stringify(card), activitySequence, updatedAt, messageId);
+    });
+    if (grant?.duration === "session") this.sessionGrants.push(grant);
+    return grant;
+  }
+
+  expirePendingTranscriptCards(updatedAt = new Date().toISOString()): void {
+    if (this.closed) return;
+    const rows = this.db
+      .prepare("SELECT id, card_json FROM messages WHERE kind = 'card' AND card_json IS NOT NULL")
+      .all() as SqlRow[];
+    for (const row of rows) {
+      if (typeof row.id !== "string" || typeof row.card_json !== "string") continue;
+      try {
+        const card = parseTranscriptCard(JSON.parse(row.card_json) as unknown);
+        if (card && isPendingNeedsYouComputerCard(card)) {
+          this.updateMessageCard(row.id, unavailableNeedsYouComputerCard(card), updatedAt);
+          continue;
+        }
+        if (!card || card.status.tone !== "waiting" || card.actions.length === 0) continue;
+        this.updateMessageCard(row.id, expiredTranscriptCard(card), updatedAt);
+      } catch {
+        // Malformed private state stays hidden and cannot become actionable.
+      }
+    }
+  }
+
+  deleteMessage(messageId: string): boolean {
+    if (this.closed) return false;
+    return this.transaction(() => {
+      this.db
+        .prepare("UPDATE messages SET reply_to = NULL, revision = revision + 1 WHERE reply_to = ?")
+        .run(messageId);
+      const deleted = this.db.prepare("DELETE FROM messages WHERE id = ?").run(messageId);
+      return deleted.changes === 1;
+    });
   }
 
   setReceipt(messageId: string, recipientBotId: string, receipt: MessageReceipt, updatedAt: string): void {
@@ -568,13 +915,14 @@ export class HomeStore {
       throw newerSchemaError(version);
     }
     if (version === HOME_SCHEMA_VERSION) return;
-    if (version === 3) {
-      this.migrateVersionThree();
-      return;
-    }
+
+    const isolatedVersionThree = version === 3
+      && tableHasColumn(this.db, "bots", "display")
+      && !tableHasColumn(this.db, "messages", "activity_sequence");
+    if (isolatedVersionThree) this.migrateVersionThree();
 
     this.transaction(() => {
-      if (version === 0) {
+if (version === 0) {
         this.db.exec(`
         CREATE TABLE bots (
           id TEXT PRIMARY KEY,
@@ -593,6 +941,7 @@ export class HomeStore {
           id TEXT PRIMARY KEY,
           kind TEXT NOT NULL CHECK (kind IN ('direct', 'group', 'bot-to-bot')),
           title TEXT,
+          activity_sequence INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL
         );
 
@@ -606,6 +955,9 @@ export class HomeStore {
 
         CREATE TABLE messages (
           sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          revision INTEGER NOT NULL DEFAULT 1,
+          activity_sequence INTEGER NOT NULL,
+          activity_at TEXT NOT NULL,
           id TEXT NOT NULL UNIQUE,
           channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
           kind TEXT NOT NULL DEFAULT 'text',
@@ -613,10 +965,12 @@ export class HomeStore {
           sender_id TEXT NOT NULL,
           text TEXT NOT NULL,
           created_at TEXT NOT NULL,
-          reply_to TEXT REFERENCES messages(id)
+          reply_to TEXT REFERENCES messages(id),
+          card_json TEXT
         );
 
         CREATE INDEX messages_channel_sequence ON messages(channel_id, sequence);
+        CREATE INDEX messages_channel_activity ON messages(channel_id, activity_sequence DESC);
 
         CREATE TABLE reactions (
           message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -662,6 +1016,13 @@ export class HomeStore {
           created_at TEXT NOT NULL
         );
 
+        CREATE TABLE channel_reads (
+          channel_id TEXT PRIMARY KEY REFERENCES channels(id) ON DELETE CASCADE,
+          last_read_sequence INTEGER NOT NULL DEFAULT 0,
+          last_read_revision INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE host_grants (
           id TEXT PRIMARY KEY,
           path TEXT NOT NULL,
@@ -671,9 +1032,13 @@ export class HomeStore {
           created_at TEXT NOT NULL
         );
         `);
-      } else if (version === 1) {
+      }
+
+      if (version > 0) {
+        if (!tableHasColumn(this.db, "bots", "config_mode")) {
+          this.db.exec("ALTER TABLE bots ADD COLUMN config_mode TEXT NOT NULL DEFAULT 'isolated';");
+        }
         this.db.exec(`
-          ALTER TABLE bots ADD COLUMN config_mode TEXT NOT NULL DEFAULT 'isolated';
           CREATE TABLE IF NOT EXISTS host_grants (
             id TEXT PRIMARY KEY,
             path TEXT NOT NULL,
@@ -684,26 +1049,106 @@ export class HomeStore {
           );
         `);
       }
-      if (version === 1 || version === 2) {
-        this.db.exec(`
-          ALTER TABLE bots ADD COLUMN display INTEGER CHECK (display BETWEEN 1 AND 8);
 
-          CREATE TABLE bot_provisioning (
-            bot_id TEXT PRIMARY KEY,
-            display INTEGER CHECK (display BETWEEN 1 AND 8),
-            workspace_owned INTEGER NOT NULL DEFAULT 1 CHECK (workspace_owned IN (0, 1)),
-            state TEXT NOT NULL CHECK (state IN ('preparing', 'cleanup-required')),
-            cleanup_error TEXT,
-            created_at TEXT NOT NULL
-          );
-        `);
+      if (!tableHasColumn(this.db, "bots", "display")) {
+        this.db.exec("ALTER TABLE bots ADD COLUMN display INTEGER CHECK (display BETWEEN 1 AND 8);");
         const persistedBots = this.db.prepare("SELECT id FROM bots ORDER BY rowid").all() as SqlRow[];
         const setDisplay = this.db.prepare("UPDATE bots SET display = ? WHERE id = ?");
         persistedBots.slice(0, BOT_DISPLAY_MAX).forEach((row, index) => {
           setDisplay.run(index + 1, String(row.id));
         });
-        this.db.exec("CREATE UNIQUE INDEX bots_display_unique ON bots(display);");
       }
+      this.db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS bots_display_unique ON bots(display);
+        CREATE TABLE IF NOT EXISTS bot_provisioning (
+          bot_id TEXT PRIMARY KEY,
+          display INTEGER CHECK (display BETWEEN 1 AND 8),
+          workspace_owned INTEGER NOT NULL DEFAULT 1 CHECK (workspace_owned IN (0, 1)),
+          state TEXT NOT NULL CHECK (state IN ('preparing', 'cleanup-required')),
+          cleanup_error TEXT,
+          created_at TEXT NOT NULL
+        );
+      `);
+
+      if (!tableHasColumn(this.db, "messages", "revision")) {
+        this.db.exec("ALTER TABLE messages ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;");
+      }
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS channel_reads (
+          channel_id TEXT PRIMARY KEY REFERENCES channels(id) ON DELETE CASCADE,
+          last_read_sequence INTEGER NOT NULL DEFAULT 0,
+          last_read_revision INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO channel_reads (channel_id, last_read_sequence, last_read_revision, updated_at)
+        SELECT
+          channels.id,
+          COALESCE(messages.sequence, 0),
+          COALESCE(messages.revision, 0),
+          COALESCE(messages.created_at, channels.created_at)
+        FROM channels
+        LEFT JOIN messages ON messages.sequence = (
+          SELECT MAX(latest.sequence)
+          FROM messages AS latest
+          WHERE latest.channel_id = channels.id
+        )
+        ON CONFLICT(channel_id) DO NOTHING;
+      `);
+
+      if (!tableHasColumn(this.db, "messages", "activity_sequence")) {
+        this.db.exec("ALTER TABLE messages ADD COLUMN activity_sequence INTEGER NOT NULL DEFAULT 0;");
+      }
+      if (!tableHasColumn(this.db, "messages", "activity_at")) {
+        this.db.exec("ALTER TABLE messages ADD COLUMN activity_at TEXT NOT NULL DEFAULT '';");
+      }
+      if (!tableHasColumn(this.db, "channels", "activity_sequence")) {
+        this.db.exec("ALTER TABLE channels ADD COLUMN activity_sequence INTEGER NOT NULL DEFAULT 0;");
+      }
+      this.db.exec(`
+        UPDATE messages
+        SET activity_sequence = sequence
+        WHERE activity_sequence = 0;
+        UPDATE messages
+        SET activity_at = created_at
+        WHERE activity_at = '';
+        UPDATE channels
+        SET activity_sequence = COALESCE((
+          SELECT MAX(messages.activity_sequence)
+          FROM messages
+          WHERE messages.channel_id = channels.id
+        ), 0);
+        CREATE INDEX IF NOT EXISTS messages_channel_activity
+          ON messages(channel_id, activity_sequence DESC);
+      `);
+
+      if (!tableHasColumn(this.db, "messages", "card_json")) {
+        this.db.exec("ALTER TABLE messages ADD COLUMN card_json TEXT;");
+      }
+      const legacyCards = this.db
+        .prepare("SELECT id, text FROM messages WHERE kind = 'host-grant'")
+        .all() as SqlRow[];
+      const migrateCard = this.db.prepare(
+        "UPDATE messages SET kind = 'card', text = ?, card_json = ? WHERE id = ?",
+      );
+      for (const row of legacyCards) {
+        if (typeof row.id !== "string" || typeof row.text !== "string") continue;
+        const card = legacyHostGrantTranscriptCard(row.text);
+        migrateCard.run(transcriptCardSummary(card), JSON.stringify(card), row.id);
+      }
+
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS app_settings (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          default_harness TEXT CHECK (
+            default_harness IS NULL OR default_harness IN ('codex', 'claude', 'grok', 'kimi')
+          ),
+          default_config_mode TEXT NOT NULL DEFAULT 'isolated'
+            CHECK (default_config_mode IN ('isolated', 'host'))
+        );
+        INSERT OR IGNORE INTO app_settings (singleton, default_harness, default_config_mode)
+        VALUES (1, NULL, 'isolated');
+      `);
+
       this.db.exec(`PRAGMA user_version = ${HOME_SCHEMA_VERSION};`);
     });
   }
@@ -741,7 +1186,6 @@ export class HomeStore {
         if (violations.length > 0) {
           throw new Error("Home schema migration would break persisted relationships");
         }
-        this.db.exec(`PRAGMA user_version = ${HOME_SCHEMA_VERSION};`);
       });
     } finally {
       this.db.exec("PRAGMA foreign_keys = ON;");
@@ -776,8 +1220,39 @@ export class HomeStore {
     };
   }
 
+  private reviveChannelSummary(row: SqlRow, members: ChannelMember[]): StoredChannelSummary | null {
+    if (
+      typeof row.id !== "string"
+      || !isChannelKind(row.kind)
+      || typeof row.created_at !== "string"
+      || typeof row.last_activity_at !== "string"
+      || typeof row.cursor_sequence !== "number"
+      || typeof row.cursor_revision !== "number"
+    ) {
+      return null;
+    }
+    return {
+      id: row.id,
+      kind: row.kind,
+      title: typeof row.title === "string" ? row.title : null,
+      createdAt: row.created_at,
+      members,
+      activity: {
+        latestText: typeof row.latest_text === "string" ? row.latest_text : null,
+        lastActivityAt: row.last_activity_at,
+        unread: row.unread === 1,
+        cursor: { sequence: row.cursor_sequence, revision: row.cursor_revision },
+      },
+    };
+  }
+
   private reviveMessage(row: SqlRow): TranscriptMessage[] {
-    if (typeof row.id !== "string" || typeof row.text !== "string" || typeof row.created_at !== "string") return [];
+    if (
+      typeof row.id !== "string"
+      || typeof row.sender_id !== "string"
+      || typeof row.text !== "string"
+      || typeof row.created_at !== "string"
+    ) return [];
     if (row.sender_kind !== "user" && row.sender_kind !== "bot") return [];
     const receiptRow = this.db
       .prepare(
@@ -797,10 +1272,22 @@ export class HomeStore {
     const message: TranscriptMessage = {
       id: row.id,
       role: row.sender_kind === "user" ? "user" : "assistant",
+      senderId: row.sender_id,
       text: row.text,
       createdAt: row.created_at,
     };
     if (row.kind === "host-grant") message.kind = "host-grant";
+    if (row.kind === "card" && typeof row.card_json === "string") {
+      try {
+        const card = parseTranscriptCard(JSON.parse(row.card_json) as unknown);
+        if (card) {
+          message.kind = "card";
+          message.card = card;
+        }
+      } catch {
+        // Keep malformed private state out of the public Transcript.
+      }
+    }
     if (isReceipt(receiptRow?.state)) message.receipt = receiptRow.state;
     if (typeof row.reply_to === "string" && row.reply_to) message.replyTo = row.reply_to;
     if (reactions.length) message.reactions = reactions;
@@ -865,6 +1352,20 @@ export class HomeStore {
       )
       .run(bot.id, channel.id, bot.harness);
     return channel;
+  }
+
+  private nextChannelActivitySequence(channelId: string): number {
+    const changed = this.db
+      .prepare("UPDATE channels SET activity_sequence = activity_sequence + 1 WHERE id = ?")
+      .run(channelId);
+    if (changed.changes !== 1) throw Object.assign(new Error("Channel not found"), { status: 404 });
+    const row = this.db
+      .prepare("SELECT activity_sequence FROM channels WHERE id = ?")
+      .get(channelId) as SqlRow | undefined;
+    if (typeof row?.activity_sequence !== "number") {
+      throw new Error("could not allocate Channel activity sequence");
+    }
+    return row.activity_sequence;
   }
 
   private transaction<T>(action: () => T): T {
@@ -953,18 +1454,6 @@ function reviveMember(row: SqlRow): ChannelMember[] {
   return [{ kind: row.member_kind, id: row.member_id }];
 }
 
-function uniqueIds(ids: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const raw of ids) {
-    const id = raw.trim();
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
-    out.push(id);
-  }
-  return out;
-}
-
 function isChannelKind(value: unknown): value is ChannelKind {
   return value === "direct" || value === "group" || value === "bot-to-bot";
 }
@@ -990,6 +1479,11 @@ function readSchemaVersion(database: DatabaseSync): number {
     throw new Error("talk.sqlite has an invalid schema version");
   }
   return version;
+}
+
+function tableHasColumn(database: DatabaseSync, table: string, column: string): boolean {
+  const rows = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>;
+  return rows.some((row) => row.name === column);
 }
 
 function newerSchemaError(version: number): Error {

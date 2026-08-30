@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { permissionOptionKind } from "./acp.ts";
 import { COMPUTER_CONTAINER, WORKSPACE_MOUNT } from "./computer.ts";
 import { HARNESS_IDS, type HarnessId } from "./harness.ts";
 
@@ -285,31 +286,17 @@ function firstAbsolutePath(text: string): string | null {
 export function pickAllowOption(
   options: Array<{ optionId: string; kind?: string }>,
 ): string | null {
-  const allowOnce = options.find(
-    (option) => option.kind === "allow_once" || option.optionId === "allow-once" || option.optionId === "once",
-  );
-  if (allowOnce) return allowOnce.optionId;
-  const allow = options.find(
-    (option) =>
-      (option.kind && option.kind.startsWith("allow")) ||
-      option.optionId.startsWith("allow") ||
-      option.optionId === "always",
-  );
-  return allow?.optionId ?? null;
+  return options.find((option) => permissionOptionKind(option) === "allow_once")?.optionId
+    ?? options.find((option) => permissionOptionKind(option) === "allow_always")?.optionId
+    ?? null;
 }
 
 export function pickRejectOption(
   options: Array<{ optionId: string; kind?: string }>,
 ): string | null {
-  const reject = options.find(
-    (option) =>
-      option.kind === "reject_once" ||
-      option.kind === "reject" ||
-      option.optionId === "reject-once" ||
-      option.optionId === "reject" ||
-      option.optionId === "deny",
-  );
-  return reject?.optionId ?? options.find((option) => /reject|deny|cancel/i.test(option.optionId))?.optionId ?? null;
+  return options.find((option) => permissionOptionKind(option) === "reject_once")?.optionId
+    ?? options.find((option) => permissionOptionKind(option) === "reject_always")?.optionId
+    ?? null;
 }
 
 export function ensureWorkspaceLayout(workspaceDir: string): void {

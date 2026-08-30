@@ -146,7 +146,6 @@ describe("test command contract", () => {
     assert.equal(pinchtab.status, 0, pinchtab.stderr);
     assert.deepEqual(outputLines(pinchtab.stdout), ["daemon/test/pinchtab.live.test.ts"]);
   });
-
   test("a deterministic lane rejects a live module", () => {
     const result = runRunner("focused", "--list", "daemon/test/home-channel.live.test.ts");
 
@@ -154,10 +153,12 @@ describe("test command contract", () => {
     assert.match(result.stderr, /belongs to live:harness, not focused/u);
   });
 
-  test("an empty live Screen lane fails instead of reporting proof", () => {
+  test("the connected-PWA shutdown regression owns the live Screen lane", () => {
     const screen = runRunner("live:screen", "--list");
 
-    assert.equal(screen.status, 2);
-    assert.match(screen.stderr, /No live Screen test files found/u);
+    assert.equal(screen.status, 0, screen.stderr);
+    assert.deepEqual(outputLines(screen.stdout), [
+      "daemon/test/connected-pwa-shutdown.screen.live.test.ts",
+    ]);
   });
 });

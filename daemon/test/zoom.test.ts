@@ -832,23 +832,6 @@ describe("PWA has no Takeover button", () => {
     assert.doesNotMatch(computer, /Wake this Bot/);
   });
 
-  test("preview Open control keeps full-surface markup and only confirmed ownership is writable", async () => {
-    const computer = await readFile(join(repoRoot, "pwa/src/components/Computer.tsx"), "utf8");
-    const messenger = await readFile(join(repoRoot, "pwa/src/components/Messenger.tsx"), "utf8");
-    assert.match(messenger, /data-testid="open-computer"/);
-    assert.match(messenger, /data-testid="open-computer-preview"/);
-    assert.match(messenger, /data-testid=\{expanded \? "computer-expanded" : "computer-preview"\}/);
-    assert.match(messenger, /<ComputerPreview expanded=\{computerOpen\} onOpen=\{openComputer\}>/);
-    assert.match(messenger, /aria-label="Open Computer"/);
-    assert.match(
-      messenger,
-      /data-testid="open-computer-preview"[\s\S]*?className="absolute inset-0 z-30 flex cursor-pointer items-center justify-center bg-transparent"/,
-    );
-    assert.match(computer, /canWrite \? "pointer-events-auto" : "pointer-events-none"/);
-    assert.match(computer, /computerCanWrite\(computer, expanded, botId\)/);
-    assert.match(computer, /setComputerZoom\(botId, expanded\)/);
-  });
-
   test("Computer iframe allows host clipboard into Screen", async () => {
     const computer = await readFile(join(repoRoot, "pwa/src/components/Computer.tsx"), "utf8");
     const yaml = await readFile(join(repoRoot, "screen/kasmvnc.yaml"), "utf8");

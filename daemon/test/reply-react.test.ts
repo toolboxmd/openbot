@@ -3,6 +3,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
+import type { AcpHandlers } from "../src/acp.ts";
 import type { AcpSession } from "../src/bots.ts";
 import { startBox, type RunningBox } from "../src/box.ts";
 import type { SpawnSpec } from "../src/harness.ts";
@@ -27,11 +28,7 @@ type BotBody = {
   messages?: PublicMessage[];
 };
 
-type TestHandlers = {
-  onPromptWritten?: () => void;
-  onPromptFlushed?: () => void;
-  onAssistant?: (text: string, delta?: { start?: boolean; done?: boolean }) => void;
-};
+type TestHandlers = AcpHandlers;
 
 function cookieHeader(res: Response): string {
   return res.headers.getSetCookie().map((cookie) => cookie.split(";")[0]).join("; ");
@@ -51,6 +48,7 @@ type Gate = {
   written: ReturnType<typeof defer>;
   flushed: ReturnType<typeof defer>;
   finish: ReturnType<typeof defer>;
+  handlers?: AcpHandlers;
 };
 
 function gatedFakeAcp() {
@@ -58,6 +56,8 @@ function gatedFakeAcp() {
   const closed = defer<Error>();
   const gates: Gate[] = [];
   let next = 0;
+  let cancels = 0;
+  let completionOnCancel: { text: string; messageId: string } | null = null;
   const prompts: string[] = [];
 
   function until<T>(p: Promise<T>): Promise<T> {
@@ -81,18 +81,31 @@ function gatedFakeAcp() {
       async newSession() {
         return "s1";
       },
-      cancel() {},
-      async prompt(text: string) {
+      cancel() {
+        cancels += 1;
+        const completion = completionOnCancel;
+        completionOnCancel = null;
+        if (completion) {
+          gates[Math.max(0, next - 1)]?.handlers?.onAssistant?.(completion.text, {
+            start: true,
+            done: true,
+            messageId: completion.messageId,
+          });
+        }
+      },
+      async prompt(text: string, promptHandlers?: AcpHandlers) {
+        const turnHandlers = promptHandlers ?? handlers;
         prompts.push(text);
         const gate = gates[next++];
         if (!gate) throw new Error("prompt without arm()");
+        gate.handlers = turnHandlers;
         await until(gate.written.promise);
-        handlers?.onPromptWritten?.();
+        turnHandlers?.onPromptWritten?.();
         await until(gate.flushed.promise);
-        handlers?.onPromptFlushed?.();
+        turnHandlers?.onPromptFlushed?.();
         await until(gate.finish.promise);
-        handlers?.onAssistant?.("First.", { start: true, done: true });
-        handlers?.onAssistant?.("Second.", { start: true, done: true });
+        turnHandlers?.onAssistant?.("First.", { start: true, done: true });
+        turnHandlers?.onAssistant?.("Second.", { start: true, done: true });
         return "First.\nSecond.";
       },
       respondPermission() {},
@@ -102,10 +115,21 @@ function gatedFakeAcp() {
   return {
     spawnAcp,
     prompts: () => prompts,
+    cancelCount: () => cancels,
+    completeOnCancel(text: string, messageId: string): void {
+      completionOnCancel = { text, messageId };
+    },
     arm(): Gate {
       const gate: Gate = { written: defer(), flushed: defer(), finish: defer() };
       gates.push(gate);
       return gate;
+    },
+    emit(
+      gate: Gate,
+      text: string,
+      delta?: { start?: boolean; done?: boolean; messageId?: string },
+    ): void {
+      gate.handlers?.onAssistant?.(text, delta);
     },
   };
 }
@@ -184,6 +208,145 @@ async function openTalk() {
 }
 
 describe("Talk HTTP reply and react", () => {
+  test("one ACP message id stays private across continuation events and publishes once at completion", async () => {
+    const { box, fake, cookie, id } = await openTalk();
+    try {
+      const gate = fake.arm();
+      const posted = await fetch(`${box.url}/api/bots/${id}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "use a tool" }),
+      });
+      assert.ok(posted.ok);
+
+      fake.emit(gate, "Complete ", { start: true, messageId: "same-message" });
+      fake.emit(gate, "Complete after tool.", { messageId: "same-message" });
+      const partial = await getBot(box.url, cookie, id);
+      assert.equal(
+        (partial.messages ?? []).some((message) => message.role === "assistant"),
+        false,
+        "continuation events must remain outside the public Transcript",
+      );
+
+      fake.emit(gate, "Complete after tool.", { done: true, messageId: "same-message" });
+
+      const current = await getBot(box.url, cookie, id);
+      const matching = (current.messages ?? []).filter(
+        (message) => message.role === "assistant" && message.text.includes("Complete"),
+      );
+      assert.equal(matching.length, 1);
+      assert.equal(matching[0]?.text, "Complete after tool.");
+
+      fake.emit(gate, "Late duplicate replacement.", {
+        start: true,
+        done: true,
+        messageId: "same-message",
+      });
+      const afterDuplicate = await getBot(box.url, cookie, id);
+      const stable = (afterDuplicate.messages ?? []).filter(
+        (message) => message.role === "assistant",
+      );
+      assert.equal(stable.length, 1);
+      assert.equal(stable[0]?.id, matching[0]?.id);
+      assert.equal(stable[0]?.text, "Complete after tool.");
+
+      await releaseTurn(gate);
+    } finally {
+      await box.close();
+    }
+  });
+
+  test("interrupting retains a completed message and discards the next unfinished message", async () => {
+    const { box, fake, cookie, id } = await openTalk();
+    try {
+      const originalGate = fake.arm();
+      const posted = await fetch(`${box.url}/api/bots/${id}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "use a tool, then keep writing" }),
+      });
+      assert.ok(posted.ok);
+
+      fake.emit(originalGate, "Completed before tool.", {
+        start: true,
+        messageId: "completed-message",
+      });
+      fake.emit(originalGate, "Completed before tool.", {
+        done: true,
+        messageId: "completed-message",
+      });
+      fake.emit(originalGate, "Completed before tool. Unfinished continuation", {
+        start: true,
+        messageId: "unfinished-message",
+      });
+
+      const duringContinuation = await getBot(box.url, cookie, id);
+      assert.equal(
+        (duringContinuation.messages ?? []).find((message) => message.role === "assistant")?.text,
+        "Completed before tool.",
+      );
+
+      const replacementGate = fake.arm();
+      fake.completeOnCancel("Stale completion during cancel.", "stale-cancel-message");
+      const replacement = await fetch(`${box.url}/api/bots/${id}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "replace the unfinished continuation" }),
+      });
+      assert.ok(replacement.ok);
+      const interrupted = (await replacement.json()) as BotBody;
+      const assistant = (interrupted.messages ?? []).filter((message) => message.role === "assistant");
+      assert.equal(assistant.length, 1);
+      assert.equal(assistant[0]?.text, "Completed before tool.");
+      assert.equal(
+        assistant.some((message) => message.text.includes("Unfinished continuation")),
+        false,
+      );
+      assert.equal(
+        assistant.some((message) => message.text.includes("Stale completion during cancel")),
+        false,
+      );
+
+      await releaseTurn(replacementGate);
+      originalGate.written.resolve();
+      originalGate.flushed.resolve();
+      originalGate.finish.resolve();
+      await tick();
+    } finally {
+      await box.close();
+    }
+  });
+
+  test("an anonymous ACP stream after an identified completion stays a separate bubble", async () => {
+    const { box, fake, cookie, id } = await openTalk();
+    try {
+      const gate = fake.arm();
+      const posted = await fetch(`${box.url}/api/bots/${id}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "use a tool, then continue anonymously" }),
+      });
+      assert.ok(posted.ok);
+
+      fake.emit(gate, "Identified.", { start: true, messageId: "identified-message" });
+      fake.emit(gate, "Identified.", { done: true, messageId: "identified-message" });
+      fake.emit(gate, "Anonymous.", { start: true });
+      fake.emit(gate, "Anonymous.", { done: true });
+
+      const current = await getBot(box.url, cookie, id);
+      assert.deepEqual(
+        (current.messages ?? [])
+          .filter((message) => message.role === "assistant" && /Identified|Anonymous/.test(message.text))
+          .map((message) => message.text),
+        ["Identified.", "Anonymous."],
+      );
+
+      await releaseTurn(gate);
+    } finally {
+      await box.close();
+    }
+  });
+
   test("replyTo nests on the user bubble, keeps receipts, and survives GET plus Talk restart", async () => {
     const opened = await openTalk();
     let { box, fake, cookie, id, homeDir } = opened;
@@ -383,6 +546,44 @@ describe("Talk HTTP reply and react", () => {
       assert.equal(nestedMsg?.receipt, "sent");
       assert.equal(body.write, true);
 
+      await tick();
+      fake.emit(replyGate, "completed before tool", { start: true });
+      fake.emit(replyGate, "completed before tool", { done: true });
+      fake.emit(replyGate, "unfinished response", { start: true });
+      await tick();
+      const partial = await getBot(box.url, cookie, id);
+      assert.equal(partial.write, true);
+      assert.equal(
+        (partial.messages ?? []).some(
+          (m) => m.role === "assistant" && m.text === "unfinished response",
+        ),
+        false,
+        "unfinished ACP text must stay outside the public Transcript",
+      );
+      const polled = await getBot(box.url, cookie, id);
+      assert.deepEqual(
+        (polled.messages ?? []).map((message) => message.id),
+        (partial.messages ?? []).map((message) => message.id),
+        "polling must not materialize or replace a private partial",
+      );
+
+      const invalidDuringWork = await fetch(`${box.url}/api/bots/${id}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "must not interrupt", replyTo: "missing-live-bubble" }),
+      });
+      assert.equal(invalidDuringWork.status, 400);
+      const afterInvalid = await getBot(box.url, cookie, id);
+      assert.equal(afterInvalid.write, true, "invalid reply must leave the active Turn running");
+      assert.equal(fake.cancelCount(), 0, "invalid reply must be rejected before cancellation");
+      assert.equal(
+        (afterInvalid.messages ?? []).some(
+          (m) => m.role === "assistant" && m.text === "unfinished response",
+        ),
+        false,
+        "invalid reply must not publish private partial text",
+      );
+
       const interruptGate = fake.arm();
       const interrupt = await fetch(`${box.url}/api/bots/${id}/messages`, {
         method: "POST",
@@ -395,12 +596,87 @@ describe("Talk HTTP reply and react", () => {
       const stopMsg = (stopped.messages ?? []).find((m) => m.text === "stop");
       assert.equal(stopMsg?.replyTo, nestedMsg?.id);
       assert.equal(stopMsg?.receipt, "sent");
+      assert.ok(
+        (stopped.messages ?? []).some((m) => m.role === "assistant" && m.text === "First."),
+        "interrupt must retain completed bubbles from earlier Turns",
+      );
+      assert.ok(
+        (stopped.messages ?? []).some(
+          (m) => m.role === "assistant" && m.text === "completed before tool",
+        ),
+        "interrupt must retain a completed ACP bubble",
+      );
+      assert.equal(
+        (stopped.messages ?? []).some((m) => /response stopped/i.test(m.text)),
+        false,
+        "interrupt must not append a synthetic Response stopped bubble",
+      );
+      assert.equal(
+        (stopped.messages ?? []).some((m) => m.text === "unfinished response"),
+        false,
+        "interrupt must discard the unfinished assistant bubble",
+      );
 
       await releaseTurn(interruptGate);
       replyGate.written.resolve();
       replyGate.flushed.resolve();
       replyGate.finish.resolve();
       await tick();
+
+      const completed = await getBot(box.url, cookie, id);
+      assert.equal(completed.write, false);
+      assert.equal(
+        (completed.messages ?? []).some((m) => /response stopped/i.test(m.text)),
+        false,
+      );
+      assert.equal(
+        (completed.messages ?? []).filter((m) => m.role === "assistant" && m.text === "First.").length,
+        2,
+        "only the completed first Turn and replacement Turn may contribute assistant bubbles",
+      );
+      assert.equal(
+        (completed.messages ?? []).filter((m) => m.role === "assistant" && m.text === "Second.").length,
+        2,
+      );
+    } finally {
+      await box.close();
+    }
+  });
+
+  test("does not restore private unfinished ACP text after Talk restarts", async () => {
+    const opened = await openTalk();
+    let { box, fake, cookie, id, homeDir } = opened;
+    try {
+      const gate = fake.arm();
+      const posted = await fetch(`${box.url}/api/bots/${id}/messages`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ text: "begin a response" }),
+      });
+      assert.ok(posted.ok);
+      fake.emit(gate, "private unfinished text", {
+        start: true,
+        messageId: "private-message",
+      });
+      await tick();
+      assert.equal(
+        (await getBot(box.url, cookie, id)).messages?.some(
+          (message) => message.text === "private unfinished text",
+        ),
+        false,
+      );
+
+      await box.close();
+      const restartedFake = gatedFakeAcp();
+      fake = restartedFake;
+      box = await startTalk(restartedFake.spawnAcp, homeDir);
+      cookie = await login(box.url);
+      const restarted = await getBot(box.url, cookie, id);
+      assert.equal(restarted.write, false);
+      assert.equal(
+        (restarted.messages ?? []).some((message) => message.text === "private unfinished text"),
+        false,
+      );
     } finally {
       await box.close();
     }

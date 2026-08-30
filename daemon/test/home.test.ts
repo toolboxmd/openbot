@@ -40,6 +40,454 @@ function modeOf(path: string): number {
 }
 
 describe("HomeStore sqlite", () => {
+  test("indexes the monotonic activity cursor used by inbox summaries and migrations", async () => {
+    const homeDir = await tempHome();
+    const databasePath = join(homeDir, "talk.sqlite");
+    const fresh = new HomeStore(homeDir);
+    fresh.close();
+
+    const seed = new DatabaseSync(databasePath);
+    seed.exec(`
+      DROP INDEX IF EXISTS messages_channel_activity;
+      PRAGMA user_version = 3;
+    `);
+    seed.close();
+
+    const migrated = new HomeStore(homeDir);
+    migrated.close();
+    const probe = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const columns = probe
+        .prepare("PRAGMA index_info(messages_channel_activity)")
+        .all() as Array<{ name?: string }>;
+      assert.deepEqual(columns.map((column) => column.name), ["channel_id", "activity_sequence"]);
+    } finally {
+      probe.close();
+    }
+  });
+
+  test("Channel activity exposes only safe text and persists the human read cursor", async () => {
+    const homeDir = await tempHome();
+    const adaId = crypto.randomUUID();
+    const channelId = crypto.randomUUID();
+    const home = new HomeStore(homeDir);
+    home.createBot(
+      {
+        id: adaId,
+        name: "Ada",
+        color: "#ff3b5c",
+        shape: "capsule",
+        harness: null,
+        createdAt: iso(),
+      },
+      channelId,
+    );
+    assert.deepEqual(home.channelActivity(channelId), {
+      latestText: null,
+      lastActivityAt: iso(),
+      unread: false,
+      cursor: { sequence: 0, revision: 0 },
+    });
+
+    home.appendMessage(channelId, {
+      id: crypto.randomUUID(),
+      role: "user",
+      text: "  hello\nAda  ",
+      createdAt: iso(1000),
+      senderId: HUMAN_MEMBER_ID,
+      recipientBotId: adaId,
+      receipt: "sent",
+    });
+    assert.deepEqual(home.channelActivity(channelId), {
+      latestText: "  hello\nAda  ",
+      lastActivityAt: iso(1000),
+      unread: false,
+      cursor: { sequence: 1, revision: 1 },
+    });
+
+    home.appendMessage(channelId, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: "safe answer",
+      createdAt: iso(2000),
+      senderId: adaId,
+    });
+    home.appendMessage(channelId, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      kind: "host-grant",
+      text: "/Users/private/secret",
+      createdAt: iso(3000),
+      senderId: adaId,
+    });
+    assert.deepEqual(home.channelActivity(channelId), {
+      latestText: "safe answer",
+      lastActivityAt: iso(2000),
+      unread: true,
+      cursor: { sequence: 3, revision: 1 },
+    });
+
+    home.markChannelRead(channelId, { sequence: 3, revision: 1 }, iso(4000));
+    assert.equal(home.channelActivity(channelId).unread, false);
+    home.close();
+
+    const again = new HomeStore(homeDir);
+    assert.equal(again.channelActivity(channelId).unread, false);
+    again.appendMessage(channelId, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: "a later answer",
+      createdAt: iso(5000),
+      senderId: adaId,
+    });
+    assert.equal(again.channelActivity(channelId).unread, true);
+    again.close();
+  });
+
+  test("read acknowledgement is limited to the transcript cursor the browser observed", async () => {
+    const homeDir = await tempHome();
+    const adaId = crypto.randomUUID();
+    const channelId = crypto.randomUUID();
+    const firstId = crypto.randomUUID();
+    const home = new HomeStore(homeDir);
+    home.createBot(
+      {
+        id: adaId,
+        name: "Ada",
+        color: "#ff3b5c",
+        shape: "capsule",
+        harness: null,
+        createdAt: iso(),
+      },
+      channelId,
+    );
+    home.appendMessage(channelId, {
+      id: firstId,
+      role: "assistant",
+      text: "first chunk",
+      createdAt: iso(1000),
+      senderId: adaId,
+    });
+    const observed = home.channelActivity(channelId).cursor;
+    home.appendMessage(channelId, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: "arrived during the read request",
+      createdAt: iso(2000),
+      senderId: adaId,
+    });
+
+    home.markChannelRead(channelId, observed, iso(3000));
+    assert.equal(home.channelActivity(channelId).unread, true);
+
+    const latest = home.channelActivity(channelId).cursor;
+    home.markChannelRead(channelId, latest, iso(4000));
+    assert.equal(home.channelActivity(channelId).unread, false);
+
+    home.updateMessageText(firstId, "first chunk, completed later", iso(4500));
+    assert.deepEqual(home.channelActivity(channelId), {
+      latestText: "first chunk, completed later",
+      lastActivityAt: iso(4500),
+      unread: true,
+      cursor: { sequence: 3, revision: 2 },
+    }, "an earlier visible revision owns new Channel activity after the read cursor advanced");
+    home.markChannelRead(channelId, { sequence: 3, revision: 2 }, iso(4750));
+    assert.equal(home.channelActivity(channelId).unread, false);
+
+    const streamingId = crypto.randomUUID();
+    home.appendMessage(channelId, {
+      id: streamingId,
+      role: "assistant",
+      text: "streaming",
+      createdAt: iso(5000),
+      senderId: adaId,
+    });
+    const streaming = home.channelActivity(channelId).cursor;
+    home.markChannelRead(channelId, streaming, iso(6000));
+    home.updateMessageText(streamingId, "streaming completed");
+    assert.equal(home.channelActivity(channelId).unread, true, "a later revision is new activity");
+    home.close();
+  });
+
+  test("resumed assistant content after a read Host-grant Card owns new activity", async () => {
+    const homeDir = await tempHome();
+    const adaId = crypto.randomUUID();
+    const channelId = crypto.randomUUID();
+    const assistantId = crypto.randomUUID();
+    const home = new HomeStore(homeDir);
+    home.createBot(
+      {
+        id: adaId,
+        name: "Ada",
+        color: "#ff3b5c",
+        shape: "capsule",
+        harness: null,
+        createdAt: iso(),
+      },
+      channelId,
+    );
+    home.appendMessage(channelId, {
+      id: assistantId,
+      role: "assistant",
+      text: "Before permission.",
+      createdAt: iso(1000),
+      senderId: adaId,
+    });
+    home.appendMessage(channelId, {
+      id: crypto.randomUUID(),
+      role: "user",
+      kind: "host-grant",
+      text: "Read · once\n/tmp/outside.txt",
+      createdAt: iso(2000),
+      senderId: HUMAN_MEMBER_ID,
+    });
+
+    const throughCard = home.channelActivity(channelId).cursor;
+    assert.deepEqual(throughCard, { sequence: 2, revision: 1 });
+    home.markChannelRead(channelId, throughCard, iso(2500));
+    assert.equal(home.channelActivity(channelId).unread, false);
+
+    home.updateMessageText(assistantId, "Before permission. After permission.", iso(3000));
+    assert.deepEqual(home.channelActivity(channelId), {
+      latestText: "Before permission. After permission.",
+      lastActivityAt: iso(3000),
+      unread: true,
+      cursor: { sequence: 3, revision: 2 },
+    });
+    home.markChannelRead(channelId, { sequence: 3, revision: 2 }, iso(3500));
+    assert.equal(home.channelActivity(channelId).unread, false);
+    home.close();
+  });
+
+  test("Channel activity sequence does not reuse an interrupted partial's position", async () => {
+    const homeDir = await tempHome();
+    const adaId = crypto.randomUUID();
+    const channelId = crypto.randomUUID();
+    const partialId = crypto.randomUUID();
+    const home = new HomeStore(homeDir);
+    home.createBot(
+      {
+        id: adaId,
+        name: "Ada",
+        color: "#ff3b5c",
+        shape: "capsule",
+        harness: null,
+        createdAt: iso(),
+      },
+      channelId,
+    );
+    home.appendMessage(channelId, {
+      id: crypto.randomUUID(),
+      role: "user",
+      text: "Start",
+      createdAt: iso(1000),
+      senderId: HUMAN_MEMBER_ID,
+    });
+    home.appendMessage(channelId, {
+      id: partialId,
+      role: "assistant",
+      text: "unfinished",
+      createdAt: iso(2000),
+      senderId: adaId,
+    });
+    assert.equal(home.deleteMessage(partialId), true);
+    home.appendMessage(channelId, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: "replacement",
+      createdAt: iso(3000),
+      senderId: adaId,
+    });
+
+    assert.deepEqual(home.channelActivity(channelId).cursor, { sequence: 3, revision: 1 });
+    home.close();
+  });
+
+  test("lightweight Channel summaries cap preview text and do not hydrate transcripts", async () => {
+    const homeDir = await tempHome();
+    const adaId = crypto.randomUUID();
+    const channelId = crypto.randomUUID();
+    const home = new HomeStore(homeDir);
+    home.createBot(
+      {
+        id: adaId,
+        name: "Ada",
+        color: "#ff3b5c",
+        shape: "capsule",
+        harness: null,
+        createdAt: iso(),
+      },
+      channelId,
+    );
+    home.appendMessage(channelId, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: "x".repeat(800),
+      createdAt: iso(1000),
+      senderId: adaId,
+    });
+
+    const [summary] = home.listChannelSummaries();
+    assert.equal(summary?.id, channelId);
+    assert.equal(summary?.activity.latestText?.length, 512);
+    assert.equal("messages" in (summary ?? {}), false);
+    home.close();
+  });
+
+  test("gets one lightweight Channel summary without hydrating another Channel", async () => {
+    const homeDir = await tempHome();
+    const adaId = crypto.randomUUID();
+    const adaChannelId = crypto.randomUUID();
+    const bobId = crypto.randomUUID();
+    const bobChannelId = crypto.randomUUID();
+    const home = new HomeStore(homeDir);
+    home.createBot(
+      {
+        id: adaId,
+        name: "Ada",
+        color: "#ff3b5c",
+        shape: "capsule",
+        harness: null,
+        createdAt: iso(),
+      },
+      adaChannelId,
+    );
+    home.createBot(
+      {
+        id: bobId,
+        name: "Bob",
+        color: "#2457ff",
+        shape: "rounded-cube",
+        harness: null,
+        createdAt: iso(1000),
+      },
+      bobChannelId,
+    );
+    home.appendMessage(adaChannelId, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: "target reply",
+      createdAt: iso(2000),
+      senderId: adaId,
+    });
+    home.appendMessage(bobChannelId, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: "other reply",
+      createdAt: iso(3000),
+      senderId: bobId,
+    });
+
+    const summary = home.getChannelSummary(adaChannelId);
+    assert.equal(summary?.id, adaChannelId);
+    assert.equal(summary?.activity.latestText, "target reply");
+    assert.deepEqual(summary?.members, [
+      { kind: "user", id: HUMAN_MEMBER_ID },
+      { kind: "bot", id: adaId },
+    ]);
+    assert.equal("messages" in (summary ?? {}), false);
+    assert.equal(home.getChannelSummary("missing"), null);
+    home.close();
+  });
+
+  test("returns stable sender identity for same-role messages from different Channel members", async () => {
+    const homeDir = await tempHome();
+    const home = new HomeStore(homeDir);
+    const adaId = crypto.randomUUID();
+    const bobId = crypto.randomUUID();
+    const adaChannelId = crypto.randomUUID();
+    const bobChannelId = crypto.randomUUID();
+    home.createBot(
+      {
+        id: adaId,
+        name: "Ada",
+        color: "#ff3b5c",
+        shape: "capsule",
+        harness: null,
+        createdAt: iso(),
+      },
+      adaChannelId,
+    );
+    home.createBot(
+      {
+        id: bobId,
+        name: "Bob",
+        color: "#2457ff",
+        shape: "rounded-cube",
+        harness: null,
+        createdAt: iso(1000),
+      },
+      bobChannelId,
+    );
+    const group = home.createGroup({ title: "Ada & Bob", memberBotIds: [adaId, bobId] });
+    home.appendMessage(group.id, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: "Ada here",
+      createdAt: iso(2000),
+      senderId: adaId,
+    });
+    home.appendMessage(group.id, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: "Bob here",
+      createdAt: iso(3000),
+      senderId: bobId,
+    });
+
+    const messages = home.listMessages(group.id) as Array<{ senderId?: string }>;
+    assert.deepEqual(messages.map((message) => message.senderId), [adaId, bobId]);
+    home.close();
+  });
+
+  test("migrates schema 2 Homes by baselining existing activity as read", async () => {
+    const homeDir = await tempHome();
+    const databasePath = join(homeDir, "talk.sqlite");
+    const current = new HomeStore(homeDir);
+    const adaId = crypto.randomUUID();
+    const channelId = crypto.randomUUID();
+    current.createBot(
+      {
+        id: adaId,
+        name: "Ada",
+        color: "#ff3b5c",
+        shape: "capsule",
+        harness: null,
+        createdAt: iso(),
+      },
+      channelId,
+    );
+    current.appendMessage(channelId, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: "historical reply",
+      createdAt: iso(1000),
+      senderId: adaId,
+    });
+    current.close();
+    const seed = new DatabaseSync(databasePath);
+    seed.exec(`
+      DROP TABLE channel_reads;
+      PRAGMA user_version = 2;
+    `);
+    seed.close();
+
+    const home = new HomeStore(homeDir);
+    assert.equal(home.channelActivity(channelId).unread, false);
+    home.close();
+    const probe = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const version = probe.prepare("PRAGMA user_version").get() as { user_version?: number };
+      assert.equal(version.user_version, HOME_SCHEMA_VERSION);
+      const table = probe
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'channel_reads'")
+        .get() as { name?: string } | undefined;
+      assert.equal(table?.name, "channel_reads");
+    } finally {
+      probe.close();
+    }
+  });
+
   test("empty Home: createBot writes bot + direct Channel members you+bot", async () => {
     const homeDir = await tempHome();
     const adaId = crypto.randomUUID();
@@ -369,12 +817,14 @@ describe("channelHistory and talkPrompt", () => {
       messages.push({
         id: `u${i}`,
         role: "user" as const,
+        senderId: HUMAN_MEMBER_ID,
         text: `user-${i}`,
         createdAt: iso(i * 1000),
       });
       messages.push({
         id: `a${i}`,
         role: "assistant" as const,
+        senderId: "ada",
         text: `asst-${i}`,
         createdAt: iso(i * 1000 + 1),
       });
@@ -389,10 +839,39 @@ describe("channelHistory and talkPrompt", () => {
 
   test("clips a 64000-character history and marks the cut", () => {
     const huge = "x".repeat(70_000);
-    const history = channelHistory([{ id: "u1", role: "user", text: huge, createdAt: iso() }], "Ada");
+    const history = channelHistory([{
+      id: "u1",
+      role: "user",
+      senderId: HUMAN_MEMBER_ID,
+      text: huge,
+      createdAt: iso(),
+    }], "Ada");
     assert.match(history, /\[Earlier transcript clipped\]/);
     assert.equal(history.length, 64_000);
     assert.match(history, /^Recent Channel transcript:\n/);
+  });
+
+  test("keeps Cards out of the speech transcript injected into ACP", () => {
+    const history = channelHistory([
+      { id: "u1", role: "user", senderId: HUMAN_MEMBER_ID, text: "hello", createdAt: iso() },
+      {
+        id: "c1",
+        role: "assistant",
+        senderId: "ada",
+        kind: "card",
+        text: "Permission requested: Waiting for you",
+        createdAt: iso(1),
+        card: {
+          kind: "permission",
+          title: "Permission requested",
+          body: "This Bot needs approval.",
+          status: { tone: "waiting", label: "Waiting for you" },
+          actions: [],
+        },
+      },
+      { id: "a1", role: "assistant", senderId: "ada", text: "done", createdAt: iso(2) },
+    ], "Ada");
+    assert.equal(history, "Recent Channel transcript:\nYou: hello\nAda: done");
   });
 
   test("talkPrompt includes Replying to even when history is empty", () => {

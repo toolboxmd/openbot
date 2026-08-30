@@ -4,6 +4,27 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#ffffff" />
+    <script>
+      (() => {
+        const key = "openbot.ui-preferences.v1";
+        let preference = "system";
+        try {
+          const stored = JSON.parse(localStorage.getItem(key) || "null");
+          if (stored && ["light", "dark", "system"].includes(stored.theme)) preference = stored.theme;
+        } catch {}
+        const theme =
+          preference === "dark" ||
+          (preference === "system" && matchMedia("(prefers-color-scheme: dark)").matches)
+            ? "dark"
+            : "light";
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+        document.querySelector('meta[name="theme-color"]')?.setAttribute(
+          "content",
+          theme === "dark" ? "#0F0F10" : "#FFFFFF",
+        );
+      })();
+    </script>
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="OpenBot" />
     <link rel="manifest" href="/manifest.webmanifest" />

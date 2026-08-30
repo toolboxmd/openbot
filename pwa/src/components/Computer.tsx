@@ -8,10 +8,19 @@ import {
   setComputerZoom,
   type Computer,
 } from "@/lib/session";
+import { startComputerZoomSync } from "@/lib/computer-zoom";
 import { Button } from "@/components/ui/button";
-import { MessageSquare } from "lucide-react";
+import { Maximize2, MessageSquare } from "lucide-react";
+import { createLatestRequestScope } from "@/lib/async-state";
 import { cn } from "@/lib/utils";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
 
 function screenSrc(path: string, botId: string | null, viewOnly: boolean): string {
   const url = new URL(path, "http://openbot.local");
@@ -155,20 +164,86 @@ export function ComputerScreenStateNotice({
   );
 }
 
+export function SelectedBotComputerPreview({
+  botName,
+  triggerRef,
+  onOpen,
+  children,
+}: {
+  botName: string;
+  triggerRef: RefObject<HTMLButtonElement | null>;
+  onOpen: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      data-testid="selected-bot-computer-preview"
+      className="relative isolate aspect-[16/10] overflow-hidden rounded-[var(--radius-card)] border bg-black shadow-sm"
+    >
+      {children}
+      <button
+        ref={triggerRef}
+        type="button"
+        data-testid="open-computer-preview"
+        aria-label={`Open ${botName}'s Computer`}
+        onClick={onOpen}
+        className="absolute inset-0 z-10 flex min-h-[var(--touch-min)] items-end justify-end p-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+      >
+        <span className="inline-flex min-h-9 items-center gap-2 rounded-[var(--radius-control)] bg-background/90 px-3 text-xs font-medium text-foreground shadow-sm backdrop-blur-sm">
+          <Maximize2 className="size-4" />
+          Open Computer
+        </span>
+      </button>
+    </div>
+  );
+}
+
+function ComputerScreenLoadingNotice({
+  expanded,
+  onClose,
+}: {
+  expanded: boolean;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      role="status"
+      className="absolute inset-0 z-40 flex items-center justify-center bg-background px-6"
+    >
+      <div className="text-center">
+        <p className="text-sm text-muted-foreground">Opening Computer…</p>
+        {expanded ? (
+          <Button type="button" size="sm" variant="outline" onClick={onClose} className="mt-4">
+            <MessageSquare />
+            Chat
+          </Button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 export function ComputerScreen({
   botId,
   expanded,
   onClose,
+  onFailure,
+  showChatButton = true,
 }: {
   botId: string | null;
   expanded: boolean;
   onClose: () => void;
+  onFailure?: (message: string) => void;
+  showChatButton?: boolean;
 }) {
   const [computer, setComputer] = useState<Computer | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [retryingScreen, setRetryingScreen] = useState(false);
+  const [loadedBotId, setLoadedBotId] = useState<string | null | undefined>(undefined);
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   const computerRef = useRef<Computer | null>(null);
+  const computerRequestRef = useRef(createLatestRequestScope());
+  const dismissRequestRef = useRef(createLatestRequestScope());
   const transitionVersion = useRef(0);
   const pendingTransitions = useRef(0);
   const loadSequence = useRef(0);
@@ -181,39 +256,47 @@ export function ComputerScreen({
   computerRef.current = computer;
 
   useEffect(() => {
-    let cancelled = false;
+    computerRequestRef.current.cancel();
+    dismissRequestRef.current.cancel();
     transitionVersion.current += 1;
     retryRequestRef.current = null;
     setRetryingScreen(false);
     setComputer(null);
     setError(null);
-    const load = () => {
+    setLoadedBotId(undefined);
+
+    async function refresh(showFailure: boolean) {
+      if (pendingTransitions.current > 0 || retryRequestRef.current !== null) return;
       const sequence = ++loadSequence.current;
       const version = transitionVersion.current;
-      const startedDuringTransition = pendingTransitions.current > 0 || retryRequestRef.current !== null;
-      const canPublish = () => !cancelled
-        && selectedBotRef.current === botId
+      const canPublish = () => selectedBotRef.current === botId
         && loadSequence.current === sequence
-        && !startedDuringTransition
         && pendingTransitions.current === 0
         && retryRequestRef.current === null
         && transitionVersion.current === version;
-      void getComputer(botId)
-        .then((data) => {
-          if (!canPublish() || !computerMatchesSelection(data, botId)) return;
-          setComputer(data);
-          setError(screenIsUsable(data, botId) ? ownershipMismatch(data, expandedRef.current, botId) : null);
-        })
-        .catch(() => {
-          if (canPublish()) setError("Could not open Computer.");
-        });
-    };
-    load();
-    const tick = window.setInterval(() => {
-      load();
-    }, 1500);
+      await computerRequestRef.current.run(
+        (signal) => getComputer(botId, signal),
+        {
+          success(data) {
+            if (!canPublish() || !computerMatchesSelection(data, botId)) return;
+            setComputer(data);
+            setError(screenIsUsable(data, botId) ? ownershipMismatch(data, expandedRef.current, botId) : null);
+            setLoadedBotId(botId);
+          },
+          failure() {
+            if (!canPublish() || !showFailure) return;
+            setError("Could not open Computer.");
+            setLoadedBotId(botId);
+          },
+        },
+      );
+    }
+
+    void refresh(true);
+    const tick = window.setInterval(() => void refresh(false), 1500);
     return () => {
-      cancelled = true;
+      computerRequestRef.current.cancel();
+      dismissRequestRef.current.cancel();
       transitionVersion.current += 1;
       if (retryRequestRef.current?.botId === botId) retryRequestRef.current = null;
       loadSequence.current += 1;
@@ -224,31 +307,46 @@ export function ComputerScreen({
   useEffect(() => {
     if (botId && !computer) return;
     if (computer && !screenIsUsable(computer, botId)) return;
-    const version = ++transitionVersion.current;
-    pendingTransitions.current += 1;
-    void setComputerZoom(botId, expanded)
-      .then((data) => {
-        if (transitionVersion.current !== version || !computerMatchesSelection(data, botId)) return;
-        setComputer(data);
-        setError(ownershipMismatch(data, expanded, botId));
-      })
-      .catch((cause: unknown) => {
-        if (transitionVersion.current !== version) return;
-        const failure = transitionError(cause);
-        if (failure.computer && computerMatchesSelection(failure.computer, botId)) {
-          setComputer(failure.computer);
+
+    const setComputerZoomForSelection = async (
+      selectedBotId: string | null,
+      zoom: boolean,
+    ): Promise<Computer> => {
+      const version = ++transitionVersion.current;
+      pendingTransitions.current += 1;
+      computerRequestRef.current.cancel();
+      try {
+        const data = await setComputerZoom(selectedBotId, zoom, { keepalive: !zoom });
+        if (
+          transitionVersion.current === version
+          && selectedBotRef.current === selectedBotId
+          && computerMatchesSelection(data, selectedBotId)
+        ) {
+          setComputer(data);
+          setError(ownershipMismatch(data, zoom, selectedBotId));
+          setLoadedBotId(selectedBotId);
         }
-        setError(failure.message);
-      })
-      .finally(() => {
+        return data;
+      } catch (cause) {
+        if (transitionVersion.current === version && selectedBotRef.current === selectedBotId) {
+          const failure = transitionError(cause);
+          if (failure.computer && computerMatchesSelection(failure.computer, selectedBotId)) {
+            setComputer(failure.computer);
+            setLoadedBotId(selectedBotId);
+          }
+          setError(failure.message);
+        }
+        throw cause;
+      } finally {
         pendingTransitions.current -= 1;
-      });
-    return () => {
-      transitionVersion.current += 1;
-      if (expanded && (!botId || (computer && screenIsUsable(computer, botId)))) {
-        void releaseComputerForNavigation(botId).catch(() => undefined);
       }
     };
+
+    return startComputerZoomSync(
+      botId,
+      expanded,
+      setComputerZoomForSelection,
+    );
   }, [botId, expanded, computer?.path, computer?.screenState, computer?.ready, computer?.botId]);
 
   useEffect(() => {
@@ -265,7 +363,9 @@ export function ComputerScreen({
     };
   }, [botId, expanded]);
 
-  const canWrite = computerCanWrite(computer, expanded, botId);
+  const currentComputer = loadedBotId === botId ? computer : null;
+  const currentError = loadedBotId === botId ? error : null;
+  const canWrite = computerCanWrite(currentComputer, expanded, botId);
 
   useEffect(() => {
     if (!canWrite) return;
@@ -306,8 +406,12 @@ export function ComputerScreen({
       onClose();
       return;
     }
-    if (await applyDesiredOwnership(false)) onClose();
-  }, [applyDesiredOwnership, botId, computer, onClose]);
+    if (await applyDesiredOwnership(false)) {
+      onClose();
+      return;
+    }
+    onFailure?.("Could not close Computer. Try again.");
+  }, [applyDesiredOwnership, botId, computer, onClose, onFailure]);
 
   const retryScreenAttachment = useCallback(async () => {
     if (
@@ -360,27 +464,22 @@ export function ComputerScreen({
     return () => window.removeEventListener("keydown", onKey);
   }, [dismiss, expanded]);
 
-  if (error && !computer) {
-    return (
-      <ComputerOwnershipNotice
-        message={error}
-        onRetry={() => void applyDesiredOwnership(expanded)}
-      />
-    );
+  if (currentError && !currentComputer) {
+    return <p className="px-6 text-sm text-muted-foreground" role="alert">{currentError}</p>;
   }
 
-  if (!computer) {
-    return <p className="px-6 text-sm text-muted-foreground">Opening Computer…</p>;
+  if (!currentComputer) {
+    return <ComputerScreenLoadingNotice expanded={expanded} onClose={onClose} />;
   }
 
-  if (!screenIsUsable(computer, botId)) {
-    const canRetrySelected = computerMatchesSelection(computer, botId) && screenCanRetry(computer);
-    const canRepairOwnership = computerMatchesSelection(computer, botId)
-      && computer.screenState === "ready"
-      && computer.ownership === "unknown";
+  if (!screenIsUsable(currentComputer, botId)) {
+    const canRetrySelected = computerMatchesSelection(currentComputer, botId) && screenCanRetry(currentComputer);
+    const canRepairOwnership = computerMatchesSelection(currentComputer, botId)
+      && currentComputer.screenState === "ready"
+      && currentComputer.ownership === "unknown";
     return (
       <ComputerScreenStateNotice
-        computer={computer}
+        computer={currentComputer}
         expanded={expanded}
         retrying={retryingScreen}
         error={error}
@@ -392,8 +491,8 @@ export function ComputerScreen({
   }
 
   const viewOnly = !canWrite;
-  const path = computer.path;
-  const visibleError = error ?? ownershipMismatch(computer, expanded, botId);
+  const path = currentComputer.path;
+  const visibleError = currentError ?? ownershipMismatch(currentComputer, expanded, botId);
 
   return (
     <>
@@ -406,7 +505,7 @@ export function ComputerScreen({
         className={cn(
           "absolute inset-0 z-0 h-full w-full border-0 bg-black",
           canWrite ? "pointer-events-auto" : "pointer-events-none",
-          computer.ownership === "unknown" && "invisible",
+          currentComputer.ownership === "unknown" && "invisible",
         )}
         allow="clipboard-read; clipboard-write; fullscreen"
       />
@@ -416,7 +515,7 @@ export function ComputerScreen({
           onRetry={() => void applyDesiredOwnership(expanded)}
         />
       ) : null}
-      {expanded ? (
+      {expanded && showChatButton ? (
         <Button
           type="button"
           size="lg"
