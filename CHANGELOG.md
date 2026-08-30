@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.15.1] - 2026-08-30
+
+### Changed
+
+- Harden the connected PWA shutdown live fixture ownership boundary
+
 ## [0.15.0] - 2026-08-29
 
 ### Added

@@ -11,15 +11,26 @@ import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { describe, test } from "node:test";
 import { pickScreenPorts } from "../src/computer.ts";
+import {
+  immutableDockerRemovalArgs,
+  LIVE_LABEL,
+  OwnedCommandError,
+  RUN_LABEL,
+  runOwnedCommand,
+  validateOwnedDockerSet,
+  type DockerContainerInspect,
+  type DockerImageInspect,
+  type DockerNetworkInspect,
+  type DockerOwnershipInput,
+  type ExpectedDockerOwnership,
+  type OwnedCommandResult,
+} from "./live-screen-fixture.ts";
 
 const LIVE_GRANT = "connected-pwa-shutdown";
 const PASSWORD = "openbot-screen-live";
 const BROWSER_WAIT_MS = 300_000;
 const START_WAIT_MS = 300_000;
 const SHUTDOWN_WAIT_MS = 30_000;
-const COMMAND_OUTPUT_LIMIT_BYTES = 1_048_576;
-const COMMAND_TERM_GRACE_MS = 250;
-const COMMAND_KILL_OBSERVE_MS = 1_000;
 const DOCKER_INSPECT_WAIT_MS = 5_000;
 const DOCKER_BUILD_WAIT_MS = 600_000;
 const DOCKER_CLEANUP_WAIT_MS = 120_000;
@@ -47,23 +58,6 @@ type TapEvent = {
   httpStatus?: number;
   upgradeId?: number;
 };
-
-type OwnedCommandResult = {
-  code: number | null;
-  signal: NodeJS.Signals | null;
-  stderr: string;
-  stdout: string;
-};
-
-class OwnedCommandError extends Error {
-  readonly result: OwnedCommandResult;
-
-  constructor(message: string, result: OwnedCommandResult) {
-    super(message);
-    this.name = "OwnedCommandError";
-    this.result = result;
-  }
-}
 
 type PublicComputer = {
   botId: string | null;
@@ -110,147 +104,6 @@ async function waitUntil(
   throw new Error(`${message()} after ${timeoutMs} ms`);
 }
 
-function runOwnedCommand(
-  command: string,
-  args: string[],
-  options: {
-    description: string;
-    env: NodeJS.ProcessEnv;
-    timeoutMs: number;
-  },
-): Promise<OwnedCommandResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      cwd: repoRoot,
-      detached: process.platform !== "win32",
-      env: options.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const ownedPid = child.pid;
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let childClosed = false;
-    let settled = false;
-    let terminalError: Error | undefined;
-    let termTimer: NodeJS.Timeout | undefined;
-    let observeTimer: NodeJS.Timeout | undefined;
-    let reapTimer: NodeJS.Timeout | undefined;
-
-    const result = (
-      code: number | null = child.exitCode,
-      signal: NodeJS.Signals | null = child.signalCode,
-    ): OwnedCommandResult => ({
-      code,
-      signal,
-      stderr: Buffer.concat(stderr).toString("utf8"),
-      stdout: Buffer.concat(stdout).toString("utf8"),
-    });
-    const groupAlive = (): boolean => {
-      if (!ownedPid) return false;
-      if (process.platform === "win32") {
-        return child.exitCode === null && child.signalCode === null;
-      }
-      try {
-        process.kill(-ownedPid, 0);
-        return true;
-      } catch (error) {
-        return (error as NodeJS.ErrnoException).code !== "ESRCH";
-      }
-    };
-    const signalGroup = (signal: NodeJS.Signals): void => {
-      if (!ownedPid) return;
-      try {
-        if (process.platform === "win32") child.kill(signal);
-        else process.kill(-ownedPid, signal);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") child.kill(signal);
-      }
-    };
-    const clearTimers = (): void => {
-      clearTimeout(deadlineTimer);
-      if (termTimer) clearTimeout(termTimer);
-      if (observeTimer) clearTimeout(observeTimer);
-      if (reapTimer) clearInterval(reapTimer);
-    };
-    const finishFailureAfterClosure = (): void => {
-      if (settled || !terminalError || !childClosed || groupAlive()) return;
-      settled = true;
-      clearTimers();
-      reject(terminalError);
-    };
-    const finishFailureAtBound = (): void => {
-      finishFailureAfterClosure();
-      if (settled || !terminalError) return;
-      settled = true;
-      clearTimers();
-      child.stdout.destroy();
-      child.stderr.destroy();
-      child.unref();
-      reject(terminalError);
-    };
-    const fail = (error: Error): void => {
-      if (settled || terminalError) return;
-      terminalError = error;
-      clearTimeout(deadlineTimer);
-      signalGroup("SIGTERM");
-      termTimer = setTimeout(() => {
-        if (groupAlive()) signalGroup("SIGKILL");
-        observeTimer = setTimeout(finishFailureAtBound, COMMAND_KILL_OBSERVE_MS);
-        observeTimer.unref();
-        finishFailureAfterClosure();
-      }, COMMAND_TERM_GRACE_MS);
-      termTimer.unref();
-      reapTimer = setInterval(finishFailureAfterClosure, 10);
-      reapTimer.unref();
-      finishFailureAfterClosure();
-    };
-    const append = (target: Buffer[], chunk: Buffer, stream: "stdout" | "stderr"): void => {
-      if (terminalError) return;
-      if (stream === "stdout") stdoutBytes += chunk.length;
-      else stderrBytes += chunk.length;
-      if (stdoutBytes + stderrBytes > COMMAND_OUTPUT_LIMIT_BYTES) {
-        fail(new OwnedCommandError(
-          `${options.description} exceeded ${COMMAND_OUTPUT_LIMIT_BYTES} bytes of combined output`,
-          result(),
-        ));
-        return;
-      }
-      target.push(chunk);
-    };
-    const deadlineTimer = setTimeout(() => {
-      fail(new OwnedCommandError(
-        `${options.description} timed out after ${options.timeoutMs} ms`,
-        result(),
-      ));
-    }, options.timeoutMs);
-    deadlineTimer.unref();
-
-    child.stdout.on("data", (chunk: Buffer) => append(stdout, chunk, "stdout"));
-    child.stderr.on("data", (chunk: Buffer) => append(stderr, chunk, "stderr"));
-    child.once("error", (error) => fail(error));
-    child.once("close", (code, signal) => {
-      childClosed = true;
-      if (terminalError) {
-        finishFailureAfterClosure();
-        return;
-      }
-      const completed = result(code, signal);
-      if (code !== 0) {
-        fail(new OwnedCommandError(
-          `${options.description} exited ${code ?? signal ?? "without status"}`,
-          completed,
-        ));
-        return;
-      }
-      settled = true;
-      clearTimers();
-      resolve(completed);
-    });
-  });
-}
-
 async function dockerAvailable(env: NodeJS.ProcessEnv): Promise<void> {
   await runOwnedCommand("docker", ["info"], {
     description: "Docker availability check",
@@ -259,11 +112,21 @@ async function dockerAvailable(env: NodeJS.ProcessEnv): Promise<void> {
   });
 }
 
-async function sharedScreenSnapshot(env: NodeJS.ProcessEnv): Promise<unknown> {
+const DOCKER_MISSING = {
+  container: /No such (?:container|object)|not found/iu,
+  image: /No such image|not found/iu,
+  network: /No such network|not found/iu,
+} as const;
+
+async function optionalDockerInspect<T>(
+  kind: keyof typeof DOCKER_MISSING,
+  target: string,
+  env: NodeJS.ProcessEnv,
+): Promise<T | undefined> {
   let inspect: OwnedCommandResult;
   try {
-    inspect = await runOwnedCommand("docker", ["container", "inspect", "openbot-screen"], {
-      description: "protected Screen inspection",
+    inspect = await runOwnedCommand("docker", [kind, "inspect", target], {
+      description: `${kind} inspection for ${target}`,
       env,
       timeoutMs: DOCKER_INSPECT_WAIT_MS,
     });
@@ -271,32 +134,172 @@ async function sharedScreenSnapshot(env: NodeJS.ProcessEnv): Promise<unknown> {
     if (
       error instanceof OwnedCommandError
       && error.result.code !== null
-      && /No such (?:container|object)|not found/iu.test(`${error.result.stdout}\n${error.result.stderr}`)
+      && DOCKER_MISSING[kind].test(`${error.result.stdout}\n${error.result.stderr}`)
     ) {
-      return null;
+      return undefined;
     }
     throw error;
   }
-  const row = (JSON.parse(inspect.stdout) as Array<Record<string, unknown>>)[0] as {
+  const rows = JSON.parse(inspect.stdout) as T[];
+  assert.equal(rows.length, 1, `${kind} inspection for ${target} returned ${rows.length} records`);
+  return rows[0];
+}
+
+function sortedEntries(value: Record<string, unknown> | undefined): Array<[string, unknown]> {
+  return Object.entries(value ?? {}).sort(([left], [right]) => left.localeCompare(right));
+}
+
+type ProtectedScreenSnapshot = {
+  container: {
+    configImage: unknown;
+    id: unknown;
+    imageId: unknown;
+    labels: Array<[string, unknown]>;
+    mounts: unknown[];
+    name: unknown;
+    networks: unknown[];
+    ports: Array<[string, unknown]>;
+    restartCount: unknown;
+    restartPolicy: unknown;
+    state: unknown;
+  } | null;
+  image: {
+    id: unknown;
+    labels: Array<[string, unknown]>;
+    repoDigests: unknown[];
+    repoTags: unknown[];
+  } | null;
+  networks: Array<{
+    containers: Array<[string, unknown]>;
+    id: unknown;
+    labels: Array<[string, unknown]>;
+    name: unknown;
+  }>;
+};
+
+async function sharedScreenSnapshot(env: NodeJS.ProcessEnv): Promise<ProtectedScreenSnapshot> {
+  const row = await optionalDockerInspect<{
+    Config?: { Image?: unknown; Labels?: Record<string, unknown> };
+    HostConfig?: { PortBindings?: Record<string, unknown>; RestartPolicy?: unknown };
     Id?: unknown;
     Image?: unknown;
+    Mounts?: Array<{
+      Destination?: unknown;
+      Driver?: unknown;
+      Mode?: unknown;
+      Name?: unknown;
+      Propagation?: unknown;
+      RW?: unknown;
+      Source?: unknown;
+      Type?: unknown;
+    }>;
+    Name?: unknown;
+    NetworkSettings?: { Networks?: Record<string, Record<string, unknown>> };
     RestartCount?: unknown;
-    State?: { Running?: unknown; StartedAt?: unknown };
-    HostConfig?: { PortBindings?: Record<string, unknown> };
-    NetworkSettings?: { Networks?: Record<string, { NetworkID?: unknown }> };
-  };
+    State?: Record<string, unknown>;
+  }>("container", "openbot-screen", env);
+  const image = await optionalDockerInspect<{
+    Config?: { Labels?: Record<string, unknown> };
+    Id?: unknown;
+    RepoDigests?: unknown[];
+    RepoTags?: unknown[];
+  }>("image", "openbot-screen:latest", env);
+  const networkAttachments = Object.entries(row?.NetworkSettings?.Networks ?? {})
+    .sort(([left], [right]) => left.localeCompare(right));
+  const networks = await Promise.all(networkAttachments.map(async ([, attachment]) => {
+    const networkId = String(attachment.NetworkID ?? "");
+    assert.notEqual(networkId, "", "protected Screen network has no immutable ID");
+    const network = await optionalDockerInspect<{
+      Containers?: Record<string, unknown> | null;
+      Id?: unknown;
+      Labels?: Record<string, unknown>;
+      Name?: unknown;
+    }>("network", networkId, env);
+    assert.ok(network, `protected Screen network ${networkId} disappeared during inspection`);
+    return {
+      containers: sortedEntries(network.Containers ?? undefined),
+      id: network.Id,
+      labels: sortedEntries(network.Labels),
+      name: network.Name,
+    };
+  }));
   return {
-    id: row.Id,
-    image: row.Image,
-    restartCount: row.RestartCount,
-    running: row.State?.Running,
-    startedAt: row.State?.StartedAt,
-    ports: Object.entries(row.HostConfig?.PortBindings ?? {}).sort(([left], [right]) =>
-      left.localeCompare(right)
-    ),
-    networks: Object.entries(row.NetworkSettings?.Networks ?? {})
-      .map(([name, value]) => [name, value.NetworkID])
-      .sort(([left], [right]) => String(left).localeCompare(String(right))),
+    container: row
+      ? {
+        configImage: row.Config?.Image,
+        id: row.Id,
+        imageId: row.Image,
+        labels: sortedEntries(row.Config?.Labels),
+        mounts: (row.Mounts ?? [])
+          .map((mount) => ({
+            destination: mount.Destination,
+            driver: mount.Driver,
+            mode: mount.Mode,
+            name: mount.Name,
+            propagation: mount.Propagation,
+            rw: mount.RW,
+            source: mount.Source,
+            type: mount.Type,
+          }))
+          .sort((left, right) =>
+            String(left.destination).localeCompare(String(right.destination))
+            || String(left.source).localeCompare(String(right.source))
+          ),
+        name: row.Name,
+        networks: networkAttachments.map(([name, value]) => ({
+          endpointId: value.EndpointID,
+          globalIpv6Address: value.GlobalIPv6Address,
+          ipAddress: value.IPAddress,
+          macAddress: value.MacAddress,
+          name,
+          networkId: value.NetworkID,
+        })),
+        ports: sortedEntries(row.HostConfig?.PortBindings),
+        restartCount: row.RestartCount,
+        restartPolicy: row.HostConfig?.RestartPolicy,
+        state: row.State,
+      }
+      : null,
+    image: image
+      ? {
+        id: image.Id,
+        labels: sortedEntries(image.Config?.Labels),
+        repoDigests: [...(image.RepoDigests ?? [])].sort(),
+        repoTags: [...(image.RepoTags ?? [])].sort(),
+      }
+      : null,
+    networks: networks.sort((left, right) => String(left.id).localeCompare(String(right.id))),
+  };
+}
+
+function protectedDockerIds(snapshot: ProtectedScreenSnapshot): {
+  containerId: string | null;
+  imageIds: string[];
+  networkIds: string[];
+} {
+  return {
+    containerId: typeof snapshot.container?.id === "string" ? snapshot.container.id : null,
+    imageIds: [snapshot.container?.imageId, snapshot.image?.id]
+      .filter((value): value is string => typeof value === "string"),
+    networkIds: snapshot.networks
+      .map((network) => network.id)
+      .filter((value): value is string => typeof value === "string"),
+  };
+}
+
+async function inspectOwnedDockerInput(
+  expected: ExpectedDockerOwnership,
+  env: NodeJS.ProcessEnv,
+): Promise<DockerOwnershipInput> {
+  const [container, image, network] = await Promise.all([
+    optionalDockerInspect<DockerContainerInspect>("container", expected.containerName, env),
+    optionalDockerInspect<DockerImageInspect>("image", expected.imageName, env),
+    optionalDockerInspect<DockerNetworkInspect>("network", expected.networkName, env),
+  ]);
+  return {
+    ...(container ? { container } : {}),
+    ...(image ? { image } : {}),
+    ...(network ? { network } : {}),
   };
 }
 
@@ -325,6 +328,81 @@ async function cleanupOwnedCommand(
     }
     throw error;
   }
+}
+
+async function assertDockerTargetsAbsent(
+  kind: keyof typeof DOCKER_MISSING,
+  targets: string[],
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  for (const target of new Set(targets)) {
+    assert.equal(
+      await optionalDockerInspect(kind, target, env),
+      undefined,
+      `${kind} target survived cleanup: ${target}`,
+    );
+  }
+}
+
+async function cleanupOwnedDockerResources(
+  expected: ExpectedDockerOwnership,
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  let owned = validateOwnedDockerSet(
+    await inspectOwnedDockerInput(expected, env),
+    expected,
+    { requireComplete: false },
+  );
+  if (owned.containerId) {
+    await cleanupOwnedCommand("docker", immutableDockerRemovalArgs("container", owned.containerId), {
+      absentPattern: DOCKER_MISSING.container,
+      description: "disposable Screen container cleanup",
+      env,
+    });
+    await assertDockerTargetsAbsent(
+      "container",
+      [owned.containerId, expected.containerName],
+      env,
+    );
+  }
+
+  owned = validateOwnedDockerSet(
+    await inspectOwnedDockerInput(expected, env),
+    expected,
+    { requireComplete: false },
+  );
+  if (owned.networkId) {
+    await cleanupOwnedCommand("docker", immutableDockerRemovalArgs("network", owned.networkId), {
+      absentPattern: DOCKER_MISSING.network,
+      description: "disposable Screen network cleanup",
+      env,
+    });
+    await assertDockerTargetsAbsent("network", [owned.networkId, expected.networkName], env);
+  }
+
+  owned = validateOwnedDockerSet(
+    await inspectOwnedDockerInput(expected, env),
+    expected,
+    { requireComplete: false },
+  );
+  if (owned.imageId) {
+    await cleanupOwnedCommand("docker", immutableDockerRemovalArgs("image", owned.imageId), {
+      absentPattern: DOCKER_MISSING.image,
+      description: "disposable Screen image cleanup",
+      env,
+    });
+    await assertDockerTargetsAbsent("image", [owned.imageId, expected.imageName], env);
+  }
+
+  assert.deepEqual(
+    validateOwnedDockerSet(
+      await inspectOwnedDockerInput(expected, env),
+      expected,
+      { requireComplete: false },
+    ),
+    {},
+    "disposable Docker resources survived cleanup",
+  );
 }
 
 function cookieHeader(response: Response): string {
@@ -576,13 +654,13 @@ describe("Live connected PWA Screen shutdown", { timeout: 1_200_000 }, () => {
     let runtime: string | undefined;
     let composeArgs: string[] = [];
     let composeEnv: NodeJS.ProcessEnv | undefined;
-    let protectedBefore: unknown;
+    let protectedBefore: ProtectedScreenSnapshot | undefined;
     let protectedSnapshotTaken = false;
     let dockerChecked = false;
+    let dockerOwnership: ExpectedDockerOwnership | undefined;
     let tap: Awaited<ReturnType<typeof startScreenTap>> | undefined;
     let firstTalk: TalkProcess | undefined;
     let secondTalk: TalkProcess | undefined;
-    let composeAttempted = false;
     let bodyFailure: unknown = null;
 
     try {
@@ -608,6 +686,22 @@ describe("Live connected PWA Screen shutdown", { timeout: 1_200_000 }, () => {
 
       protectedBefore = await sharedScreenSnapshot(process.env);
       protectedSnapshotTaken = true;
+      const protectedIds = protectedDockerIds(protectedBefore);
+      dockerOwnership = {
+        containerName: container,
+        imageName: image,
+        liveLabel: LIVE_GRANT,
+        networkName: network,
+        protectedContainerId: protectedIds.containerId,
+        protectedImageIds: protectedIds.imageIds,
+        protectedNetworkIds: protectedIds.networkIds,
+        runLabel: nonce,
+      };
+      assert.deepEqual(
+        await inspectOwnedDockerInput(dockerOwnership, process.env),
+        {},
+        "disposable Docker names were already in use",
+      );
       const homeDir = join(runtime, "home");
       const workspaceDir = join(homeDir, "workspace");
       const cookiesDir = join(homeDir, "cookies");
@@ -632,16 +726,18 @@ describe("Live connected PWA Screen shutdown", { timeout: 1_200_000 }, () => {
       mkdirSync(workspaceDir, { recursive: true });
       mkdirSync(cookiesDir, { recursive: true });
       writeFileSync(passwordFile, `${PASSWORD}\n`, { mode: 0o600, flag: "wx" });
+      const liveLabels = { [LIVE_LABEL]: LIVE_GRANT, [RUN_LABEL]: nonce };
       await writeFile(override, JSON.stringify({
         services: {
           screen: {
+            build: { labels: liveLabels },
             container_name: container,
             image,
             restart: "no",
-            labels: { "openbot.live": "connected-pwa-shutdown", "openbot.run": nonce },
+            labels: liveLabels,
           },
         },
-        networks: { default: { name: network } },
+        networks: { default: { labels: liveLabels, name: network } },
       }));
 
       composeEnv = {
@@ -671,7 +767,34 @@ describe("Live connected PWA Screen shutdown", { timeout: 1_200_000 }, () => {
       };
 
       tap = await startScreenTap(tapPort, screenPorts[0]!);
-      composeAttempted = true;
+      const composeConfigResult = await runOwnedCommand(
+        "docker",
+        [...composeArgs, "config", "--format", "json"],
+        {
+          description: "disposable Screen compose ownership preflight",
+          env: composeEnv,
+          timeoutMs: DOCKER_INSPECT_WAIT_MS,
+        },
+      );
+      const composeConfig = JSON.parse(composeConfigResult.stdout) as {
+        networks?: { default?: { labels?: Record<string, string>; name?: string } };
+        services?: {
+          screen?: {
+            build?: { labels?: Record<string, string> };
+            container_name?: string;
+            image?: string;
+            labels?: Record<string, string>;
+            restart?: string;
+          };
+        };
+      };
+      assert.deepEqual(composeConfig.services?.screen?.build?.labels, liveLabels);
+      assert.equal(composeConfig.services?.screen?.container_name, container);
+      assert.equal(composeConfig.services?.screen?.image, image);
+      assert.deepEqual(composeConfig.services?.screen?.labels, liveLabels);
+      assert.equal(composeConfig.services?.screen?.restart, "no");
+      assert.deepEqual(composeConfig.networks?.default?.labels, liveLabels);
+      assert.equal(composeConfig.networks?.default?.name, network);
       await runOwnedCommand(
         "docker",
         [...composeArgs, "up", "--detach", "--build", "--force-recreate", "screen"],
@@ -680,6 +803,11 @@ describe("Live connected PWA Screen shutdown", { timeout: 1_200_000 }, () => {
           env: composeEnv,
           timeoutMs: DOCKER_BUILD_WAIT_MS,
         },
+      );
+      validateOwnedDockerSet(
+        await inspectOwnedDockerInput(dockerOwnership, composeEnv),
+        dockerOwnership,
+        { requireComplete: true },
       );
       assert.deepEqual(
         await sharedScreenSnapshot(process.env),
@@ -834,44 +962,11 @@ describe("Live connected PWA Screen shutdown", { timeout: 1_200_000 }, () => {
         cleanupFailures.push(error);
       }
       const cleanupEnv = composeEnv ?? process.env;
-      if (composeAttempted) {
+      if (dockerChecked && dockerOwnership) {
         try {
-          await cleanupOwnedCommand(
-            "docker",
-            [...composeArgs, "down", "--volumes", "--remove-orphans"],
-            { description: "disposable Screen compose cleanup", env: cleanupEnv },
-          );
+          await cleanupOwnedDockerResources(dockerOwnership, cleanupEnv);
         } catch (error) {
           cleanupFailures.push(error);
-        }
-      }
-      if (dockerChecked) {
-        for (const cleanup of [
-          {
-            args: ["container", "rm", "--force", container],
-            description: "disposable Screen container cleanup",
-            absentPattern: /No such (?:container|object)|not found/iu,
-          },
-          {
-            args: ["network", "rm", network],
-            description: "disposable Screen network cleanup",
-            absentPattern: /No such network|not found/iu,
-          },
-          {
-            args: ["image", "rm", image],
-            description: "disposable Screen image cleanup",
-            absentPattern: /No such image|not found/iu,
-          },
-        ]) {
-          try {
-            await cleanupOwnedCommand("docker", cleanup.args, {
-              absentPattern: cleanup.absentPattern,
-              description: cleanup.description,
-              env: cleanupEnv,
-            });
-          } catch (error) {
-            cleanupFailures.push(error);
-          }
         }
       }
       if (runtime) {
