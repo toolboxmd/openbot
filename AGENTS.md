@@ -7,7 +7,7 @@ Read `docs/agents/issue-tracker.md` before filing tickets.
 Read `docs/adr/` before reversing a locked decision.
 Read `CONTRIBUTING.md` before opening a PR.
 
-Implement remaining tracer-bullet tickets from the v1 spec. Do not reverse a locked ADR without a new decision.
+Read `VISION.md`, `MISSION.md` and `OBJECTIVE.md` first: OpenBot is moving onto the toolboxmd T3 Code fork, and new standalone v1 features wait for that decision. Do not reverse a locked ADR without a new decision.
 
 ## Skills
 
